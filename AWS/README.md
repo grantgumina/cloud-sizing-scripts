@@ -1,239 +1,139 @@
-# AWS 
+# AWS Cloud Sizing Script (Python)
 
-## Overview
+`CVAWSCloudSizingScript.py` discovers AWS cloud resources across one or more
+accounts and regions and produces Excel workbooks summarizing provisioned/used
+capacity. It is the cross-platform Python replacement for the original
+`CVAWSCloudSizingScript.ps1` and runs identically on Linux, macOS, Windows, and
+AWS CloudShell.
 
-This PowerShell Script inventories AWS Services across one or multiple accounts and regions.  
-It provides a unified view of key AWS resources, their configurations, and capacity metrics to assist with cost analysis, right-sizing, and capacity planning.
+## What it inventories
 
-The script collects information for the following services:
-- **EC2** — Instances with attached/unattached EBS volumes  
-- **S3** — Buckets and storage metrics  
-- **EFS** — Elastic File Systems  
-- **FSx** — File systems (ONTAP/SVX, Windows, Lustre, etc.)  
-- **RDS** — Database Instances  
-- **DynamoDB** — Tables with provisioned throughput details  
-- **DocumentDB** — Clusters  
-- **Redshift** — Clusters  
-- **EKS** — Clusters and Associated PVCs
+| Workload | Service(s) | Sizing source |
+|----------|-----------|----------------|
+| `ec2` | EC2 instances + attached EBS | Sum of attached EBS volume sizes |
+| `unattached_volumes` | EBS volumes in `available` state | Provisioned volume size |
+| `s3` | S3 buckets | CloudWatch `BucketSizeBytes` (per storage class) + `NumberOfObjects`; object-enumeration fallback |
+| `efs` | EFS file systems | `SizeInBytes` or CloudWatch `StorageBytes` |
+| `fsx` | FSx file systems + ONTAP SVMs/volumes | Provisioned storage capacity |
+| `rds` | RDS instances | Allocated storage; Aurora used via CloudWatch `VolumeBytesUsed` |
+| `docdb` | DocumentDB clusters + instances | CloudWatch `VolumeBytesUsed` |
+| `dynamodb` | DynamoDB tables | `TableSizeBytes` + item count |
+| `redshift` | Redshift clusters | `TotalStorageCapacityInMegaBytes` |
+| `eks` | EKS clusters | PVC capacity + node count via `kubectl` |
 
-The inventory captures **provisioned size details for applicable services** (and **used size for S3**), along with other configuration and metadata information.  
-Results are exported as timestamped Excel workbooks and consolidated ZIP archives for easy sharing and reporting.
+Every size is reported in both binary (GiB/TiB) and decimal (GB/TB) units.
 
-## Requirements
-- **PowerShell 7**  
-  Download: https://github.com/PowerShell/PowerShell/releases  
-- **AWS CLI** (for local powershell runs)  
-  Install guide: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html  
-- **PowerShell Modules**  
-  - ImportExcel  
-  - AWS.Tools.Common  
-  - AWS.Tools.EC2  
-  - AWS.Tools.S3  
-  - AWS.Tools.SecurityToken  
-  - AWS.Tools.IdentityManagement  
-  - AWS.Tools.CloudWatch  
-  - AWS.Tools.RDS  
-  - AWS.Tools.DynamoDBv2  
-  - AWS.Tools.Redshift  
-  - AWS.Tools.FSx  
-  - AWS.Tools.ElasticFileSystem  
-  - AWS.Tools.EKS  
-  - AWS.Tools.DocDB
-  
-Execution Instructions
-----------------------
+## Output
 
-Two ways to run the AWS sizing script — CloudShell, Local PowerShell.
+- `Metrics/<account>_summary_<timestamp>.xlsx` — one workbook per account.
+- `Metrics/comprehensive_all_aws_accounts_<timestamp>.xlsx` — combined workbook (only when more than one account is processed).
+- `Logs/aws_sizing_<timestamp>.log` — execution log.
 
-Method 1 — Run in AWS CloudShell 
-1. Sign in to the AWS Console and open CloudShell.
-2. Enter PowerShell:
-   ```powershell
-   pwsh
-   ```
-3. (Install ImportExcel in CloudShell)
-   ```powershell
-   Install-Module -Name ImportExcel -Scope CurrentUser -Force
-   ```
-   Note: AWS.Tools modules are pre-installed in CloudShell.
-4. (Optional) Make executable:
-   ```bash
-   chmod +x CVAWSCloudSizingScript.ps1
-   ```
-5. Run using the default IAM role:
-   ```powershell
-   ./CVAWSCloudSizingScript.ps1 -DefaultProfile -Regions "us-east-1"
-   ```
-6. Run using uploaded Creds.txt file with profiles:
-   ```powershell
-   ./CVAWSCloudSizingScript.ps1 -UserSpecifiedProfileNames "Profile1,Profile2" -ProfileLocation "./Creds.txt" -Regions "us-east-1,us-west-2"
-   ```
+Each workbook has an **Info** sheet (one row per resource) and a **Summary**
+sheet (per-region counts/totals with a bold grand-total row) per workload.
 
+## Prerequisites
 
-Method 2 — Run locally
-1. Install PowerShell 7:
-   https://github.com/PowerShell/PowerShell/releases
-2. Install AWS CLI:
-   https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
-3. Install required modules (example consolidated command):
-   ```powershell
-   # remove any loaded AWSTools modules first (optional)
-   Get-Module AWS.Tools.* | Remove-Module -Force
+- Python 3.12+
+- Dependencies: `boto3`, `openpyxl`, `rich`. Install any one way:
+  - `pip install -r ../requirements.txt` (the repo-wide requirements file for all tools), or
+  - `pip install boto3 openpyxl rich` (just this tool's deps; the script also auto-installs these on first run).
+- AWS credentials (a configured profile, environment variables, an instance/CloudShell role, or a cross-account role).
+- For the `eks` workload: `kubectl` and the AWS CLI (`aws`) on `PATH`, and the running identity must be permitted in each cluster's access config (`aws-auth`/access entries).
 
-   # install ImportExcel and AWSTools installer then required AWSTools modules
-   Install-Module -Name ImportExcel -Scope CurrentUser -Force -Confirm:$false
-   Install-Module -Name AWS.Tools.Installer -Scope CurrentUser -Force -Confirm:$false
+### Verify credentials before running
 
-   Install-AWSToolsModule -Name AWS.Tools.Common,AWS.Tools.EC2,AWS.Tools.S3,AWS.Tools.SecurityToken,AWS.Tools.IdentityManagement,AWS.Tools.CloudWatch,AWS.Tools.RDS,AWS.Tools.DynamoDBv2,AWS.Tools.Redshift,AWS.Tools.FSx,AWS.Tools.ElasticFileSystem,AWS.Tools.EKS,AWS.Tools.DocDB -Scope CurrentUser -CleanUp -Force -Confirm:$false
-   ```
-4. Verify required modules are installed:
-   ```powershell
-   Get-Module -ListAvailable AWS.Tools.* , ImportExcel | Select-Object Name, Version, Path
-   ```
-5. Fix unsigned script error:
-   If you encounter the following error when running the script on Windows:
-   .\CVAWSCloudSizingScript.ps1 cannot be loaded because it is not digitally signed.
-   This is due to PowerShell's execution policy restricting unsigned scripts. To temporarily allow the script to run in the current session, execute the following command in PowerShell (run as Administrator if necessary):
+The script authenticates entirely through boto3's standard credential chain — it
+does not prompt for keys or perform an interactive login. Before a real run,
+confirm credentials resolve:
 
-   ```powershell
-   Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-   ```
-6. Run the script with desired parameters:
-   ```powershell
-   ./CVAWSCloudSizingScript.ps1 -DefaultProfile -Regions "us-west-2"
-   ```
-
-Common script parameters
-- -DefaultProfile — Uses default AWS CLI profile / CloudShell role.
-- -UserSpecifiedProfileNames "Profile1,Profile2" — comma-separated local profiles.
-- -AllLocalProfiles — process all local profiles given in Credential File.
-- -ProfileLocation "<path>" — shared Credentials file path.
-- -CrossAccountRoleName "<RoleName>" — role to assume in target accounts.
-- -Regions "us-east-1,us-west-2" — comma-separated regions to query.
-
-
-Credential Files:
-- Creds.txt (AWS shared credentials format)
-```ini
-[Profile1]
-aws_access_key_id = <AccessKey1>
-aws_secret_access_key = <SecretKey1>
-
-[Profile2]
-aws_access_key_id = <AccessKey2>
-aws_secret_access_key = <SecretKey2>
+```bash
+aws sts get-caller-identity          # should print your account/ARN
+# or, without collecting anything:
+python CVAWSCloudSizingScript.py --validate-only
 ```
 
-- Accounts.txt (one AWS account ID per line, no commas):
-```text
-123456789012
-987654321098
-555555555555
+On startup the script runs a **credential preflight** (`sts:GetCallerIdentity`).
+If no credentials authenticate, it prints setup guidance and exits `1` instead of
+emitting a wall of errors. In multi-account / multi-profile runs, sessions that
+fail to authenticate are skipped with a warning and the valid ones still run.
+
+When run interactively (a terminal, no account/profile flags, no `--no-input`)
+and more than one account is resolved, the script first shows a numbered picker
+so you can choose which accounts to scan. Passing `--profiles`/`--accounts`/etc.
+or `--no-input` skips it.
+
+## Authentication modes
+
+```bash
+# Default credential chain (CloudShell / instance role / env / default profile)
+python CVAWSCloudSizingScript.py --default-profile --regions=us-east-1
+
+# Named local profiles
+python CVAWSCloudSizingScript.py --profiles=prod,dev --regions=us-east-1,us-west-2
+
+# Every profile in a custom credentials file
+python CVAWSCloudSizingScript.py --all-local-profiles --profile-location=./Creds.txt
+
+# Cross-account role assumption
+python CVAWSCloudSizingScript.py \
+    --cross-account-role=InventoryRole \
+    --accounts=123456789012,987654321098 \
+    --regions=us-east-1
 ```
 
-Example invocations
-```powershell
-# CloudShell using CloudShell role (default IAM role)
-./CVAWSCloudSizingScript.ps1 -DefaultProfile -Regions "us-east-1"
+## Common options
 
-# CloudShell using uploaded credentials file
-./CVAWSCloudSizingScript.ps1 -UserSpecifiedProfileNames "Profile1" -ProfileLocation "./Creds.txt" -Regions "us-east-1"
+| Option | Description |
+|--------|-------------|
+| `--regions=r1,r2` | Regions to query (default: all enabled regions) |
+| `--workload=ec2,s3,...` | Limit to specific workloads (default: `all`) |
+| `--partition=GovCloud` | Use the AWS GovCloud partition |
+| `--skip-bucket-tags` | Skip fetching S3 bucket tags (faster) |
+| `--no-s3-enumerate` | Disable object-enumeration fallback for S3 sizing |
+| `--external-id=ID` | External ID for cross-account role assumption |
+| `--role-session-name=NAME` | STS session name (default: `CVAWS-Cost-Sizing`) |
+| `--validate-only` | Run the credential preflight, report the accounts/regions/workloads that would be collected, then exit without collecting |
+| `--json` | Emit a machine-readable summary to **stdout** (for `jq`/scripting) |
+| `-q`, `--quiet` | Only warnings and errors; no progress bar or summary table |
+| `-v`, `--verbose` | Verbose console output (timestamps, debug, full tracebacks) |
+| `--no-color` | Disable colored output (also honors the `NO_COLOR` env var) |
+| `--no-input` | Never prompt; for non-interactive / CI use |
+| `--version` | Print the version and exit |
 
-# Local, using specific credential file and profiles
-./CVAWSCloudSizingScript.ps1 -UserSpecifiedProfileNames "prod,dev" -ProfileLocation "./Creds.txt" -Regions "us-east-1,us-west-2"
+Run `python CVAWSCloudSizingScript.py --help` for the full grouped list with examples.
 
-# Cross-account role using file with account IDs [CloudShell]
-./CVAWSCloudSizingScript.ps1 -CrossAccountRoleName "InventoryRole" -UserSpecifiedAccounts "123456789012" -Regions "us-east-1"
+## Terminal output
+
+The script is TTY-aware and separates streams so it composes well in pipelines:
+
+- **stderr** — human-facing output: a live progress display (per account/region/
+  workload, plus the S3 object-enumeration counter), status lines, the summary
+  table, and warnings/errors. Color and progress animation are disabled
+  automatically when output is not a terminal, when `NO_COLOR`/`--no-color` is
+  set, or under `--quiet`.
+- **stdout** — machine output only: the written workbook path(s) by default, or a
+  full JSON summary with `--json`. Nothing else is written to stdout, so
+  `... --json | jq .` and `... > files.txt` work cleanly.
+- **`Logs/aws_sizing_<ts>.log`** — the complete, timestamped run log (unchanged
+  format) for later analysis, regardless of console verbosity.
+
+```bash
+# Machine-readable totals for two regions, piped to jq
+python CVAWSCloudSizingScript.py --json --regions=us-east-1,us-west-2 | jq '.combined'
+
+# Quiet run in CI: only the workbook paths reach stdout
+python CVAWSCloudSizingScript.py --quiet --no-input > artifacts.txt
 ```
 
+Exit codes: `0` success · `1` runtime/credential failure · `2` usage error ·
+`130` interrupted (Ctrl-C).
 
-Outputs
--------
-Files are written to the working directory with timestamps:
-- `<AccountId>_summary_YYYY-MM-DD_HHMMSS.xlsx` — per-account Excel summary & detail sheets(EC2, S3, RDS, FSx, EFS, DynamoDB, Redshift, EKS)
-- `comprehensive_all_aws_accounts_summary_YYYY-MM-DD_HHMMSS.xlsx` — consolidated workbook
-- `aws_sizing_script_output_YYYY-MM-DD_HHMMSS.log` — execution log
-- `aws_sizing_results_YYYY-MM-DD_HHMMSS.zip` — ZIP archive 
+## Required IAM permissions (read-only)
 
-
-Required IAM Permissions
--------
-The executing user/role must have the following IAM permissions for the script to run successfully.
-
-```json
-{
-    "Version": "2012-10-17",
-    "Statement": [
-        {
-            "Effect": "Allow",
-            "Action": [
-                "sts:GetCallerIdentity",
-                "sts:AssumeRole",
-                "iam:ListAccountAliases",
-                "ec2:DescribeRegions",
-                "ec2:DescribeInstances",
-                "ec2:DescribeVolumes",
-                "ec2:DescribeTags",
-                "s3:GetBucketLocation",
-                "s3:ListAllMyBuckets",
-                "s3:GetBucketTagging",
-                "s3:ListBucket",
-                "cloudwatch:GetMetricStatistics",
-                "cloudwatch:ListMetrics",
-                "elasticfilesystem:DescribeFileSystems",
-                "elasticfilesystem:ListTagsForResource",
-                "elasticfilesystem:DescribeTags",
-                "fsx:DescribeFileSystems",
-                "fsx:DescribeVolumes",
-                "fsx:ListTagsForResource",
-                "fsx:DescribeStorageVirtualMachines",
-                "rds:DescribeDBInstances",
-                "rds:DescribeDBClusters",
-                "rds:ListTagsForResource",
-                "dynamodb:ListTables",
-                "dynamodb:DescribeTable",
-                "dynamodb:ListTagsOfResource",
-                "redshift:DescribeClusters",
-                "redshift:DescribeTags",
-                "eks:ListClusters",
-                "eks:DescribeCluster",
-                "eks:ListNodegroups",
-                "eks:ListTagsForResource"
-            ],
-            "Resource": "*"
-        }
-    ]
-}
-```
-**Important: EKS (Kubernetes Workload)**
-- To collect in-cluster workload details (such as PVCs, Nodes), the executing IAM User/Role must be added to the EKS cluster’s `aws-auth` ConfigMap with appropriate Kubernetes Role-Based Access Control permissions. Otherwise, only basic cluster metadata will be available.
-
-Example `aws-auth` ConfigMap
-```yaml
-apiVersion: v1
-kind: ConfigMap
-metadata:
-  name: aws-auth
-  namespace: kube-system
-data:
-  mapUsers: '[{
-      "userarn": "arn:aws:iam::123456789012:user/ScriptUser1",
-      "username": "scriptuser1",
-      "groups": ["system:masters"]
-    },
-    {
-      "userarn": "arn:aws:iam::123456789012:user/ScriptUser2",
-      "username": "scriptuser2",
-      "groups": ["system:masters"]
-    }]'
-  mapRoles: |
-    - rolearn: arn:aws:iam::123456789012:role/ScriptUserRole
-      username: system:node:{{EC2PrivateDNSName}}
-      groups:
-        - system:bootstrappers
-        - system:nodes
-```        
-- mapUsers — Maps IAM users to Kubernetes groups.
-- mapRoles — Maps IAM roles (e.g., node instance roles) to Kubernetes groups.
-- system:masters — Grants full cluster-admin permissions.
-
+`sts:GetCallerIdentity`, `sts:AssumeRole` (cross-account only), `iam:ListAccountAliases`,
+`ec2:Describe*`, `s3:ListAllMyBuckets`, `s3:GetBucketLocation`, `s3:GetBucketTagging`,
+`s3:ListBucket`, `cloudwatch:GetMetricStatistics`, `elasticfilesystem:Describe*`,
+`fsx:Describe*`, `rds:Describe*`, `rds:ListTagsForResource`, `dynamodb:ListTables`,
+`dynamodb:DescribeTable`, `dynamodb:ListTagsOfResource`, `redshift:DescribeClusters`,
+`redshift:DescribeTags`, `docdb:Describe*`, `eks:ListClusters`, `eks:DescribeCluster`.

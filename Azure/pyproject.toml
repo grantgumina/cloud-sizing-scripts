@@ -1,0 +1,20 @@
+[project]
+name = "cv-azure-cloud-sizing"
+version = "0.1.0"
+description = "Azure cloud resource discovery / sizing tool (Commvault protection planning)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openpyxl>=3.1.5",
+    "rich>=13.0.0",
+    "azure-identity>=1.15.0",
+    "azure-mgmt-subscription>=3.1.1",
+    "azure-mgmt-compute>=30.0.0",
+    "azure-mgmt-storage>=21.0.0",
+    "azure-mgmt-monitor>=6.0.0",
+    "azure-mgmt-netapp>=10.0.0",
+    "azure-mgmt-sql>=3.0.1",
+    "azure-mgmt-rdbms>=10.1.0",
+    "azure-mgmt-cosmosdb>=9.0.0",
+    "azure-mgmt-containerservice>=30.0.0",
+]

@@ -1,131 +1,124 @@
-### Azure - Execution Instructions
+# Azure Cloud Sizing Script (Python)
 
-This PowerShell script inventories Azure resources across subscriptions to assist Commvault representatives in gathering information about cloud resources that may need protection and helps representatives in estimating the cost of protecting these resources.
+`CVAzureCloudSizingScript.py` discovers Azure resources across one or more
+subscriptions and produces Excel workbooks summarizing provisioned/used capacity.
+It is the cross-platform Python replacement for the original
+`CVAzureCloudSizingScript.ps1` and shares its terminal UX, Excel output, and CLI
+with the AWS tool via the repo-root `cloudsizing_common.py` module.
 
-#### Method 1 (Recommended) – Run in Azure Cloud Shell
+Unlike AWS, Azure enumerates resources at **subscription scope** (each resource
+carries its own region), so the run is subscription → workload rather than
+account → region → workload.
 
-1. Learn about Azure Cloud Shell:
-   https://docs.microsoft.com/en-us/azure/cloud-shell/overview
+## What it inventories
 
-2. Verify Azure permissions:
-   Ensure your Azure AD account has "Reader" role on target subscriptions
-   Additional "Reader and Data Access" role may be needed for storage metrics
+| Workload | Service(s) | Sizing source |
+|----------|-----------|----------------|
+| `vm` | Virtual machines + managed disks | Sum of OS + data disk provisioned sizes |
+| `storage_account` | Storage accounts (blob) | Azure Monitor `BlobCapacity` (+ `BlobCount`, `ContainerCount`) |
+| `file_share` | Azure Files shares | Share quota + `shareUsageBytes` (stats) |
+| `netapp_volume` | Azure NetApp Files volumes | Provisioned (`usageThreshold`) + Monitor `VolumeLogicalSize` |
+| `sql_database` | Azure SQL databases | `maxSizeBytes` + Monitor `storage` |
+| `sql_managed_instance` | SQL Managed Instances | `storageSizeInGB` + Monitor `storage_space_used_mb` |
+| `mysql_server` | MySQL (flexible + single) | Provisioned storage + Monitor `storage_used` |
+| `postgresql_server` | PostgreSQL (flexible + single) | Provisioned storage + Monitor `storage_used` |
+| `cosmosdb_account` | Cosmos DB accounts | Monitor `DataUsage` (+ `DocumentCount`) |
+| `aks_cluster` | AKS clusters | PVC capacity + node count via `kubectl` |
 
-3. Access Azure Cloud Shell:
-   - Login to Azure Portal with verified account
-   - Open Azure Cloud Shell (PowerShell mode)
+Sizes are reported in both binary (GiB/TiB) and decimal (GB/TB) units. Azure
+Monitor metrics use Maximum aggregation over a 1-hour lookback (NetApp uses
+Average), mirroring the original PowerShell behavior.
 
-4. Upload this script:
-   Use the Cloud Shell file upload feature to upload `CVAzureCloudSizingScript.ps1`
+## Output
 
-5. Run the script (examples below). With no parameters it scans all accessible subscriptions and all supported resource types.
+- `Metrics/<subscription>_summary_<timestamp>.xlsx` — one workbook per subscription.
+- `Metrics/comprehensive_all_azure_subscriptions_<timestamp>.xlsx` — combined workbook (only when more than one subscription is processed).
+- `Logs/azure_sizing_<timestamp>.log` — full timestamped execution log.
 
-#### Method 2 (Alternative) – Run Locally with PowerShell 7
+Each workbook has an **Info** sheet (one row per resource) and a **Summary**
+sheet (per-region counts/totals with a bold grand-total row) per workload.
 
-1. Install PowerShell 7:
-   https://github.com/PowerShell/PowerShell/releases
+## Prerequisites
 
-2. Install required Azure PowerShell modules:
-   ```powershell
-   Install-Module Az.Accounts,Az.Compute,Az.Storage,Az.Monitor,Az.Resources,Az.NetAppFiles,Az.CosmosDB,Az.MySql,Az.PostgreSql,Az.Aks -Force
-   ```
+- Python 3.12+
+- Dependencies: `openpyxl`, `rich`, and the `azure-identity` / `azure-mgmt-*`
+  SDKs. Install any one way:
+  - `pip install -r ../requirements.txt` (the repo-wide requirements file), or
+  - `pip install -e .` from this directory (uses `pyproject.toml`).
+  - The script also auto-installs its dependencies on first run.
+- Azure credentials (see below). RBAC: **Reader** on the target subscriptions;
+  **Reader and Data Access** is also helpful for storage-account metrics; for
+  `aks_cluster`, **Azure Kubernetes Service Cluster User** plus `kubectl` on
+  `PATH` (AAD-integrated clusters may additionally need `kubelogin`).
 
-3. Connect to Azure:
-   ```powershell
-   Connect-AzAccount
-   ```
+### Verify credentials before running
 
-4. Verify permissions:
-   Ensure your Azure AD account has "Reader" role on target subscriptions
+The script authenticates through `DefaultAzureCredential` — it does not prompt
+for secrets. Before a real run, confirm credentials resolve:
 
-5. Change to the script directory (where this repo was cloned/unzipped):
-   ```powershell
-   cd ./Azure
-   ```
-
-6. (Windows only, first run) If script execution is blocked you may need (in an elevated PowerShell):
-   ```powershell
-   Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-   ```
-
-7. Run the script (same parameter syntax as Cloud Shell examples below).
-
-#### Common Parameters
-* `-Subscriptions`  Comma-separated list of subscription names or IDs. Omit to include all accessible subscriptions.
-* `-Types`          Comma-separated list of resource types to limit discovery (e.g. `VM,Storage,NetApp,SQL,Cosmos,AKS`). Omit for all supported types.
-
-#### Supported Resource Types
-* `VM` - Virtual Machines with disk sizing
-* `Storage` - Storage Accounts with capacity metrics
-* `FileShare` - Azure File Shares with usage metrics
-* `NetApp` - NetApp Files volumes with capacity metrics
-* `SQL` - SQL Managed Instances, SQL Databases, MySQL Servers, PostgreSQL Servers
-* `Cosmos` - CosmosDB Accounts with storage metrics
-* `AKS` - Azure Kubernetes Service clusters with persistent volume information
-
-#### Example Invocations
-```powershell
-# All resources in all accessible subscriptions
-./CVAzureCloudSizingScript.ps1
-
-# Only VMs and Storage Accounts in all subscriptions
-./CVAzureCloudSizingScript.ps1 -Types VM,Storage
-
-# All resources in specific subscriptions
-./CVAzureCloudSizingScript.ps1 -Subscriptions "Production","Development"
-
-# Only VMs in specific subscriptions
-./CVAzureCloudSizingScript.ps1 -Types VM -Subscriptions "Production","Development"
-
-# SQL and CosmosDB resources in specific subscriptions
-./CVAzureCloudSizingScript.ps1 -Types SQL,Cosmos -Subscriptions "Database-Prod","Analytics-Prod"
-
-# NetApp Files volumes across all subscriptions
-./CVAzureCloudSizingScript.ps1 -Types NetApp
-
-# Only AKS clusters across all subscriptions
-./CVAzureCloudSizingScript.ps1 -Types AKS
+```bash
+az account show                       # should print your subscription/tenant
+# or, without collecting anything:
+python CVAzureCloudSizingScript.py --validate-only
 ```
 
-#### Important Notes for Subscription Names
-* **Always use quotes** for subscription names that contain spaces:
-  ```powershell
-  # CORRECT
-  ./CVAzureCloudSizingScript.ps1 -Subscriptions "Dev Test","Production Environment"
-  
-  # WRONG - will fail
-  ./CVAzureCloudSizingScript.ps1 -Subscriptions Dev Test
-  ```
-* You can use subscription IDs instead of names to avoid spacing issues
-* The script will show available subscriptions if specified ones are not found
+On startup the script runs a **credential preflight**. If nothing authenticates
+it prints setup guidance and exits `1` instead of emitting a wall of errors.
 
-#### AKS Requirements
-For AKS functionality, kubectl is required and will be automatically installed if not found. The script needs:
-- Azure Kubernetes Service Cluster User role on target AKS clusters
-- Azure Kubernetes Service RBAC Reader role on target AKS clusters
-- Reader role on the subscription/resource group containing AKS clusters
-- Network connectivity to AKS cluster API servers
+## Authentication
 
-#### Results & Output
-The script creates a timestamped output directory with the following files:
-- `azure_vm_info_YYYY-MM-DD_HHMMSS.csv` - VM inventory with disk sizing
-- `azure_storage_accounts_info_YYYY-MM-DD_HHMMSS.csv` - Storage Account inventory with capacity metrics
-- `azure_file_shares_info_YYYY-MM-DD_HHMMSS.csv` - File Share inventory with capacity metrics
-- `azure_netapp_volumes_info_YYYY-MM-DD_HHMMSS.csv` - NetApp volumes inventory with capacity metrics
-- `azure_sql_managed_instances_YYYY-MM-DD_HHMMSS.csv` - SQL Managed Instances inventory
-- `azure_sql_databases_inventory_YYYY-MM-DD_HHMMSS.csv` - SQL Databases inventory
-- `azure_mysql_servers_YYYY-MM-DD_HHMMSS.csv` - MySQL Servers inventory
-- `azure_postgresql_servers_YYYY-MM-DD_HHMMSS.csv` - PostgreSQL Servers inventory
-- `azure_cosmosdb_accounts_YYYY-MM-DD_HHMMSS.csv` - CosmosDB Accounts inventory with storage metrics
-- `azure_aks_clusters_YYYY-MM-DD_HHMMSS.csv` - AKS Clusters inventory with node and storage information
-- `azure_aks_persistent_volumes_YYYY-MM-DD_HHMMSS.csv` - AKS Persistent Volumes inventory
-- `azure_aks_persistent_volume_claims_YYYY-MM-DD_HHMMSS.csv` - AKS Persistent Volume Claims inventory
-- `azure_inventory_summary_YYYY-MM-DD_HHMMSS.csv` - Comprehensive summary with regional breakdowns
-- `azure_sizing_script_output_YYYY-MM-DD_HHMMSS.log` - Complete execution log
-- `azure_sizing_YYYY-MM-DD_HHMMSS.zip` - ZIP archive containing all output files
+`DefaultAzureCredential` tries, in order: environment service principal
+(`AZURE_CLIENT_ID` / `AZURE_CLIENT_SECRET` / `AZURE_TENANT_ID`), workload/managed
+identity (when running in Azure), and the Azure CLI (`az login`). Choose one:
 
-The script automatically creates a ZIP archive of all results. In Azure Cloud Shell you can download this via the built-in file browser; locally you will find it in the same folder you executed the script from. Share the ZIP file with your Commvault representative for sizing analysis.
+```bash
+# Azure CLI (laptop)
+az login
+python CVAzureCloudSizingScript.py
 
-#### Performance Notes
-- Azure Monitor metrics are collected using Maximum aggregation over a 1-hour time period for efficient data retrieval
-- AKS persistent volume data is collected directly from cluster APIs using kubectl
+# Service principal (CI / automation)
+export AZURE_CLIENT_ID=... AZURE_CLIENT_SECRET=... AZURE_TENANT_ID=...
+python CVAzureCloudSizingScript.py --no-input
+
+# Inside Azure (Cloud Shell / VM / AKS managed identity) — nothing to configure
+python CVAzureCloudSizingScript.py
+```
+
+By default every accessible **Enabled** subscription is processed; subscriptions
+that fail to authenticate are skipped with a warning while the valid ones run.
+
+When run interactively (a terminal, no `--subscriptions`/`--tenant`, no
+`--no-input`) and more than one subscription is found, the script first shows a
+numbered picker so you can choose which subscriptions to scan. Pass
+`--subscriptions=...` or `--no-input` to skip it (e.g. in CI).
+
+## Common options
+
+| Option | Description |
+|--------|-------------|
+| `--subscriptions=ID,NAME` | Only these subscription IDs or names (default: all accessible) |
+| `--tenant=TENANT_ID` | Only subscriptions in this tenant |
+| `--regions=r1,r2` | Regions to collect resources from (default: all). `--locations` is accepted as an alias |
+| `--workload=vm,storage_account,...` | Limit to specific workloads (default: `all`) |
+| `--validate-only` | Run the credential preflight, report the subscriptions/regions that would be collected, then exit without collecting |
+| `--json` | Emit a machine-readable summary to **stdout** (for `jq`/scripting) |
+| `-q`, `--quiet` | Only warnings and errors; no progress or summary |
+| `-v`, `--verbose` | Verbose console output (timestamps, debug, tracebacks) |
+| `--no-color` | Disable colored output (also honors `NO_COLOR`) |
+| `--no-input` | Never prompt; for non-interactive / CI use |
+| `--version` | Print the version and exit |
+
+Run `python CVAzureCloudSizingScript.py --help` for the full grouped list.
+
+## Terminal output
+
+Like the AWS tool, the script is TTY-aware and separates streams: **stderr**
+carries human output (progress, summary table, warnings/errors) while **stdout**
+carries only machine output (the written workbook paths, or `--json`). Exit
+codes: `0` success · `1` runtime/credential failure · `2` usage error · `130`
+interrupted (Ctrl-C).
+
+```bash
+# Machine-readable totals, piped to jq
+python CVAzureCloudSizingScript.py --json --subscriptions=Prod | jq '.combined'
+```

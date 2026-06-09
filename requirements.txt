@@ -1,0 +1,42 @@
+# Cloud Sizing Scripts — Python dependencies for all discovery tools.
+#
+#   Install everything:  pip install -r requirements.txt
+#
+# Only need one cloud? Comment out the sections you don't use.
+# openpyxl + rich are shared by every Python tool (Excel output + terminal UI,
+# via cloudsizing_common.py).
+
+openpyxl>=3.1.5
+rich>=13.0.0
+
+# --- AWS  (AWS/CVAWSCloudSizingScript.py) ---
+boto3>=1.34.0
+
+# --- Azure  (Azure/CVAzureCloudSizingScript.py) ---
+azure-identity>=1.15.0
+azure-mgmt-resource>=23.0.0
+azure-mgmt-subscription>=3.1.1
+azure-mgmt-compute>=30.0.0
+azure-mgmt-storage>=21.0.0
+azure-mgmt-monitor>=6.0.0
+azure-mgmt-netapp>=10.0.0
+azure-mgmt-sql>=3.0.1
+azure-mgmt-rdbms>=10.1.0
+azure-mgmt-cosmosdb>=9.0.0
+azure-mgmt-containerservice>=30.0.0
+azure-storage-file-share>=12.15.0
+
+# --- Google Cloud  (GoogleCloud/CVGoogleCloudSizingScript.py) ---
+google-auth>=2.27.0
+google-api-python-client>=2.115.0
+google-cloud-resource-manager>=1.12.0
+google-cloud-compute>=1.18.0
+google-cloud-storage>=2.14.0
+google-cloud-filestore>=1.9.0
+google-cloud-monitoring>=2.19.0
+google-cloud-spanner>=3.44.0
+google-cloud-bigquery>=3.17.0
+
+# --- OCI  (OCI/CVOracleCloudSizingScript.py) ---
+oci>=2.159.1
+pandas>=2.3.2
