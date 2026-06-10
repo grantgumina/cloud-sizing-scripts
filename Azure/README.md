@@ -14,16 +14,17 @@ account → region → workload.
 
 | Workload | Service(s) | Sizing source |
 |----------|-----------|----------------|
-| `vm` | Virtual machines + managed disks | Sum of OS + data disk provisioned sizes |
-| `storage_account` | Storage accounts (blob) | Azure Monitor `BlobCapacity` (+ `BlobCount`, `ContainerCount`) |
-| `file_share` | Azure Files shares | Share quota + `shareUsageBytes` (stats) |
-| `netapp_volume` | Azure NetApp Files volumes | Provisioned (`usageThreshold`) + Monitor `VolumeLogicalSize` |
-| `sql_database` | Azure SQL databases | `maxSizeBytes` + Monitor `storage` |
-| `sql_managed_instance` | SQL Managed Instances | `storageSizeInGB` + Monitor `storage_space_used_mb` |
-| `mysql_server` | MySQL (flexible + single) | Provisioned storage + Monitor `storage_used` |
-| `postgresql_server` | PostgreSQL (flexible + single) | Provisioned storage + Monitor `storage_used` |
-| `cosmosdb_account` | Cosmos DB accounts | Monitor `DataUsage` (+ `DocumentCount`) |
-| `aks_cluster` | AKS clusters | PVC capacity + node count via `kubectl` |
+| `virtual-machines` | Virtual machines + managed disks | Sum of OS + data disk provisioned sizes |
+| `storage-accounts` | Storage accounts (blob) | Azure Monitor `BlobCapacity` (+ `BlobCount`, `ContainerCount`) |
+| `azure-files` | Azure Files shares | Share quota + `shareUsageBytes` (stats) |
+| `azure-netapp-files` | Azure NetApp Files volumes | Provisioned (`usageThreshold`) + Monitor `VolumeLogicalSize` |
+| `azure-sql-database` | Azure SQL databases | `maxSizeBytes` + Monitor `storage` |
+| `azure-sql-managed-instance` | SQL Managed Instances | `storageSizeInGB` + Monitor `storage_space_used_mb` |
+| `azure-database-mysql` | MySQL (flexible + single) | Provisioned storage + Monitor `storage_used` |
+| `azure-database-postgresql` | PostgreSQL (flexible + single) | Provisioned storage + Monitor `storage_used` |
+| `azure-cosmos-db` | Cosmos DB accounts | Monitor `DataUsage` (+ `DocumentCount`) |
+| `aks` | Azure Kubernetes Service clusters | PVC capacity + node count via `kubectl` |
+| `cloud-rewind-quote` | Cloud Rewind view | Resource classification into billable/non-billable and data/config (with exclusions for unattached/unused network & disk resources) |
 
 Sizes are reported in both binary (GiB/TiB) and decimal (GB/TB) units. Azure
 Monitor metrics use Maximum aggregation over a 1-hour lookback (NetApp uses

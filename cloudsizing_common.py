@@ -23,33 +23,12 @@ Azure/CVAzureCloudSizingScript.py.
 """
 
 import sys
-import subprocess
 import os
 import json
 import re
 import logging
 from datetime import datetime
 from dataclasses import dataclass, field
-
-
-# --------------------------------------------------------------------------- #
-# Dependency bootstrap (the agnostic toolkit needs only openpyxl + rich;
-# each cloud script bootstraps its own SDKs separately).
-# --------------------------------------------------------------------------- #
-def install_and_import(package, import_name=None):
-    """Ensure a pip package is importable, installing it on demand."""
-    import_name = import_name or package
-    try:
-        __import__(import_name)
-    except ImportError:
-        # rich may not be importable yet, so this notice is a plain stderr print.
-        print(f"Installing missing dependency '{package}'...", file=sys.stderr)
-        subprocess.check_call([sys.executable, "-m", "pip", "install", package],
-                              stdout=sys.stderr)
-
-
-for _pkg, _imp in [("openpyxl", "openpyxl"), ("rich", "rich")]:
-    install_and_import(_pkg, _imp)
 
 from openpyxl import Workbook, load_workbook  # noqa: E402
 from openpyxl.styles import Font, PatternFill  # noqa: E402
@@ -59,6 +38,7 @@ from rich.progress import (  # noqa: E402
     Progress, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn,
 )
 from rich.table import Table  # noqa: E402
+from rich.text import Text  # noqa: E402
 
 
 # Single shared console for ALL human-facing output (status, progress, tables,
@@ -318,7 +298,7 @@ def render_summary_table(combined, workload_classes):
     table = Table(title="Sizing summary", title_style="bold",
                   header_style="bold", title_justify="left")
     table.add_column("Workload")
-    table.add_column("Count", justify="right")
+    table.add_column("Resource Count", justify="right")
     table.add_column("Total (TB)", justify="right")
     for cls in workload_classes:
         block = totals.get(cls.WORKLOAD)
@@ -326,8 +306,24 @@ def render_summary_table(combined, workload_classes):
             continue
         name = cls.INFO_SHEET.replace(" Info", "")
         tb = block.get("size_tb")
-        table.add_row(name, f"{block['count']:,}",
-                      f"{tb:,.4f}" if tb is not None else "-")
+        tb_str = f"{tb:,.4f}" if tb is not None else "-"
+        if cls.WORKLOAD == "cloud-rewind-quote":
+            # Section header row for Cloud Rewind (no count/size values)
+            header = Text(name, style="bold")
+            table.add_row(header, "", "")
+            # Sub-rows indented with tree characters
+            discovered = block.get("total_count", 0)
+            protectable = block.get("protectable_count", 0)
+            table.add_row(
+                Text("  ├─ Discovered Resources", style="dim"),
+                f"{discovered:,}", "-",
+            )
+            table.add_row(
+                Text("  └─ Protectable Resources", style="dim"),
+                f"{protectable:,}", "-",
+            )
+        else:
+            table.add_row(name, f"{block['count']:,}", tb_str)
     console.print(table)
 
 
@@ -345,17 +341,20 @@ def build_json_summary(scope_items, combined, comprehensive, workload_classes,
     return out
 
 
-def print_banner(title, sessions, workloads, version="", subtitle=""):
+def print_banner(title, sessions, workloads, version="", subtitle="",
+                 scope_label="Scopes"):
     """Concise startup summary of what is about to run (-> stderr)."""
     scopes = ", ".join(
-        f"{sid or '?'}" + (f" ({sname})" if sname else "")
+        (f"{sname} ({sid or '?'})" if sname else f"{sid or '?'}")
         for _handle, sid, sname in sessions)
     head = f"[bold]{title}[/bold]" + (f" v{version}" if version else "")
     if subtitle:
         head += f"  -  {subtitle}"
     console.print(head)
-    console.print(f"Scopes:    {scopes}")
-    console.print(f"Workloads: {', '.join(workloads)}")
+    console.print()
+    console.print(f"{scope_label}: {scopes}")
+    console.print(f"Scanning for: {', '.join(workloads)}")
+    console.print()
 
 
 # --------------------------------------------------------------------------- #
@@ -486,8 +485,9 @@ def select_scopes(sessions, noun):
                           highlight=False)
             continue
         chosen = [sessions[i - 1] for i in idx]
-        console.print(f"Selected {len(chosen)} of {len(sessions)} {noun}.",
-                      style="green", highlight=False)
+        names = ", ".join(sname or sid for _, sid, sname in chosen)
+        console.print(f"Selected: {names}", style="green", markup=False,
+                      highlight=False)
         return chosen
 
 
@@ -591,8 +591,14 @@ def _run(config):
 
     if not quiet:
         subtitle = config.banner_subtitle(args) if config.banner_subtitle else ""
-        print_banner(f"{config.name} Cloud Sizing", sessions, workloads,
-                     version=config.version, subtitle=subtitle)
+        print_banner(
+            f"{config.name} Cloud Sizing",
+            sessions,
+            workloads,
+            version=config.version,
+            subtitle=subtitle,
+            scope_label=f"{config.scope_noun.capitalize()}s",
+        )
 
     if args.get("validate_only"):
         for handle, scope_id, scope_name in sessions:

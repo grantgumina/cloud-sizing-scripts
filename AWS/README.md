@@ -11,12 +11,12 @@ AWS CloudShell.
 | Workload | Service(s) | Sizing source |
 |----------|-----------|----------------|
 | `ec2` | EC2 instances + attached EBS | Sum of attached EBS volume sizes |
-| `unattached_volumes` | EBS volumes in `available` state | Provisioned volume size |
+| `ebs-unattached` | EBS volumes in `available` state | Provisioned volume size |
 | `s3` | S3 buckets | CloudWatch `BucketSizeBytes` (per storage class) + `NumberOfObjects`; object-enumeration fallback |
 | `efs` | EFS file systems | `SizeInBytes` or CloudWatch `StorageBytes` |
 | `fsx` | FSx file systems + ONTAP SVMs/volumes | Provisioned storage capacity |
 | `rds` | RDS instances | Allocated storage; Aurora used via CloudWatch `VolumeBytesUsed` |
-| `docdb` | DocumentDB clusters + instances | CloudWatch `VolumeBytesUsed` |
+| `documentdb` | DocumentDB clusters + instances | CloudWatch `VolumeBytesUsed` |
 | `dynamodb` | DynamoDB tables | `TableSizeBytes` + item count |
 | `redshift` | Redshift clusters | `TotalStorageCapacityInMegaBytes` |
 | `eks` | EKS clusters | PVC capacity + node count via `kubectl` |
@@ -136,4 +136,4 @@ Exit codes: `0` success · `1` runtime/credential failure · `2` usage error ·
 `s3:ListBucket`, `cloudwatch:GetMetricStatistics`, `elasticfilesystem:Describe*`,
 `fsx:Describe*`, `rds:Describe*`, `rds:ListTagsForResource`, `dynamodb:ListTables`,
 `dynamodb:DescribeTable`, `dynamodb:ListTagsOfResource`, `redshift:DescribeClusters`,
-`redshift:DescribeTags`, `docdb:Describe*`, `eks:ListClusters`, `eks:DescribeCluster`.
+`redshift:DescribeTags`, `documentdb:Describe*`, `eks:ListClusters`, `eks:DescribeCluster`.

@@ -20,9 +20,9 @@ its own .location), so there is no per-region API loop: the run is
 subscription -> workload, with region derived per resource.
 
 Supported workloads:
-    vm, storage_account, file_share, netapp_volume, sql_database,
-    sql_managed_instance, mysql_server, postgresql_server, cosmosdb_account,
-    aks_cluster
+    virtual-machines, storage-accounts, azure-files, azure-netapp-files,
+    azure-sql-database, azure-sql-managed-instance, azure-database-mysql,
+    azure-database-postgresql, azure-cosmos-db, aks, cloud-rewind-quote
 
 Run with --help for usage.
 """
@@ -41,31 +41,19 @@ from dataclasses import dataclass, field
 
 
 # --------------------------------------------------------------------------- #
-# Shared cloud-agnostic toolkit (repo root) + Azure SDK bootstrap
+# Shared cloud-agnostic toolkit (repo root)
 # --------------------------------------------------------------------------- #
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import cloudsizing_common as common  # noqa: E402
-
-for _pkg, _imp in [
-    ("azure-identity", "azure.identity"),
-    ("azure-mgmt-subscription", "azure.mgmt.subscription"),
-    ("azure-mgmt-compute", "azure.mgmt.compute"),
-    ("azure-mgmt-storage", "azure.mgmt.storage"),
-    ("azure-mgmt-monitor", "azure.mgmt.monitor"),
-    ("azure-mgmt-netapp", "azure.mgmt.netapp"),
-    ("azure-mgmt-sql", "azure.mgmt.sql"),
-    ("azure-mgmt-rdbms", "azure.mgmt.rdbms"),
-    ("azure-mgmt-cosmosdb", "azure.mgmt.cosmosdb"),
-    ("azure-mgmt-containerservice", "azure.mgmt.containerservice"),
-]:
-    common.install_and_import(_pkg, _imp)
 
 from azure.identity import DefaultAzureCredential, CredentialUnavailableError  # noqa: E402
 from azure.core.exceptions import (  # noqa: E402
     HttpResponseError, ClientAuthenticationError,
 )
 from azure.mgmt.subscription import SubscriptionClient  # noqa: E402
+from azure.mgmt.resource import ResourceManagementClient  # noqa: E402
 from azure.mgmt.compute import ComputeManagementClient  # noqa: E402
+from azure.mgmt.network import NetworkManagementClient  # noqa: E402
 from azure.mgmt.storage import StorageManagementClient  # noqa: E402
 from azure.mgmt.monitor import MonitorManagementClient  # noqa: E402
 from azure.mgmt.netapp import NetAppManagementClient  # noqa: E402
@@ -146,15 +134,15 @@ _STD_SUM_FIELDS = [("size_gb", "Total Size (GB)"), ("size_tb", "Total Size (TB)"
 
 @dataclass
 class VirtualMachine:
-    WORKLOAD = "vm"
-    INFO_SHEET = "VM Info"
-    SUMMARY_SHEET = "VM Summary"
+    WORKLOAD = "virtual-machines"
+    INFO_SHEET = "Azure VM Info"
+    SUMMARY_SHEET = "Azure VM Summary"
     INFO_HEADERS = _COMMON + ["VM Name", "VM Size", "OS", "Disk Count",
                               "Size (GiB)", "Size (TiB)", "Size (GB)", "Size (TB)",
                               "Disk Details", "Tags"]
     SUMMARY_HEADERS = _STD_SUMMARY
     SUMMARY_SUM_FIELDS = _STD_SUM_FIELDS
-    GRAND_LABEL = "Total VMs"
+    GRAND_LABEL = "Total Azure VMs"
 
     subscription_id: str = ""
     subscription_name: str = ""
@@ -180,15 +168,15 @@ class VirtualMachine:
 
 @dataclass
 class StorageAccount:
-    WORKLOAD = "storage_account"
-    INFO_SHEET = "Storage Account Info"
-    SUMMARY_SHEET = "Storage Account Summary"
+    WORKLOAD = "storage-accounts"
+    INFO_SHEET = "Azure Storage Account Info"
+    SUMMARY_SHEET = "Azure Storage Account Summary"
     INFO_HEADERS = _COMMON + ["Storage Account", "SKU", "Kind", "Access Tier",
                               "Container Count", "Blob Count", "Size (GiB)",
                               "Size (TiB)", "Size (GB)", "Size (TB)", "Tags"]
     SUMMARY_HEADERS = _STD_SUMMARY
     SUMMARY_SUM_FIELDS = _STD_SUM_FIELDS
-    GRAND_LABEL = "Total Storage Accounts"
+    GRAND_LABEL = "Total Azure Storage Accounts"
 
     subscription_id: str = ""
     subscription_name: str = ""
@@ -216,15 +204,15 @@ class StorageAccount:
 
 @dataclass
 class FileShare:
-    WORKLOAD = "file_share"
-    INFO_SHEET = "File Share Info"
-    SUMMARY_SHEET = "File Share Summary"
+    WORKLOAD = "azure-files"
+    INFO_SHEET = "Azure Files Info"
+    SUMMARY_SHEET = "Azure Files Summary"
     INFO_HEADERS = _COMMON + ["Share Name", "Storage Account", "Tier",
                               "Quota (GiB)", "Size (GiB)", "Size (TiB)",
                               "Size (GB)", "Size (TB)"]
     SUMMARY_HEADERS = _STD_SUMMARY
     SUMMARY_SUM_FIELDS = _STD_SUM_FIELDS
-    GRAND_LABEL = "Total File Shares"
+    GRAND_LABEL = "Total Azure File Shares"
 
     subscription_id: str = ""
     subscription_name: str = ""
@@ -248,15 +236,15 @@ class FileShare:
 
 @dataclass
 class NetAppVolume:
-    WORKLOAD = "netapp_volume"
-    INFO_SHEET = "NetApp Info"
-    SUMMARY_SHEET = "NetApp Summary"
+    WORKLOAD = "azure-netapp-files"
+    INFO_SHEET = "Azure NetApp Files Info"
+    SUMMARY_SHEET = "Azure NetApp Files Summary"
     INFO_HEADERS = _COMMON + ["Volume", "NetApp Account", "Capacity Pool",
                               "Service Level", "Provisioned (GiB)", "Size (GiB)",
                               "Size (TiB)", "Size (GB)", "Size (TB)"]
     SUMMARY_HEADERS = _STD_SUMMARY
     SUMMARY_SUM_FIELDS = _STD_SUM_FIELDS
-    GRAND_LABEL = "Total Volumes"
+    GRAND_LABEL = "Total Azure NetApp Volumes"
 
     subscription_id: str = ""
     subscription_name: str = ""
@@ -281,15 +269,15 @@ class NetAppVolume:
 
 @dataclass
 class SQLDatabase:
-    WORKLOAD = "sql_database"
-    INFO_SHEET = "SQL Database Info"
-    SUMMARY_SHEET = "SQL Database Summary"
+    WORKLOAD = "azure-sql-database"
+    INFO_SHEET = "Azure SQL Database Info"
+    SUMMARY_SHEET = "Azure SQL Database Summary"
     INFO_HEADERS = _COMMON + ["Server", "Database", "Edition", "Status",
                               "Max Size (GiB)", "Size (GiB)", "Size (TiB)",
                               "Size (GB)", "Size (TB)"]
     SUMMARY_HEADERS = _STD_SUMMARY
     SUMMARY_SUM_FIELDS = _STD_SUM_FIELDS
-    GRAND_LABEL = "Total Databases"
+    GRAND_LABEL = "Total Azure SQL Databases"
 
     subscription_id: str = ""
     subscription_name: str = ""
@@ -314,15 +302,15 @@ class SQLDatabase:
 
 @dataclass
 class SQLManagedInstance:
-    WORKLOAD = "sql_managed_instance"
-    INFO_SHEET = "SQL Managed Instance Info"
-    SUMMARY_SHEET = "SQL MI Summary"
+    WORKLOAD = "azure-sql-managed-instance"
+    INFO_SHEET = "Azure SQL Managed Instance Info"
+    SUMMARY_SHEET = "Azure SQL MI Summary"
     INFO_HEADERS = _COMMON + ["Managed Instance", "vCores", "License", "State",
                               "Storage (GiB)", "Size (GiB)", "Size (TiB)",
                               "Size (GB)", "Size (TB)"]
     SUMMARY_HEADERS = _STD_SUMMARY
     SUMMARY_SUM_FIELDS = _STD_SUM_FIELDS
-    GRAND_LABEL = "Total Managed Instances"
+    GRAND_LABEL = "Total Azure SQL Managed Instances"
 
     subscription_id: str = ""
     subscription_name: str = ""
@@ -347,15 +335,15 @@ class SQLManagedInstance:
 
 @dataclass
 class MySQLServer:
-    WORKLOAD = "mysql_server"
-    INFO_SHEET = "MySQL Info"
-    SUMMARY_SHEET = "MySQL Summary"
+    WORKLOAD = "azure-database-mysql"
+    INFO_SHEET = "Azure MySQL Info"
+    SUMMARY_SHEET = "Azure MySQL Summary"
     INFO_HEADERS = _COMMON + ["Server", "Type", "Version", "SKU",
                               "Provisioned (GiB)", "Size (GiB)", "Size (TiB)",
                               "Size (GB)", "Size (TB)"]
     SUMMARY_HEADERS = _STD_SUMMARY
     SUMMARY_SUM_FIELDS = _STD_SUM_FIELDS
-    GRAND_LABEL = "Total Servers"
+    GRAND_LABEL = "Total Azure MySQL Servers"
 
     subscription_id: str = ""
     subscription_name: str = ""
@@ -380,15 +368,15 @@ class MySQLServer:
 
 @dataclass
 class PostgreSQLServer:
-    WORKLOAD = "postgresql_server"
-    INFO_SHEET = "PostgreSQL Info"
-    SUMMARY_SHEET = "PostgreSQL Summary"
+    WORKLOAD = "azure-database-postgresql"
+    INFO_SHEET = "Azure PostgreSQL Info"
+    SUMMARY_SHEET = "Azure PostgreSQL Summary"
     INFO_HEADERS = _COMMON + ["Server", "Type", "Version", "SKU",
                               "Provisioned (GiB)", "Size (GiB)", "Size (TiB)",
                               "Size (GB)", "Size (TB)"]
     SUMMARY_HEADERS = _STD_SUMMARY
     SUMMARY_SUM_FIELDS = _STD_SUM_FIELDS
-    GRAND_LABEL = "Total Servers"
+    GRAND_LABEL = "Total Azure PostgreSQL Servers"
 
     subscription_id: str = ""
     subscription_name: str = ""
@@ -413,14 +401,14 @@ class PostgreSQLServer:
 
 @dataclass
 class CosmosDBAccount:
-    WORKLOAD = "cosmosdb_account"
-    INFO_SHEET = "Cosmos DB Info"
-    SUMMARY_SHEET = "Cosmos DB Summary"
+    WORKLOAD = "azure-cosmos-db"
+    INFO_SHEET = "Azure Cosmos DB Info"
+    SUMMARY_SHEET = "Azure Cosmos DB Summary"
     INFO_HEADERS = _COMMON + ["Account", "Kind", "Document Count", "Size (GiB)",
                               "Size (TiB)", "Size (GB)", "Size (TB)"]
     SUMMARY_HEADERS = _STD_SUMMARY
     SUMMARY_SUM_FIELDS = _STD_SUM_FIELDS
-    GRAND_LABEL = "Total Accounts"
+    GRAND_LABEL = "Total Azure Cosmos DB Accounts"
 
     subscription_id: str = ""
     subscription_name: str = ""
@@ -442,16 +430,16 @@ class CosmosDBAccount:
 
 @dataclass
 class AKSCluster:
-    WORKLOAD = "aks_cluster"
-    INFO_SHEET = "AKS Info"
-    SUMMARY_SHEET = "AKS Summary"
+    WORKLOAD = "aks"
+    INFO_SHEET = "Azure AKS Info"
+    SUMMARY_SHEET = "Azure AKS Summary"
     INFO_HEADERS = _COMMON + ["Cluster Name", "Kubernetes Version", "PVC Count",
                               "Node Count", "Size (GiB)", "Size (TiB)",
                               "Size (GB)", "Size (TB)", "PVC Details",
                               "Node Details"]
     SUMMARY_HEADERS = _STD_SUMMARY
     SUMMARY_SUM_FIELDS = _STD_SUM_FIELDS
-    GRAND_LABEL = "Total Clusters"
+    GRAND_LABEL = "Total Azure AKS Clusters"
 
     subscription_id: str = ""
     subscription_name: str = ""
@@ -475,12 +463,154 @@ class AKSCluster:
                 self.size_tb, self.pvc_details, self.node_details]
 
 
+@dataclass
+class CloudRewindQuote:
+    WORKLOAD = "cloud-rewind-quote"
+    INFO_SHEET = "Cloud Rewind Info"
+    SUMMARY_SHEET = "Cloud Rewind Summary"
+    INFO_HEADERS = [
+        "Subscription ID", "Subscription Name", "Resource Group", "Subscription",
+        "Resource Name", "Resource Type", "Billing Category", "Resource Class",
+        "Billable Data", "Billable Config", "Non-Billable Data",
+        "Non-Billable Config", "Total Billable", "Total Non-Billable", "Total Count",
+    ]
+    SUMMARY_HEADERS = [
+        "Subscription", "Protectable Resources", "Billable Data", "Billable Config",
+        "Non-Billable Data", "Non-Billable Config", "Total Billable",
+        "Total Non-Billable", "Total Count",
+    ]
+    SUMMARY_SUM_FIELDS = [
+        ("protectable_count", "Protectable Resources"),
+        ("billable_data", "Billable Data"),
+        ("billable_config", "Billable Config"),
+        ("non_billable_data", "Non-Billable Data"),
+        ("non_billable_config", "Non-Billable Config"),
+        ("total_billable", "Total Billable"),
+        ("total_non_billable", "Total Non-Billable"),
+        ("total_count", "Total Count"),
+    ]
+    GRAND_LABEL = "Tenant Total"
+
+    subscription_id: str = ""
+    subscription_name: str = ""
+    resource_group: str = ""
+    region: str = ""
+    resource_name: str = ""
+    resource_type: str = ""
+    billing_category: str = ""
+    resource_class: str = ""
+    billable_data: int = 0
+    billable_config: int = 0
+    non_billable_data: int = 0
+    non_billable_config: int = 0
+    total_billable: int = 0
+    total_non_billable: int = 0
+    total_count: int = 0
+    protectable_count: int = 0
+
+    def to_row(self):
+        return [
+            self.subscription_id, self.subscription_name, self.resource_group,
+            self.region, self.resource_name, self.resource_type,
+            self.billing_category, self.resource_class, self.billable_data,
+            self.billable_config, self.non_billable_data, self.non_billable_config,
+            self.total_billable, self.total_non_billable, self.total_count,
+        ]
+
+
 # Registry of all workload classes, in display order.
 WORKLOAD_CLASSES = [
     VirtualMachine, StorageAccount, FileShare, NetAppVolume, SQLDatabase,
     SQLManagedInstance, MySQLServer, PostgreSQLServer, CosmosDBAccount, AKSCluster,
+    CloudRewindQuote,
 ]
 WORKLOAD_BY_KEY = {cls.WORKLOAD: cls for cls in WORKLOAD_CLASSES}
+
+
+# Cloud Rewind quote classification constants.
+CRW_BILLABLE_RESOURCE_TYPES = {
+    "microsoft.web/sites",
+    "microsoft.network/applicationgateways",
+    "microsoft.network/azurefirewalls",
+    "microsoft.keyvault/vaults",
+    "microsoft.network/loadbalancers",
+    "microsoft.compute/disks",
+    "microsoft.network/natgateways",
+    "microsoft.network/publicipaddresses",
+    "microsoft.sql/servers",
+    "microsoft.sql/servers/databases",
+    "microsoft.storage/storageaccounts",
+    "microsoft.compute/virtualmachines",
+    "microsoft.network/virtualnetworks",
+    "microsoft.compute/virtualmachinescalesets",
+}
+
+CRW_NON_BILLABLE_RESOURCE_TYPES = {
+    "microsoft.web/serverfarms",
+    "microsoft.compute/availabilitysets",
+    "microsoft.network/networkinterfaces",
+    "microsoft.network/networksecuritygroups",
+    "microsoft.network/privateendpoints",
+    "microsoft.network/routetables",
+    "microsoft.network/virtualnetworkpeerings",
+    "microsoft.compute/images",
+    "microsoft.compute/virtualmachinescalesets/virtualmachines",
+}
+
+CRW_FILTER_UNUSED_RESOURCE_TYPES = {
+    "microsoft.compute/disks",
+    "microsoft.network/publicipaddresses",
+    "microsoft.network/networkinterfaces",
+    "microsoft.network/networksecuritygroups",
+    "microsoft.network/applicationgateways",
+    "microsoft.network/loadbalancers",
+    "microsoft.network/virtualnetworks",
+}
+
+
+def _cloud_rewind_resource_class(resource_type):
+    if resource_type in ("microsoft.compute/virtualmachines", "microsoft.compute/disks"):
+        return "Data"
+    return "Config"
+
+
+def _cloud_rewind_test_resource_associated(resource, resource_type, compute, network):
+    rg = rg_from_id(resource.id)
+    name = resource.name
+
+    try:
+        if resource_type == "microsoft.compute/disks":
+            disk = compute.disks.get(rg, name)
+            return bool(getattr(disk, "managed_by", None))
+
+        if resource_type == "microsoft.network/publicipaddresses":
+            pip = network.public_ip_addresses.get(rg, name)
+            return bool(getattr(pip, "ip_configuration", None))
+
+        if resource_type == "microsoft.network/networkinterfaces":
+            nic = network.network_interfaces.get(rg, name)
+            return bool(getattr(nic, "virtual_machine", None))
+
+        if resource_type == "microsoft.network/networksecuritygroups":
+            nsg = network.network_security_groups.get(rg, name)
+            return bool((nsg.subnets or []) or (nsg.network_interfaces or []))
+
+        if resource_type == "microsoft.network/applicationgateways":
+            agw = network.application_gateways.get(rg, name)
+            return bool((agw.http_listeners or []) or (agw.backend_address_pools or []))
+
+        if resource_type == "microsoft.network/loadbalancers":
+            lb = network.load_balancers.get(rg, name)
+            return bool((lb.frontend_ip_configurations or []) or (lb.backend_address_pools or []))
+
+        if resource_type == "microsoft.network/virtualnetworks":
+            vnet = network.virtual_networks.get(rg, name)
+            return bool((vnet.subnets or []) or (vnet.virtual_network_peerings or []))
+    except (HttpResponseError, Exception) as exc:  # noqa: BLE001
+        logging.debug(f"Cloud Rewind association check failed for {resource.id}: {exc}")
+        return False
+
+    return True
 
 
 # --------------------------------------------------------------------------- #
@@ -805,17 +935,103 @@ def collect_aks_cluster(credential, sub_id, sub_name):
     return out
 
 
+def collect_cloud_rewind_quote(credential, sub_id, sub_name):
+    out = []
+    resources = ResourceManagementClient(credential, sub_id)
+    compute = ComputeManagementClient(credential, sub_id)
+    network = NetworkManagementClient(credential, sub_id)
+
+    for resource in resources.resources.list():
+        rtype = (resource.type or "").lower()
+
+        # Exclude Azure SQL master DB.
+        if rtype == "microsoft.sql/servers/databases" and (resource.name or "").lower().endswith("/master"):
+            continue
+
+        # Exclude specific unused/unattached resource types.
+        if rtype in CRW_FILTER_UNUSED_RESOURCE_TYPES and not _cloud_rewind_test_resource_associated(
+                resource, rtype, compute, network):
+            continue
+
+        # Include only uniform-orchestration VMSS.
+        if rtype == "microsoft.compute/virtualmachinescalesets":
+            rg = rg_from_id(resource.id)
+            try:
+                vmss = compute.virtual_machine_scale_sets.get(rg, resource.name)
+                if _enum(getattr(vmss, "orchestration_mode", "")).lower() != "uniform":
+                    continue
+            except (HttpResponseError, Exception) as exc:  # noqa: BLE001
+                logging.debug(f"Cloud Rewind VMSS check failed for {resource.id}: {exc}")
+                continue
+
+        # For disks, count only managed data disks (exclude OS disks).
+        if rtype == "microsoft.compute/disks":
+            rg = rg_from_id(resource.id)
+            try:
+                disk = compute.disks.get(rg, resource.name)
+                if getattr(disk, "os_type", None):
+                    continue
+            except (HttpResponseError, Exception) as exc:  # noqa: BLE001
+                logging.debug(f"Cloud Rewind disk check failed for {resource.id}: {exc}")
+                continue
+
+        rclass = _cloud_rewind_resource_class(rtype)
+
+        billing_category = ""
+        billable_data = 0
+        billable_config = 0
+        non_billable_data = 0
+        non_billable_config = 0
+
+        if rtype in CRW_BILLABLE_RESOURCE_TYPES:
+            billing_category = "Billable"
+            if rclass == "Data":
+                billable_data = 1
+            else:
+                billable_config = 1
+        elif rtype in CRW_NON_BILLABLE_RESOURCE_TYPES:
+            billing_category = "Non-Billable"
+            if rclass == "Data":
+                non_billable_data = 1
+            else:
+                non_billable_config = 1
+        else:
+            continue
+
+        out.append(CloudRewindQuote(
+            subscription_id=sub_id,
+            subscription_name=sub_name,
+            resource_group=rg_from_id(resource.id),
+            region=sub_name,
+            resource_name=resource.name,
+            resource_type=resource.type,
+            billing_category=billing_category,
+            resource_class=rclass,
+            billable_data=billable_data,
+            billable_config=billable_config,
+            non_billable_data=non_billable_data,
+            non_billable_config=non_billable_config,
+            total_billable=billable_data + billable_config,
+            total_non_billable=non_billable_data + non_billable_config,
+            total_count=1,
+            protectable_count=1 if billing_category == "Billable" else 0,
+        ))
+
+    return out
+
+
 COLLECTORS = {
-    "vm": collect_vm,
-    "storage_account": collect_storage_account,
-    "file_share": collect_file_share,
-    "netapp_volume": collect_netapp_volume,
-    "sql_database": collect_sql_database,
-    "sql_managed_instance": collect_sql_managed_instance,
-    "mysql_server": collect_mysql_server,
-    "postgresql_server": collect_postgresql_server,
-    "cosmosdb_account": collect_cosmosdb_account,
-    "aks_cluster": collect_aks_cluster,
+    "virtual-machines": collect_vm,
+    "storage-accounts": collect_storage_account,
+    "azure-files": collect_file_share,
+    "azure-netapp-files": collect_netapp_volume,
+    "azure-sql-database": collect_sql_database,
+    "azure-sql-managed-instance": collect_sql_managed_instance,
+    "azure-database-mysql": collect_mysql_server,
+    "azure-database-postgresql": collect_postgresql_server,
+    "azure-cosmos-db": collect_cosmosdb_account,
+    "aks": collect_aks_cluster,
+    "cloud-rewind-quote": collect_cloud_rewind_quote,
 }
 
 

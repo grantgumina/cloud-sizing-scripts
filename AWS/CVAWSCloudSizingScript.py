@@ -15,7 +15,7 @@ the native AWS SDK (boto3) for all API access and shells out to kubectl only for
 EKS persistent-volume sizing (mirroring the OCI reference script's OKE handling).
 
 Supported workloads:
-    ec2, unattached_volumes, s3, efs, fsx, rds, docdb, dynamodb, redshift, eks
+    ec2, ebs-unattached, s3, efs, fsx, fsx-svm, rds, documentdb, dynamodb, redshift, eks
 
 Run with --help for usage.
 """
@@ -35,12 +35,10 @@ from dataclasses import dataclass, field
 
 
 # --------------------------------------------------------------------------- #
-# Shared cloud-agnostic toolkit (repo root) + AWS SDK bootstrap
+# Shared cloud-agnostic toolkit (repo root)
 # --------------------------------------------------------------------------- #
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import cloudsizing_common as common  # noqa: E402
-
-common.install_and_import("boto3", "boto3")
 
 import boto3  # noqa: E402
 from botocore.config import Config  # noqa: E402
@@ -175,7 +173,7 @@ class EC2Instance:
 
 @dataclass
 class UnattachedVolume:
-    WORKLOAD = "unattached_volumes"
+    WORKLOAD = "ebs-unattached"
     INFO_SHEET = "Unattached EBS Info"
     SUMMARY_SHEET = "Unattached EBS Summary"
     INFO_HEADERS = _COMMON + ["Volume ID", "Volume Type", "State", "Create Time",
@@ -302,7 +300,7 @@ class FSxFileSystem:
 
 @dataclass
 class FSxSVM:
-    WORKLOAD = "fsx_svm"
+    WORKLOAD = "fsx-svm"
     INFO_SHEET = "FSx SVM Info"
     SUMMARY_SHEET = "FSx SVM Summary"
     INFO_HEADERS = _COMMON + ["File System ID", "SVM ID", "Name", "State", "UUID",
@@ -367,7 +365,7 @@ class RDSInstance:
 
 @dataclass
 class DocumentDBCluster:
-    WORKLOAD = "docdb"
+    WORKLOAD = "documentdb"
     INFO_SHEET = "DocumentDB Info"
     SUMMARY_SHEET = "DocumentDB Summary"
     INFO_HEADERS = _COMMON + ["Cluster Identifier", "Engine", "Engine Version", "Status",
@@ -974,10 +972,10 @@ def collect_eks(session, region, account_id, alias):
 # (returns two workloads) are handled specially in the driver.
 REGION_COLLECTORS = {
     "ec2": collect_ec2,
-    "unattached_volumes": collect_unattached_volumes,
+    "ebs-unattached": collect_unattached_volumes,
     "efs": collect_efs,
     "rds": collect_rds,
-    "docdb": collect_docdb,
+    "documentdb": collect_docdb,
     "dynamodb": collect_dynamodb,
     "redshift": collect_redshift,
     "eks": collect_eks,
@@ -1061,7 +1059,7 @@ def collect_account(session, account_id, alias, regions, workloads,
     """
     data = {wl: [] for wl in WORKLOAD_BY_KEY}
     region_workloads = [w for w in workloads if w in REGION_COLLECTORS]
-    fsx_selected = "fsx" in workloads or "fsx_svm" in workloads
+    fsx_selected = "fsx" in workloads or "fsx-svm" in workloads
     label = label or alias or account_id or "account"
 
     for region in regions:
@@ -1080,8 +1078,8 @@ def collect_account(session, account_id, alias, regions, workloads,
                 fs_list, svm_list = collect_fsx(session, region, account_id, alias)
                 if "fsx" in workloads:
                     data["fsx"].extend(fs_list)
-                if "fsx" in workloads or "fsx_svm" in workloads:
-                    data["fsx_svm"].extend(svm_list)
+                if "fsx" in workloads or "fsx-svm" in workloads:
+                    data["fsx-svm"].extend(svm_list)
             except Exception as exc:
                 logging.error(f"[{account_id}/{region}] FSx collector crashed: {exc}")
         if reporter:

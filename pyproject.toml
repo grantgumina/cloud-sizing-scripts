@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cloud-sizing-scripts"
+version = "0.1.0"
+description = "Cloud resource discovery and sizing tools for multiple cloud providers"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "openpyxl>=3.1.5",
+    "rich>=13.0.0",
+]
+
+[tool.setuptools]
+packages = []
+
+[project.optional-dependencies]
+aws = ["cv-aws-cloud-sizing"]
+azure = ["cv-azure-cloud-sizing"]
+all = [
+    "cv-aws-cloud-sizing",
+    "cv-azure-cloud-sizing",
+]
+
+[tool.uv]
+workspace.members = ["AWS", "Azure"]
+
+[tool.uv.sources]
+cv-aws-cloud-sizing = { workspace = true }
+cv-azure-cloud-sizing = { workspace = true }
