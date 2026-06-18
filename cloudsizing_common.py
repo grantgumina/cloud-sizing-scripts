@@ -289,8 +289,11 @@ def _workload_totals(data, workload_classes):
     return out
 
 
-def render_summary_table(combined, workload_classes):
-    """Print a per-workload grand-total table to the console (stderr)."""
+def render_summary_table(combined, workload_classes, extra=None):
+    """Print a per-workload grand-total table to the console (stderr).
+
+    `extra` (optional) is {"title", "rows": [(label, value), ...]} appended as a
+    labeled section below the workload rows (e.g. backup coverage)."""
     totals = _workload_totals(combined, workload_classes)
     if not totals:
         console.print("No resources found.", style="yellow")
@@ -324,11 +327,17 @@ def render_summary_table(combined, workload_classes):
             )
         else:
             table.add_row(name, f"{block['count']:,}", tb_str)
+    if extra and extra.get("rows"):
+        table.add_row(Text(extra.get("title", "Extra"), style="bold"), "", "")
+        rows = extra["rows"]
+        for i, (lbl, val) in enumerate(rows):
+            connector = "└─" if i == len(rows) - 1 else "├─"
+            table.add_row(Text(f"  {connector} {lbl}", style="dim"), str(val), "")
     console.print(table)
 
 
 def build_json_summary(scope_items, combined, comprehensive, workload_classes,
-                       meta=None):
+                       meta=None, extra=None):
     """Assemble the machine-readable summary emitted to stdout under --json."""
     out = dict(meta or {})
     out["scopes"] = [
@@ -338,6 +347,8 @@ def build_json_summary(scope_items, combined, comprehensive, workload_classes,
     ]
     out["combined"] = _workload_totals(combined, workload_classes)
     out["comprehensive_workbook"] = comprehensive
+    if extra and extra.get("rows"):
+        out[extra.get("key", "extra_summary")] = {lbl: val for lbl, val in extra["rows"]}
     return out
 
 
@@ -530,6 +541,9 @@ class CloudConfig:
     noisy_loggers: tuple = ()
     banner_subtitle: object = None  # optional callable(args) -> str
     scope_already_filtered: object = None  # callable(args) -> bool (skip picker)
+    # optional callable(combined) -> {"title", "key", "rows": [(label, value)]} | None
+    # for an extra section in the summary table + --json (e.g. backup coverage)
+    extra_summary_rows: object = None
 
 
 def run_sizing(config):
@@ -653,8 +667,11 @@ def _run(config):
             _, grand = build_summary(infos, cls)
             logging.debug(f"Grand total - {cls.INFO_SHEET}: {grand}")
 
+    extra_summary = (config.extra_summary_rows(combined)
+                     if getattr(config, "extra_summary_rows", None) else None)
+
     if not quiet:
-        render_summary_table(combined, config.workload_classes)
+        render_summary_table(combined, config.workload_classes, extra_summary)
 
     # Machine-readable output -> stdout (and ONLY this goes to stdout).
     if args.get("json"):
@@ -662,7 +679,8 @@ def _run(config):
         if config.banner_subtitle:
             meta["scope_note"] = config.banner_subtitle(args)
         print(json.dumps(build_json_summary(per_scope, combined, comprehensive,
-                                            config.workload_classes, meta), indent=2))
+                                            config.workload_classes, meta,
+                                            extra_summary), indent=2))
     else:
         for path in written:
             print(path)

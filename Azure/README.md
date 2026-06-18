@@ -30,6 +30,39 @@ Sizes are reported in both binary (GiB/TiB) and decimal (GB/TB) units. Azure
 Monitor metrics use Maximum aggregation over a 1-hour lookback (NetApp uses
 Average), mirroring the original PowerShell behavior.
 
+## Backup detection
+
+By default the script also reports whether each discovered resource is **already
+protected by an Azure-native mechanism** — useful for deciding what still needs
+Commvault protection. Every workload's **Info** sheet gains the columns
+`Native Backup` (Yes/No), `Backup Type`, `Backup Vault`, `Backup Policy`,
+`Last Backup`, and `Snapshot Count`, and the run-summary gains a **Backup
+coverage** section (protected vs unprotected per workload). Three sources are
+detected:
+
+- **Azure Backup service** — both classic **Recovery Services vaults** and the
+  newer DataProtection **Backup vaults** (VMs, Azure Files, disks, blobs, AKS,
+  PostgreSQL, …). `Backup Type` is `RSV` or `Backup Vault`.
+- **Snapshots** — managed-disk snapshots (mapped to their VM). `Backup Type` is
+  `Snapshot`. Note a snapshot proves a point-in-time copy exists, **not** an
+  ongoing/scheduled backup.
+- **Built-in PaaS backup** — always-on automated backups for SQL (PITR),
+  MySQL/PostgreSQL (retention), and Cosmos DB (backup policy). `Backup Type` is
+  `Built-in`. These are nearly always on, so those workloads almost always show
+  as protected.
+
+Detection runs **Azure Resource Graph (ARG)** queries (the `RecoveryServicesResources`
+and `Resources` tables) scoped per subscription — **Reader** already covers them,
+no extra role is needed. Pass `--no-backup-status` to skip it (faster, no ARG
+calls). Detection is **best-effort**: if the Resource Graph provider/package is
+unavailable or RBAC denies the query, the backup columns are simply left blank
+and the run still produces its workbooks.
+
+Caveats: ARG reflects current protection *state* but recovery-point/job data can
+lag (ARG keeps ~14 days of job history), so `Last Backup` is best-effort;
+classic (ASM) resources and data-plane blob snapshots are not covered;
+soft-deleted/stopped protection is reported with its state shown in `Backup Type`.
+
 ## Output
 
 - `Metrics/<subscription>_summary_<timestamp>.xlsx` — one workbook per subscription.
@@ -47,10 +80,11 @@ sheet (per-region counts/totals with a bold grand-total row) per workload.
   - `pip install -r ../requirements.txt` (the repo-wide requirements file), or
   - `pip install -e .` from this directory (uses `pyproject.toml`).
   - The script also auto-installs its dependencies on first run.
-- Azure credentials (see below). RBAC: **Reader** on the target subscriptions;
-  **Reader and Data Access** is also helpful for storage-account metrics; for
-  `aks_cluster`, **Azure Kubernetes Service Cluster User** plus `kubectl` on
-  `PATH` (AAD-integrated clusters may additionally need `kubelogin`).
+- Azure credentials (see below). RBAC: **Reader** on the target subscriptions
+  (also covers the Azure Resource Graph backup-detection queries — no extra role
+  needed); **Reader and Data Access** is also helpful for storage-account
+  metrics; for `aks_cluster`, **Azure Kubernetes Service Cluster User** plus
+  `kubectl` on `PATH` (AAD-integrated clusters may additionally need `kubelogin`).
 
 ### Verify credentials before running
 
@@ -101,6 +135,7 @@ numbered picker so you can choose which subscriptions to scan. Pass
 | `--tenant=TENANT_ID` | Only subscriptions in this tenant |
 | `--regions=r1,r2` | Regions to collect resources from (default: all). `--locations` is accepted as an alias |
 | `--workload=vm,storage_account,...` | Limit to specific workloads (default: `all`) |
+| `--no-backup-status` | Skip detecting existing Azure-native backup protection (on by default; uses Azure Resource Graph, needs Reader) |
 | `--validate-only` | Run the credential preflight, report the subscriptions/regions that would be collected, then exit without collecting |
 | `--json` | Emit a machine-readable summary to **stdout** (for `jq`/scripting) |
 | `-q`, `--quiet` | Only warnings and errors; no progress or summary |
