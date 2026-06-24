@@ -25,19 +25,21 @@ Every size is reported in both binary (GiB/TiB) and decimal (GB/TB) units.
 
 ## Output
 
-- `Metrics/<account>_summary_<timestamp>.xlsx` — one workbook per account.
-- `Metrics/comprehensive_all_aws_accounts_<timestamp>.xlsx` — combined workbook (only when more than one account is processed).
-- `Logs/aws_sizing_<timestamp>.log` — execution log.
+A run writes per-account workbooks to `Metrics/<account>_summary_<timestamp>.xlsx` (plus a combined
+`comprehensive_all_aws_accounts_<timestamp>.xlsx` when more than one account is processed) and a log
+to `Logs/aws_sizing_<timestamp>.log`. Each workbook has an **Info** sheet (one row per resource) and
+a **Summary** sheet (per-region totals with a bold grand-total row) per workload.
 
-Each workbook has an **Info** sheet (one row per resource) and a **Summary**
-sheet (per-region counts/totals with a bold grand-total row) per workload.
+See **[Understanding the output](../README.md#output)** in the root README for the full, shared
+reference — the CLI summary, the `--json` shape, and the spreadsheet sheet/column layout.
 
 ## Prerequisites
 
-- Python 3.12+
-- Dependencies: `boto3`, `openpyxl`, `rich`. Install any one way:
-  - `pip install -r ../requirements.txt` (the repo-wide requirements file for all tools), or
-  - `pip install boto3 openpyxl rich` (just this tool's deps; the script also auto-installs these on first run).
+- Python 3.12+ and [uv](https://docs.astral.sh/uv/). Install from the repo root with
+  `uv sync --extra aws` (or `uv sync --all-extras`) — see the [root README](../README.md#setup).
+  This tool's only added dependency is `boto3`; the shared `openpyxl`/`rich` come from the root.
+  Then run it with `uv run python CVAWSCloudSizingScript.py …` from this directory (or
+  `uv run python AWS/CVAWSCloudSizingScript.py …` from the repo root).
 - AWS credentials (a configured profile, environment variables, an instance/CloudShell role, or a cross-account role).
 - For the `eks` workload: `kubectl` and the AWS CLI (`aws`) on `PATH`, and the running identity must be permitted in each cluster's access config (`aws-auth`/access entries).
 
@@ -105,18 +107,10 @@ Run `python CVAWSCloudSizingScript.py --help` for the full grouped list with exa
 
 ## Terminal output
 
-The script is TTY-aware and separates streams so it composes well in pipelines:
-
-- **stderr** — human-facing output: a live progress display (per account/region/
-  workload, plus the S3 object-enumeration counter), status lines, the summary
-  table, and warnings/errors. Color and progress animation are disabled
-  automatically when output is not a terminal, when `NO_COLOR`/`--no-color` is
-  set, or under `--quiet`.
-- **stdout** — machine output only: the written workbook path(s) by default, or a
-  full JSON summary with `--json`. Nothing else is written to stdout, so
-  `... --json | jq .` and `... > files.txt` work cleanly.
-- **`Logs/aws_sizing_<ts>.log`** — the complete, timestamped run log (unchanged
-  format) for later analysis, regardless of console verbosity.
+stderr carries the human-facing output (the live progress display — including the S3
+object-enumeration counter — and the summary table); stdout carries only machine output (workbook
+paths, or `--json`). See **[CLI summary](../README.md#cli-summary)** in the root README for the full
+reference (streams, `--json` shape, exit codes).
 
 ```bash
 # Machine-readable totals for two regions, piped to jq
@@ -125,9 +119,6 @@ python CVAWSCloudSizingScript.py --json --regions=us-east-1,us-west-2 | jq '.com
 # Quiet run in CI: only the workbook paths reach stdout
 python CVAWSCloudSizingScript.py --quiet --no-input > artifacts.txt
 ```
-
-Exit codes: `0` success · `1` runtime/credential failure · `2` usage error ·
-`130` interrupted (Ctrl-C).
 
 ## Required IAM permissions (read-only)
 

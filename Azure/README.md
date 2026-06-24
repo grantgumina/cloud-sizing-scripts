@@ -65,21 +65,25 @@ soft-deleted/stopped protection is reported with its state shown in `Backup Type
 
 ## Output
 
-- `Metrics/<subscription>_summary_<timestamp>.xlsx` — one workbook per subscription.
-- `Metrics/comprehensive_all_azure_subscriptions_<timestamp>.xlsx` — combined workbook (only when more than one subscription is processed).
-- `Logs/azure_sizing_<timestamp>.log` — full timestamped execution log.
+A run writes per-subscription workbooks to `Metrics/<subscription>_summary_<timestamp>.xlsx` (plus a
+combined `comprehensive_all_azure_subscriptions_<timestamp>.xlsx` when more than one subscription is
+processed) and a log to `Logs/azure_sizing_<timestamp>.log`. Each workbook has an **Info** sheet (one
+row per resource — including the six backup columns described above) and a **Summary** sheet
+(per-region totals with a bold grand-total row) per workload.
 
-Each workbook has an **Info** sheet (one row per resource) and a **Summary**
-sheet (per-region counts/totals with a bold grand-total row) per workload.
+See **[Understanding the output](../README.md#output)** in the root README for the full, shared
+reference — the CLI summary (including the **Backup coverage** rollup), the `--json` shape, and the
+spreadsheet sheet/column layout.
 
 ## Prerequisites
 
-- Python 3.12+
-- Dependencies: `openpyxl`, `rich`, and the `azure-identity` / `azure-mgmt-*`
-  SDKs. Install any one way:
-  - `pip install -r ../requirements.txt` (the repo-wide requirements file), or
-  - `pip install -e .` from this directory (uses `pyproject.toml`).
-  - The script also auto-installs its dependencies on first run.
+- Python 3.12+ and [uv](https://docs.astral.sh/uv/). Install from the repo root with
+  `uv sync --extra azure` (or `uv sync --all-extras`) — see the [root README](../README.md#setup).
+  This tool adds the `azure-identity` / `azure-mgmt-*` SDKs; the shared `openpyxl`/`rich` come from
+  the root. Then run it with `uv run python CVAzureCloudSizingScript.py …` from this directory (or
+  `uv run python Azure/CVAzureCloudSizingScript.py …` from the repo root). (If an Azure-only sync
+  hits `ModuleNotFoundError: No module named 'six'`, use `uv sync --all-extras` — see the root
+  [Troubleshooting](../README.md#troubleshooting).)
 - Azure credentials (see below). RBAC: **Reader** on the target subscriptions
   (also covers the Azure Resource Graph backup-detection queries — no extra role
   needed); **Reader and Data Access** is also helpful for storage-account
@@ -148,11 +152,10 @@ Run `python CVAzureCloudSizingScript.py --help` for the full grouped list.
 
 ## Terminal output
 
-Like the AWS tool, the script is TTY-aware and separates streams: **stderr**
-carries human output (progress, summary table, warnings/errors) while **stdout**
-carries only machine output (the written workbook paths, or `--json`). Exit
-codes: `0` success · `1` runtime/credential failure · `2` usage error · `130`
-interrupted (Ctrl-C).
+stderr carries human output (progress, summary table, the **Backup coverage** rollup,
+warnings/errors); stdout carries only machine output (the written workbook paths, or `--json`). See
+**[CLI summary](../README.md#cli-summary)** in the root README for the full reference (streams,
+`--json` shape, exit codes).
 
 ```bash
 # Machine-readable totals, piped to jq
