@@ -1,0 +1,36 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cv-sizing-config
+  namespace: commvault
+data:
+  # Sales AI Hub callback URL — the backend that receives the sizing JSON
+  CALLBACK_URL: "https://your-cvchatapp-host.example.com"   # UPDATE THIS
+
+  # Azure Blob SAS container URL for result upload (optional)
+  # If empty, the script POSTs the JSON inline to CALLBACK_URL
+  OUTPUT_BLOB_SAS_URL: ""
+
+  # Force the shared console layer into plain, non-interactive mode (no progress bars / rich UI, no ANSI).
+  # Belt-and-suspenders: the scripts also auto-detect no-TTY / container, but this makes it explicit for pod logs.
+  CV_SIZING_HEADLESS: "1"
+
+---
+# Secret for callback API key — create separately:
+# kubectl create secret generic cv-sizing-config-secret \
+#   --from-literal=callback_api_key=USER_KEY_xxxxx \
+#   -n commvault
+
+# Secret for Azure credentials — create separately:
+# kubectl create secret generic cv-sizing-azure-creds \
+#   --from-literal=tenant_id=<tenant_id> \
+#   --from-literal=client_id=<client_id> \
+#   --from-literal=client_secret=<client_secret> \
+#   --from-literal=subscription_ids=<sub1,sub2> \
+#   -n commvault
+
+# Secret for OCI credentials — create separately:
+# kubectl create secret generic cv-sizing-oci-creds \
+#   --from-literal=config_base64=$(base64 -w0 ~/.oci/config) \
+#   --from-literal=key_base64=$(base64 -w0 ~/.oci/oci_api_key.pem) \
+#   -n commvault

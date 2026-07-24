@@ -1,0 +1,73 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: azure-sizing-${ACCOUNT_ID_SLUG}-${RUN_ID}   # rendered at launch time
+  namespace: commvault                               # update to your namespace
+  labels:
+    app: cv-cloud-sizing
+    cloud: azure
+    account-id: "${ACCOUNT_ID}"
+spec:
+  ttlSecondsAfterFinished: 3600      # auto-cleanup 1h after completion
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: cv-cloud-sizing
+        cloud: azure
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: azure-sizing
+          image: ${REGISTRY}/cv-sizing-azure:latest  # set REGISTRY env var at build time
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          envFrom:
+            - configMapRef:
+                name: cv-sizing-config          # shared config (CALLBACK_URL, OUTPUT_BLOB_SAS_URL)
+          env:
+            # Account context (set by trigger API)
+            - name: ACCOUNT_ID
+              value: "${ACCOUNT_ID}"
+            - name: SESSION_ID
+              value: "${SESSION_ID}"
+            - name: SIZING_TYPES
+              value: ""                         # e.g. "VM,Storage,SQL" — empty = all
+            - name: ENV_TAG_VALUES
+              value: ""                         # e.g. "Production,Prod"
+            # Azure credentials (from Secret)
+            - name: AZURE_TENANT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: cv-sizing-azure-creds
+                  key: tenant_id
+            - name: AZURE_CLIENT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: cv-sizing-azure-creds
+                  key: client_id
+            - name: AZURE_CLIENT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: cv-sizing-azure-creds
+                  key: client_secret
+            - name: AZURE_SUBSCRIPTION_IDS
+              valueFrom:
+                secretKeyRef:
+                  name: cv-sizing-azure-creds
+                  key: subscription_ids
+                  optional: true
+            # Callback API key
+            - name: CALLBACK_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cv-sizing-config-secret
+                  key: callback_api_key
+      imagePullSecrets:
+        - name: cv-registry-secret              # update if using private registry

@@ -1,0 +1,21 @@
+# Python-generated files (OCI subproject)
+src/OCI/__pycache__/
+src/OCI/*.py[oc]
+src/OCI/build/
+src/OCI/dist/
+src/OCI/wheels/
+src/OCI/*.egg-info
+
+# Virtual environments
+src/OCI/.venv
+
+src/OCI/Logs
+src/OCI/Metrics
+
+# Run artifacts - all sizing output + logs now land in these top-level folders
+Output/
+Logs/
+*.log
+
+.DS_Store
+**/.DS_Store

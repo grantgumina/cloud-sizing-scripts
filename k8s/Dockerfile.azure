@@ -1,0 +1,31 @@
+# Azure Cloud Sizing Script runner
+FROM mcr.microsoft.com/powershell:7.4-ubuntu-22.04
+
+LABEL maintainer="Commvault Sales Engineering"
+LABEL description="Azure cloud sizing script runner for Kubernetes Jobs"
+
+# Install Az PowerShell modules (pinned for reproducibility) + PwshSpectreConsole (the shared console layer's
+# rich renderer). In this headless Job output is plain by design, but baking Spectre in keeps the dependency
+# set uniform and lets `docker run -it` render richly for interactive debugging.
+RUN pwsh -Command "\
+    Set-PSRepository PSGallery -InstallationPolicy Trusted; \
+    Install-Module -Name Az.Accounts,Az.Compute,Az.Storage,Az.Monitor,Az.Resources,Az.NetAppFiles,Az.CosmosDB,Az.Sql,Az.MySql,Az.PostgreSql,Az.Aks,Az.RecoveryServices,Az.VMware,PwshSpectreConsole -Scope AllUsers -Force -AllowClobber"
+
+# Install kubectl (for AKS PV inventory)
+RUN apt-get update && apt-get install -y curl && \
+    curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl" && \
+    install -o root -g root -m 0755 kubectl /usr/local/bin/kubectl && \
+    rm kubectl && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /scripts
+COPY src/CVAzureCloudSizingScript.ps1 .
+# Shared console/diagnostics layer. The script dot-sources it from ./common at runtime (its dev-fallback),
+# so it must sit next to the script: /scripts/CVAzure...ps1 -> /scripts/common/CVSizing.Console.ps1
+COPY src/common ./common
+
+# Entrypoint: wrapper that runs script and posts results to callback URL
+COPY k8s/entrypoints/azure-entrypoint.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh
+
+ENTRYPOINT ["/entrypoint.sh"]

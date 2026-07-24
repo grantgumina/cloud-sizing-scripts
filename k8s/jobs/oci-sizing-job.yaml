@@ -1,0 +1,57 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: oci-sizing-${ACCOUNT_ID_SLUG}-${RUN_ID}
+  namespace: commvault
+  labels:
+    app: cv-cloud-sizing
+    cloud: oci
+    account-id: "${ACCOUNT_ID}"
+spec:
+  ttlSecondsAfterFinished: 3600
+  backoffLimit: 1
+  template:
+    metadata:
+      labels:
+        app: cv-cloud-sizing
+        cloud: oci
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: oci-sizing
+          image: ${REGISTRY}/cv-sizing-oci:latest
+          imagePullPolicy: Always
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          envFrom:
+            - configMapRef:
+                name: cv-sizing-config
+          env:
+            - name: ACCOUNT_ID
+              value: "${ACCOUNT_ID}"
+            - name: SESSION_ID
+              value: "${SESSION_ID}"
+            - name: OCI_WORKLOAD
+              value: "all"
+            - name: OCI_CONFIG_BASE64
+              valueFrom:
+                secretKeyRef:
+                  name: cv-sizing-oci-creds
+                  key: config_base64
+            - name: OCI_KEY_BASE64
+              valueFrom:
+                secretKeyRef:
+                  name: cv-sizing-oci-creds
+                  key: key_base64
+            - name: CALLBACK_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: cv-sizing-config-secret
+                  key: callback_api_key
+      imagePullSecrets:
+        - name: cv-registry-secret
