@@ -2761,7 +2761,9 @@ function Invoke-AWSCloudRewindSweep {
     param([object]$Credential, [object[]]$Regions, [hashtable]$AccountInfo)
     try {
         Write-CVSection 'Cloud Rewind Sizing'
-        if (@($ResourceGroups).Count) {
+        # Filter out empties before counting: @($null).Count is 1, so a bare @($ResourceGroups).Count would fire
+        # this warning on every run even when -ResourceGroups was never passed.
+        if (@($ResourceGroups | Where-Object { $_ -and "$_".Trim() }).Count) {
             Write-CVLog 'Cloud Rewind (AWS): -ResourceGroups filtering is a follow-up for AWS; applying -Tags only.' -Level Warning -Source 'CloudRewind'
         }
         $crTax           = Get-CVAwsCloudRewindTaxonomy

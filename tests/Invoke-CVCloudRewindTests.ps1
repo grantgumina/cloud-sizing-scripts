@@ -226,12 +226,21 @@ Assert-CV 'SubscriptionName mapped'            $disc[0].SubscriptionName 'Sub On
 Assert-CV 'Type preserved'                     $disc[0].Type 'Microsoft.Compute/virtualMachines'
 
 Write-Host "`n[16] Tenant-aware Graph discovery (multi-tenant coverage + context switching)"
-# Context starts on tenantB; subs span tenantA (2) + tenantB (1). Search-AzGraph stub returns one row per queried sub id.
-$script:SetCtxTenants = @()
-function Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = 'tenantB' }; Subscription = [pscustomobject]@{ Id = 'subB1' } } }
-function Set-AzContext { param($TenantId, $SubscriptionId, $Context, $ErrorAction) if ($TenantId) { $script:SetCtxTenants += "$TenantId" } }
+# Context starts on tenantB; subs span tenantA (2) + tenantB (1).
+#
+# The Search-AzGraph stub is deliberately CONTEXT-AWARE: it returns rows only for subscriptions belonging to the
+# tenant the context is currently on, exactly like the real cmdlet (one Graph query only ever sees the current
+# context's tenant). A context-blind stub cannot catch the bug this test exists for - a $currentTenant left
+# pinned to the ORIGINAL context means the loop never switches back to that tenant after moving away, and its
+# subscriptions silently return zero rows. Whichever tenant that is depends on hashtable key order, so the
+# real-world symptom was an undercount that came and went between runs with no code change.
+$script:SetCtxTenants  = @()
+$script:CtxTenant      = 'tenantB'
+$script:MtTenantOfSub  = @{ subA1 = 'tenantA'; subA2 = 'tenantA'; subB1 = 'tenantB' }
+function Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = $script:CtxTenant }; Subscription = [pscustomobject]@{ Id = 'subB1' } } }
+function Set-AzContext { param($TenantId, $SubscriptionId, $Context, $ErrorAction) if ($TenantId) { $script:SetCtxTenants += "$TenantId"; $script:CtxTenant = "$TenantId" } }
 function Search-AzGraph { param($Query, $Subscription, $First, $SkipToken)
-    @($Subscription | ForEach-Object { [pscustomobject]@{ id="/subs/$_/vm"; name="vm-$_"; type='microsoft.compute/virtualmachines'; resourceGroup='rg'; location='eastus'; subscriptionId=$_; tenantId='t'; tags=$null } }) }
+    @($Subscription | Where-Object { $script:MtTenantOfSub["$_"] -eq $script:CtxTenant } | ForEach-Object { [pscustomobject]@{ id="/subs/$_/vm"; name="vm-$_"; type='microsoft.compute/virtualmachines'; resourceGroup='rg'; location='eastus'; subscriptionId=$_; tenantId='t'; tags=$null } }) }
 $mtSubs = @(
     [pscustomobject]@{ Id='subA1'; Name='A1'; TenantId='tenantA' }
     [pscustomobject]@{ Id='subA2'; Name='A2'; TenantId='tenantA' }
@@ -240,8 +249,9 @@ $mtSubs = @(
 $g = @(Invoke-CVAzureCloudRewindGraphDiscovery -Subs $mtSubs)
 Assert-CV 'covers all 3 subs across 2 tenants' $g.Count 3
 Assert-CV 'switched context to tenantA'        ($script:SetCtxTenants -contains 'tenantA') $true
-Assert-CV 'did NOT switch to current tenantB'  ($script:SetCtxTenants -contains 'tenantB') $false
 Assert-CV 'subA2 present (2nd sub of tenantA)'  ([bool](@($g | Where-Object { $_.Name -eq 'vm-subA2' }).Count)) $true
+# The regression guard: tenantB is the STARTING context, so it is the tenant a stale $currentTenant strands.
+Assert-CV 'subB1 present (starting tenant)'     ([bool](@($g | Where-Object { $_.Name -eq 'vm-subB1' }).Count)) $true
 
 Write-Host ("`n{0}  {1} passed, {2} failed  {0}" -f ('=' * 6), $script:Pass, $script:Fail) -ForegroundColor ($script:Fail ? 'Red' : 'Green')
 exit ($script:Fail -gt 0 ? 1 : 0)

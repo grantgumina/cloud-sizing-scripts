@@ -213,11 +213,15 @@ function Invoke-CVAzureCloudRewindGraphDiscovery {
     param([Parameter(Mandatory)]$Subs, [hashtable]$Taxonomy = (Get-CVAzureCloudRewindTaxonomy))
 
     $query    = Get-CVAzureCloudRewindGraphQuery -Taxonomy $Taxonomy
-    $nameById = @{}; $tenantById = @{}; $byTenant = @{}
+    # $byTenant is ORDERED so tenants are always processed in the order their subscriptions were supplied.
+    # A plain @{} enumerates by hash bucket, which made the whole sweep order-dependent: whether a given tenant
+    # was visited before or after the context moved decided if its resources were found at all.
+    $nameById = @{}; $tenantById = @{}; $byTenant = [ordered]@{}
     foreach ($s in $Subs) {
         $sid = "$($s.Id)"; $tid = "$($s.TenantId)"
         $nameById[$sid] = $s.Name; $tenantById[$sid] = $s.TenantId
-        if (-not $byTenant.ContainsKey($tid)) { $byTenant[$tid] = New-Object System.Collections.Generic.List[object] }
+        # .Contains, not .ContainsKey - [ordered]@{} is an OrderedDictionary, which has no ContainsKey method.
+        if (-not $byTenant.Contains($tid)) { $byTenant[$tid] = New-Object System.Collections.Generic.List[object] }
         $byTenant[$tid].Add($s)
     }
 
@@ -236,8 +240,16 @@ function Invoke-CVAzureCloudRewindGraphDiscovery {
         foreach ($ts in $tenantSubs) { $subIds.Add("$($ts.Id)") }
 
         # Switch context to this tenant so Search-AzGraph queries it with the right token (skip if already current).
+        # $currentTenant MUST be updated after every successful switch. Leaving it pinned to the ORIGINAL context
+        # means the tenant matching that original value is never switched to - and once the loop has already moved
+        # the context elsewhere, its subscriptions are queried under the wrong tenant's token and Resource Graph
+        # returns zero rows for them, with no error. Hashtable key order then decides which tenant silently
+        # vanishes, so the same code undercounts on one run and not the next.
         if ($tid -ne $currentTenant) {
-            try { Set-AzContext -TenantId $tid -SubscriptionId $tenantSubs[0].Id -ErrorAction Stop | Out-Null }
+            try {
+                Set-AzContext -TenantId $tid -SubscriptionId $tenantSubs[0].Id -ErrorAction Stop | Out-Null
+                $currentTenant = $tid
+            }
             catch {
                 Write-CVLog "Cloud Rewind: cannot access tenant $tid ($($_.Exception.Message)); skipping $($tenantSubs.Count) subscription(s) there." -Level Warning -Source 'CloudRewind'
                 continue

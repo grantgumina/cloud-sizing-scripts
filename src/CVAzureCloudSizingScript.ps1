@@ -1028,11 +1028,13 @@ foreach ($sub in $subs) {
             $timeGrain = New-TimeSpan -Hours 1
             # Get all NetApp Files accounts in this subscription
             try {
-                # First get all resource groups, then get NetApp accounts from each
-                $resourceGroups = Get-AzResourceGroup
+                # First get all resource groups, then get NetApp accounts from each.
+                # NOTE: must NOT be named $resourceGroups - PowerShell variable names are case-insensitive, so
+                # that would overwrite the script's -ResourceGroups parameter and silently scope the whole run.
+                $subRgList = Get-AzResourceGroup
                 $anfAccounts = @()
-                
-                foreach ($rg in $resourceGroups) {
+
+                foreach ($rg in $subRgList) {
                     try {
                         $rgNetAppAccounts = Get-AzNetAppFilesAccount -ResourceGroupName $rg.ResourceGroupName -ErrorAction SilentlyContinue
                         if ($rgNetAppAccounts) {
@@ -1697,20 +1699,22 @@ foreach ($sub in $subs) {
         try {
             Write-Host "Processing CosmosDB accounts in subscription $($sub.Name)" -ForegroundColor Green
             
-            # Get all resource groups in the subscription
-            $resourceGroups = Get-AzResourceGroup -ErrorAction SilentlyContinue
-            if (-not $resourceGroups) {
+            # Get all resource groups in the subscription.
+            # NOTE: must NOT be named $resourceGroups - see the NetApp block above; that name aliases the
+            # script's -ResourceGroups parameter and would silently scope the whole run to these objects.
+            $subRgList = Get-AzResourceGroup -ErrorAction SilentlyContinue
+            if (-not $subRgList) {
                 Write-Host "No resource groups found in subscription $($sub.Name)" -ForegroundColor Yellow
                 continue
             }
-            
+
             $allCosmosAccounts = @()
             $rgCount = 0
-            
+
             # Iterate through each resource group to find CosmosDB accounts
-            foreach ($rg in $resourceGroups) {
+            foreach ($rg in $subRgList) {
                 $rgCount++
-                Write-Progress -Id 8 -ParentId 1 -Activity "Scanning Resource Groups for CosmosDB" -Status "Resource Group $rgCount of $($resourceGroups.Count): $($rg.ResourceGroupName)" -PercentComplete ([math]::Round(($rgCount / $resourceGroups.Count) * 100, 1))
+                Write-Progress -Id 8 -ParentId 1 -Activity "Scanning Resource Groups for CosmosDB" -Status "Resource Group $rgCount of $($subRgList.Count): $($rg.ResourceGroupName)" -PercentComplete ([math]::Round(($rgCount / $subRgList.Count) * 100, 1))
                 
                 try {
                     $cosmosAccountsInRG = Get-AzCosmosDBAccount -ResourceGroupName $rg.ResourceGroupName -ErrorAction SilentlyContinue
@@ -2044,8 +2048,13 @@ Write-CVSection "Subscription Processing Complete"
 # row carries; rows without a resolvable ResourceGroup are kept (conservative). -Tags is honored fully by the
 # Cloud Rewind pass; DP-side per-service tag capture is a follow-up.
 # ---------------------------------------------------------------------------
-if (-not $SkipDataProtection -and @($ResourceGroups).Count) {
-    $rgFilter = @($ResourceGroups | Where-Object { $_ -and "$_".Trim() })
+# NOTE: build $rgFilter FIRST and guard on it. Guarding on @($ResourceGroups).Count is wrong: when the caller
+# omits -ResourceGroups the parameter is $null, and @($null) is a ONE-element array containing $null, so .Count
+# is 1 and the guard passes on every run. $rgFilter would then be empty, $keepRg would match nothing, and every
+# inventory row carrying a ResourceGroup got silently discarded - only row types that never set that property
+# (File Shares, PostgreSQL) survived, via the IsNullOrWhiteSpace escape hatch below.
+$rgFilter = @($ResourceGroups | Where-Object { $_ -and "$_".Trim() })
+if (-not $SkipDataProtection -and $rgFilter.Count) {
     $keepRg = {
         param($obj)
         if (-not $obj) { return $false }
