@@ -130,11 +130,19 @@ $classified = @(
 )
 $sum = @(Get-CVCloudRewindSummary -Classified $classified)
 Assert-CV 'one account row'      $sum.Count 1
-Assert-CV 'BillableData = 1'     $sum[0].BillableData 1
-Assert-CV 'BillableConfig = 1'   $sum[0].BillableConfig 1
-Assert-CV 'NonBillableConfig = 1'$sum[0].NonBillableConfig 1
-Assert-CV 'TotalBillable = 2'    $sum[0].TotalBillable 2
-Assert-CV 'TotalCount = 3'       $sum[0].TotalCount 3
+Assert-CV 'BillableData = 1'     $sum[0].BillableDataResources 1
+Assert-CV 'BillableConfig = 1'   $sum[0].BillableConfigResources 1
+Assert-CV 'NonBillableConfig = 1'$sum[0].NonBillableConfigResources 1
+Assert-CV 'TotalBillable = 2'    $sum[0].TotalBillableResources 2
+Assert-CV 'TotalCount = 3'       $sum[0].TotalClassifiedResources 3
+
+# Every count column names its unit, and AccountName leads (matching the details CSV).
+$sumCols = @($sum[0].PSObject.Properties.Name)
+Assert-CV 'AccountName leads'    $sumCols[0] 'AccountName'
+Assert-CV 'Account second'       $sumCols[1] 'Account'
+foreach ($c in $sumCols | Where-Object { $_ -notin 'AccountName','Account' }) {
+    Assert-CV "$c names its unit" ($c -like '*Resources') $true
+}
 Assert-CV 'empty -> no rows'     (@(Get-CVCloudRewindSummary -Classified @()).Count) 0
 
 Write-Host "`n[11] AWS - ARN token parsing + classification (derived taxonomy)"

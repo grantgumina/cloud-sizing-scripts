@@ -25,7 +25,7 @@ Every AWS/Azure/GCP run performs **two independent passes by default**:
 1. **Data Protection sizing** — the per-service resource inventory (VMs, storage, databases, …), protection columns, and the cyber-resilience posture report.
 2. **Cloud Rewind sizing** — counts the resources Commvault **Cloud Rewind** (Appranix) bills for. It runs its own lightweight sweep (Azure `Get-AzResource`, AWS Resource Groups Tagging API, GCP Cloud Asset Inventory), classifies each resource billable / non-billable and Data / Config, and writes:
    - `<cloud>_cloudrewind_<ts>.csv` — one row per **billable** resource: account/region/resource group scope, resource name and native type, why it is billable, and topology. The two widest columns (`ResourceId`, then the flattened `Tags` blob) are last so they don't crowd out the rest in a spreadsheet; a `-Tags` filter adds one narrow `Tag_<key>` column per filtered key just before `Tags`.
-   - `<cloud>_cloudrewind_summary_<ts>.csv` — `BillableData` / `BillableConfig` / `NonBillableData` / `NonBillableConfig` totals per account.
+   - `<cloud>_cloudrewind_summary_<ts>.csv` — per-account `BillableDataResources` / `BillableConfigResources` / `NonBillableDataResources` / `NonBillableConfigResources` plus totals. Every number is a **count of resources, not a size** — hence the `...Resources` suffix, since these sit alongside per-service CSVs full of `SizeGB`/`UsedTiB` columns. `TotalBillableResources` is the figure that maps to Cloud Rewind licensing; `TotalClassifiedResources` counts only resources matching the taxonomy, so it is *not* the account's total resource count.
 
 ### Choosing passes and scope
 

@@ -2278,8 +2278,8 @@ if (-not $SkipCloudRewind) {
     $crSummary = Get-CVCloudRewindSummary -Classified $crClassified
     if (@($crSummary).Count) {
         $crSummary | Export-Csv (Join-Path $outdir ("azure_cloudrewind_summary_$dateStr.csv")) -NoTypeInformation
-        $crTB  = (@($crSummary) | Measure-Object TotalBillable -Sum).Sum
-        $crTNB = (@($crSummary) | Measure-Object TotalNonBillable -Sum).Sum
+        $crTB  = (@($crSummary) | Measure-Object TotalBillableResources -Sum).Sum
+        $crTNB = (@($crSummary) | Measure-Object TotalNonBillableResources -Sum).Sum
         Write-CVLog ("Cloud Rewind: {0} billable, {1} non-billable resources across {2} subscription(s)" -f $crTB, $crTNB, @($crSummary).Count) -Level Success -Source 'CloudRewind'
         Write-Host "azure_cloudrewind_summary_$dateStr.csv written to $outdir" -ForegroundColor Cyan
     }

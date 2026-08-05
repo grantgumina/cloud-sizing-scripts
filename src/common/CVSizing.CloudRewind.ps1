@@ -11,7 +11,7 @@
       - Each resource is BILLABLE, NON-BILLABLE, or neither (not in the taxonomy -> ignored, never counted).
       - Independently, each is DATA or CONFIG (Data = compute instance or attached data disk; else Config).
       - The per-resource CSV lists BILLABLE resources only; the summary CSV keeps the full
-        BillableData / BillableConfig / NonBillableData / NonBillableConfig breakdown per account.
+        Billable/NonBillable x Data/Config breakdown per account, as resource counts.
 #>
 
 #region ---------------------------------------------------------------- Run-wide resource filter
@@ -102,8 +102,8 @@ function Get-CVTagValue {
 # Tags blob - are pushed to the far right so they never push the useful columns off-screen; Tag_<key> columns
 # (one per key referenced by the -Tags filter) sit just before Tags.
 #
-# Data/Config classification is NOT a column here - it drives the summary CSV's BillableData/BillableConfig
-# rollup instead (see Get-CVCloudRewindSummary), which is where the split is actually actionable.
+# Data/Config classification is NOT a column here - it drives the summary CSV's Billable/NonBillable x
+# Data/Config rollup instead (see Get-CVCloudRewindSummary), where the split is actually actionable.
 function New-CVCloudRewindRow {
     [CmdletBinding()]
     param(
@@ -139,9 +139,21 @@ function New-CVCloudRewindRow {
 
 #region ---------------------------------------------------------------- Summary
 
-# Roll classified resources (billable AND non-billable, in-taxonomy only) into the original sizer's per-account
-# breakdown: BillableData / BillableConfig / NonBillableData / NonBillableConfig + totals.
+# Roll classified resources (billable AND non-billable, in-taxonomy only) into the per-account breakdown.
 # Each input item: { Account; AccountName; Billable([bool]); ResourceClass('Data'|'Config') }.
+#
+# Every numeric column counts RESOURCES, never bytes - hence the ...Resources suffix. These summaries sit next
+# to per-service CSVs full of SizeGB/UsedTiB columns, and a bare "BillableData = 12" reads as 12 GB of data
+# rather than 12 resources. Naming the unit in the header is the cheapest fix.
+#
+# TotalClassifiedResources counts only resources that matched the billable OR non-billable taxonomy: anything
+# in neither list is discarded before it reaches here, as are resources dropped by the per-cloud inclusion
+# tests (unattached disks/IPs, OS disks, the system master DB, Flexible VMSS). It is therefore NOT the account's
+# total resource count, and "Classified" is in the name to stop it being read that way.
+#
+# Billable/Data/Config deliberately keep Cloud Rewind's own vocabulary (support article 89349) so these numbers
+# reconcile against a Commvault quote. Note NonBillableDataResources is structurally always 0 on Azure - no
+# non-billable Azure type classifies as Data - but the column is kept for a consistent cross-cloud schema.
 function Get-CVCloudRewindSummary {
     [CmdletBinding()]
     param([object[]]$Classified = @())
@@ -153,15 +165,15 @@ function Get-CVCloudRewindSummary {
         $nbd = @($g | Where-Object { -not $_.Billable -and $_.ResourceClass -eq 'Data'   }).Count
         $nbc = @($g | Where-Object { -not $_.Billable -and $_.ResourceClass -eq 'Config' }).Count
         [pscustomobject]@{
-            Account           = $_.Name
-            AccountName       = $g[0].AccountName
-            BillableData      = $bd
-            BillableConfig    = $bc
-            NonBillableData   = $nbd
-            NonBillableConfig = $nbc
-            TotalBillable     = ($bd + $bc)
-            TotalNonBillable  = ($nbd + $nbc)
-            TotalCount        = ($bd + $bc + $nbd + $nbc)
+            AccountName                = $g[0].AccountName
+            Account                    = $_.Name
+            BillableDataResources      = $bd
+            BillableConfigResources    = $bc
+            NonBillableDataResources   = $nbd
+            NonBillableConfigResources = $nbc
+            TotalBillableResources     = ($bd + $bc)
+            TotalNonBillableResources  = ($nbd + $nbc)
+            TotalClassifiedResources   = ($bd + $bc + $nbd + $nbc)
         }
     }
     return @($rows | Sort-Object AccountName)

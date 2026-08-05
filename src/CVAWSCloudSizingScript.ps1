@@ -2829,8 +2829,8 @@ function Invoke-AWSCloudRewindSweep {
             $crSumPath = Join-Path $script:Config.OutputPath $crSumFile
             $crSummary | Export-Csv -Path $crSumPath -NoTypeInformation
             $script:AllOutputFiles.Add($crSumPath) | Out-Null
-            $tb  = (@($crSummary) | Measure-Object TotalBillable -Sum).Sum
-            $tnb = (@($crSummary) | Measure-Object TotalNonBillable -Sum).Sum
+            $tb  = (@($crSummary) | Measure-Object TotalBillableResources -Sum).Sum
+            $tnb = (@($crSummary) | Measure-Object TotalNonBillableResources -Sum).Sum
             Write-ScriptOutput "Cloud Rewind: $tb billable, $tnb non-billable resources for account $($AccountInfo.Account)" -Level Success
         }
     }
