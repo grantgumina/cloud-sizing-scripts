@@ -171,5 +171,77 @@ Assert-CV 'network -> Config' (Get-CVGcpCloudRewindClass 'compute.googleapis.com
 Assert-CV 'asset types = 18'  (@(Get-CVGcpCloudRewindAssetTypes).Count) 18
 Assert-CV 'GCP category'      (Get-CVGcpCloudRewindCategory 'compute.googleapis.com/Instance') 'Compute Engine Instance'
 
+function CountOf { param([string]$Haystack, [string]$Needle) ([regex]::Matches($Haystack, [regex]::Escape($Needle))).Count }
+
+Write-Host "`n[13] Azure Resource Graph KQL builder"
+$kql  = Get-CVAzureCloudRewindGraphQuery
+$aztx = Get-CVAzureCloudRewindTaxonomy
+# Every taxonomy type is present (types can never silently drop out of the query).
+foreach ($t in (@($aztx.Billable) + @($aztx.NonBillable))) { Assert-CV "kql has $t" ($kql.Contains($t)) $true }
+# Each attach/exclusion predicate is present.
+Assert-CV 'disk predicate'  ($kql.Contains("isnotempty(managedBy) and isempty(tostring(properties.osType))")) $true
+Assert-CV 'pip predicate'   ($kql.Contains("isnotempty(tostring(properties.ipConfiguration.id))")) $true
+Assert-CV 'vmss predicate'  ($kql.Contains("tostring(properties.orchestrationMode) =~ 'Uniform'")) $true
+Assert-CV 'sqldb predicate' ($kql.Contains("name !~ 'master'")) $true
+Assert-CV 'nic predicate'   ($kql.Contains("isnotempty(tostring(properties.virtualMachine.id))")) $true
+# Paging contract: query targets the resources table and projects id.
+Assert-CV 'targets resources' ($kql.TrimStart().StartsWith('resources')) $true
+Assert-CV 'projects id'       ($kql.Contains('| project id')) $true
+# GUARD (the important regression test): each conditional type appears EXACTLY ONCE - inside its guarded clause,
+# never also in the unconditional in~ list (a leak there would count unattached disks/IPs/NICs and the master DB).
+foreach ($ct in @('Microsoft.Compute/disks','Microsoft.Network/publicIPAddresses','Microsoft.Compute/virtualMachineScaleSets','Microsoft.Sql/servers/databases','Microsoft.Network/networkInterfaces')) {
+    Assert-CV "$ct appears once (guarded)" (CountOf $kql "'$ct'") 1
+    Assert-CV "$ct is guarded"             ($kql.Contains("type =~ '$ct' and")) $true
+}
+
+Write-Host "`n[14] ARG row normalization (pure)"
+$nameById = @{ 'sub1' = 'Sub One' }; $tenantById = @{ 'sub1' = 'ten1' }
+$argRow = [pscustomobject]@{ id='/r'; name='vm1'; type='microsoft.compute/virtualmachines'; resourceGroup='rg1'; location='eastus'; subscriptionId='sub1'; tenantId='rawten'; tags=[pscustomobject]@{ Env='Prod' } }
+$n = ConvertFrom-CVAzureGraphRow -Row $argRow -NameById $nameById -TenantById $tenantById
+Assert-CV 'type canonicalized'    $n.Type 'Microsoft.Compute/virtualMachines'
+Assert-CV 'sub name mapped'       $n.SubscriptionName 'Sub One'
+Assert-CV 'tenant mapped'         $n.TenantId 'ten1'
+Assert-CV 'tags -> IDictionary'   ($n.Tags -is [System.Collections.IDictionary]) $true
+Assert-CV 'tag value'             (Get-CVTagValue -Tags $n.Tags -Key 'Env') 'Prod'
+Assert-CV 'canonical type miss'   (Get-CVAzureCloudRewindCanonicalType 'foo/bar') 'foo/bar'
+Assert-CV 'null tags -> empty'    ((ConvertTo-CVAzureGraphTagHashtable $null).Count) 0
+Assert-CV 'idict tags preserved'  ((ConvertTo-CVAzureGraphTagHashtable @{ A='1' })['A']) '1'
+
+Write-Host "`n[15] Discovery dispatcher (ARM path) returns a FLAT normalized array (not nested)"
+function Write-CVLog { param($Message, $Level, $Source) }            # no-op stub (console layer not loaded in tests)
+function Set-AzContext { param($SubscriptionId) }                    # no-op
+function Get-AzResource {
+    @(
+        [pscustomobject]@{ ResourceType='Microsoft.Compute/virtualMachines'; Name='vm1'; ResourceGroupName='rg1'; Location='eastus'; ResourceId='/id1'; Tags=@{ Env='Prod' } }
+        [pscustomobject]@{ ResourceType='Microsoft.Storage/storageAccounts'; Name='sa1'; ResourceGroupName='rg2'; Location='westus'; ResourceId='/id2'; Tags=@{} }
+        [pscustomobject]@{ ResourceType='Microsoft.Foo/bar';                  Name='x';   ResourceGroupName='rg3'; Location='eastus'; ResourceId='/id3'; Tags=@{} }  # not in taxonomy -> dropped
+    )
+}
+$dispSubs = @([pscustomobject]@{ Id='sub1'; Name='Sub One'; TenantId='ten1' })
+$disc = @(Invoke-CVAzureCloudRewindDiscovery -Backend Arm -Subs $dispSubs)
+Assert-CV 'dispatcher returns 2 (foo dropped)' $disc.Count 2
+Assert-CV 'element is NOT a nested array'      ($disc[0] -is [System.Array]) $false
+Assert-CV 'ResourceGroup is a plain string'    ($disc[0].ResourceGroup -is [string]) $true
+Assert-CV 'SubscriptionName mapped'            $disc[0].SubscriptionName 'Sub One'
+Assert-CV 'Type preserved'                     $disc[0].Type 'Microsoft.Compute/virtualMachines'
+
+Write-Host "`n[16] Tenant-aware Graph discovery (multi-tenant coverage + context switching)"
+# Context starts on tenantB; subs span tenantA (2) + tenantB (1). Search-AzGraph stub returns one row per queried sub id.
+$script:SetCtxTenants = @()
+function Get-AzContext { [pscustomobject]@{ Tenant = [pscustomobject]@{ Id = 'tenantB' }; Subscription = [pscustomobject]@{ Id = 'subB1' } } }
+function Set-AzContext { param($TenantId, $SubscriptionId, $Context, $ErrorAction) if ($TenantId) { $script:SetCtxTenants += "$TenantId" } }
+function Search-AzGraph { param($Query, $Subscription, $First, $SkipToken)
+    @($Subscription | ForEach-Object { [pscustomobject]@{ id="/subs/$_/vm"; name="vm-$_"; type='microsoft.compute/virtualmachines'; resourceGroup='rg'; location='eastus'; subscriptionId=$_; tenantId='t'; tags=$null } }) }
+$mtSubs = @(
+    [pscustomobject]@{ Id='subA1'; Name='A1'; TenantId='tenantA' }
+    [pscustomobject]@{ Id='subA2'; Name='A2'; TenantId='tenantA' }
+    [pscustomobject]@{ Id='subB1'; Name='B1'; TenantId='tenantB' }
+)
+$g = @(Invoke-CVAzureCloudRewindGraphDiscovery -Subs $mtSubs)
+Assert-CV 'covers all 3 subs across 2 tenants' $g.Count 3
+Assert-CV 'switched context to tenantA'        ($script:SetCtxTenants -contains 'tenantA') $true
+Assert-CV 'did NOT switch to current tenantB'  ($script:SetCtxTenants -contains 'tenantB') $false
+Assert-CV 'subA2 present (2nd sub of tenantA)'  ([bool](@($g | Where-Object { $_.Name -eq 'vm-subA2' }).Count)) $true
+
 Write-Host ("`n{0}  {1} passed, {2} failed  {0}" -f ('=' * 6), $script:Pass, $script:Fail) -ForegroundColor ($script:Fail ? 'Red' : 'Green')
 exit ($script:Fail -gt 0 ? 1 : 0)

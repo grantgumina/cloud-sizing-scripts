@@ -206,6 +206,9 @@
 
     Cloud Rewind sizing runs by default alongside Data Protection and writes azure_cloudrewind_<ts>.csv
     (one row per billable resource) + azure_cloudrewind_summary_<ts>.csv. Use -SkipCloudRewind to skip it.
+    Cloud Rewind discovery uses Azure Resource Graph by default (fast, one query); -CloudRewindDiscovery Arm
+    forces the Get-AzResource path (exact parity with the standalone sizer). Graph auto-falls-back to Arm if
+    Az.ResourceGraph is unavailable.
 #>  
   
 param(  
@@ -220,6 +223,7 @@ param(
     [string[]]$ResourceGroups,     # limit BOTH passes to these resource groups (union with -Tags). Omitted = all.
     [string[]]$Tags,               # limit BOTH passes to resources carrying any of these 'Key=Value' tags. Omitted = all.
     [switch]$SkipCloudRewind,      # skip the Cloud Rewind billable-resource sizing pass
+    [ValidateSet('Graph','Arm')][string]$CloudRewindDiscovery = 'Graph', # CR discovery backend; Graph (Resource Graph) auto-falls-back to Arm (Get-AzResource)
     [switch]$SkipDataProtection    # skip the Data Protection inventory + resilience pass (run Cloud Rewind only)
 )
 
@@ -609,8 +613,12 @@ $fatalModules = @(
     'Az.Sql','Az.MySql','Az.PostgreSql','Az.Aks','Az.RecoveryServices','Az.VMware'
 )
 if (-not $peek.IsHeadless) { $fatalModules += 'PwshSpectreConsole' }
-if (-not $SkipCloudRewind) { $fatalModules += 'Az.Network' }   # Cloud Rewind attach checks (public IP / NIC)
-Assert-CVPreflight -FatalModules $fatalModules -ExitOnFatal | Out-Null
+if (-not $SkipCloudRewind) { $fatalModules += 'Az.Network' }   # Cloud Rewind ARM-fallback attach checks (public IP / NIC)
+# Resource Graph is the default Cloud Rewind discovery backend but SOFT: if Az.ResourceGraph is absent we warn
+# and fall back to the Get-AzResource (ARM) path rather than aborting the run.
+$optionalModules = @{}
+if (-not $SkipCloudRewind -and $CloudRewindDiscovery -eq 'Graph') { $optionalModules['Cloud Rewind Resource Graph discovery'] = 'Az.ResourceGraph' }
+Assert-CVPreflight -FatalModules $fatalModules -OptionalModules $optionalModules -ExitOnFatal | Out-Null
 
 # Initialize-CVConsole also calls Set-CVNativeNoiseSuppression -Provider Azure, which sets the
 # SuppressAzurePowerShellBreakingChangeWarnings env var before the Az modules load below.
@@ -2209,9 +2217,9 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
 
 # ============================================================
 # CLOUD REWIND SIZING  (skip with -SkipCloudRewind)
-# Self-contained sweep: Get-AzResource per subscription, classified against the Cloud Rewind billable taxonomy
-# (article 89349). Emits one row per BILLABLE resource plus a billable-vs-non-billable summary. Honors the
-# run-wide -ResourceGroups/-Tags filter. Independent of the Data Protection inventory above.
+# Discovers via Azure Resource Graph (default) or Get-AzResource (fallback / -CloudRewindDiscovery Arm), already
+# attach/exclusion-filtered, then classifies against the Cloud Rewind billable taxonomy (article 89349). One row
+# per BILLABLE resource + a billable-vs-non-billable summary. Honors the run-wide -ResourceGroups/-Tags filter.
 # ============================================================
 if (-not $SkipCloudRewind) {
   try {
@@ -2220,50 +2228,37 @@ if (-not $SkipCloudRewind) {
     $crFilterTagKeys = Get-CVFilterTagKeys -FilterTags $Tags
     $crRows          = New-Object System.Collections.Generic.List[object]
     $crClassified    = New-Object System.Collections.Generic.List[object]
-    $crShownErr      = $false
+    # Discovery returns resources already attach/exclusion-filtered (KQL for Graph, Test-CVAzureCloudRewindInclude
+    # for Arm), so the classify loop below must NOT re-apply the inclusion test.
+    $crItems = @(Invoke-CVAzureCloudRewindDiscovery -Backend $CloudRewindDiscovery -Subs $subs)
 
-    foreach ($sub in $subs) {
-        try { Set-AzContext -SubscriptionId $sub.Id | Out-Null }
-        catch { Write-CVLog "Cloud Rewind: cannot set context for $($sub.Name): $($_.Exception.Message)" -Level Warning -Source 'CloudRewind'; continue }
+    foreach ($it in $crItems) {
+        if (-not (Test-CVResourceMatch -ResourceGroup $it.ResourceGroup -Tags $it.Tags -FilterResourceGroups $ResourceGroups -FilterTags $Tags)) { continue }
+        $billable = Get-CVCloudRewindBillable -ResourceType $it.Type -Taxonomy $crTax
+        if ($null -eq $billable) { continue }   # defensive: discovery already returns in-taxonomy resources only
 
-        $crResources = @()
-        try { $crResources = @(Get-AzResource) }
-        catch { Write-CVLog "Cloud Rewind: Get-AzResource failed in $($sub.Name): $($_.Exception.Message)" -Level Warning -Source 'CloudRewind'; continue }
+        $class = Get-CVAzureCloudRewindClass -ResourceType $it.Type
+        $crClassified.Add([pscustomobject]@{ Account = $it.SubscriptionId; AccountName = $it.SubscriptionName; Billable = [bool]$billable; ResourceClass = $class })
 
-        foreach ($r in $crResources) {
-            $billable = Get-CVCloudRewindBillable -ResourceType $r.ResourceType -Taxonomy $crTax
-            if ($null -eq $billable) { continue }                                   # not in the taxonomy -> ignore
-            if (-not (Test-CVResourceMatch -ResourceGroup $r.ResourceGroupName -Tags $r.Tags -FilterResourceGroups $ResourceGroups -FilterTags $Tags)) { continue }
-            try {
-                if (-not (Test-CVAzureCloudRewindInclude -Resource $r)) { continue } # unattached / OS disk / master / Flexible VMSS
-            } catch {
-                if (-not $crShownErr) { $crShownErr = $true; Write-Host "[CloudRewind] inclusion check error on $($r.ResourceType): $($_.Exception.Message)" -ForegroundColor DarkYellow }
-                continue
-            }
-
-            $class = Get-CVAzureCloudRewindClass -ResourceType $r.ResourceType
-            $crClassified.Add([pscustomobject]@{ Account = $sub.Id; AccountName = $sub.Name; Billable = [bool]$billable; ResourceClass = $class })
-
-            if ($billable) {
-                $crRows.Add( (New-CVCloudRewindRow -Fields @{
-                    CloudProvider    = 'Azure'
-                    Account          = $sub.Id
-                    AccountName      = $sub.Name
-                    TenantOrOrg      = $sub.TenantId
-                    Region           = $r.Location
-                    ResourceGroup    = $r.ResourceGroupName
-                    ResourceName     = $r.Name
-                    ResourceId       = $r.ResourceId
-                    ResourceType     = $r.ResourceType
-                    ResourceState    = ''
-                    BillableReason   = (Get-CVAzureCloudRewindReason -ResourceType $r.ResourceType)
-                    VpcOrVNet        = ''      # topology enrichment: fast-follow
-                    Subnet           = ''
-                    AvailabilityZone = ''
-                    HasPublicIp      = ''
-                    DiscoveredAt     = $dateStr
-                } -Tags $r.Tags -FilterTagKeys $crFilterTagKeys) )
-            }
+        if ($billable) {
+            $crRows.Add( (New-CVCloudRewindRow -Fields @{
+                CloudProvider    = 'Azure'
+                Account          = $it.SubscriptionId
+                AccountName      = $it.SubscriptionName
+                TenantOrOrg      = $it.TenantId
+                Region           = $it.Location
+                ResourceGroup    = $it.ResourceGroup
+                ResourceName     = $it.Name
+                ResourceId       = $it.Id
+                ResourceType     = $it.Type
+                ResourceState    = ''
+                BillableReason   = (Get-CVAzureCloudRewindReason -ResourceType $it.Type)
+                VpcOrVNet        = ''      # topology enrichment: fast-follow
+                Subnet           = ''
+                AvailabilityZone = ''
+                HasPublicIp      = ''
+                DiscoveredAt     = $dateStr
+            } -Tags $it.Tags -FilterTagKeys $crFilterTagKeys) )
         }
     }
 
@@ -3405,19 +3400,19 @@ foreach ($sub in $subs) {
 }
 
 
-# Export summary if we have any rows
-if ($summaryRows.Count) {  
+# Export summary if we have any rows (Data Protection artifact - skip entirely in a Cloud-Rewind-only run).
+if ($summaryRows.Count -and -not $SkipDataProtection) {
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing comprehensive summary..." -PercentComplete 75
-    $summaryRows | Export-Csv (Join-Path $outdir "azure_inventory_summary_$dateStr.csv") -NoTypeInformation  
+    $summaryRows | Export-Csv (Join-Path $outdir "azure_inventory_summary_$dateStr.csv") -NoTypeInformation
     Write-Host "azure_inventory_summary_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
-}  
+}
 
 Write-Host "`n=== All Output Files Created Successfully ===" -ForegroundColor Green
 
 # ============================================================
 # JSON EXPORT (when OutputFormat is json or both)
 # ============================================================
-if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
+if (($OutputFormat -eq "json" -or $OutputFormat -eq "both") -and -not $SkipDataProtection) {
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing JSON output..." -PercentComplete 80
 
     # Build standardized summary block from $summaryRows
