@@ -121,6 +121,12 @@
 
         .\CVGoogleCloudSizingScript.ps1 -Types Storage -Projects my-gcp-project-1
         # Only inventories Storage Buckets in the specified project
+
+        .\CVGoogleCloudSizingScript.ps1 -SkipDataProtection
+        # Cloud Rewind billable-resource sizing only (writes gcp_cloudrewind_<ts>.csv + summary)
+
+        .\CVGoogleCloudSizingScript.ps1 -Labels env=production
+        # Scope both passes to resources labelled env=production; Cloud Rewind requires the Cloud Asset API
 #>
 
 
@@ -138,11 +144,25 @@ param(
     [int]$DbProjectTimeoutSec         = 900,   # 15m per project for DB inventory (soft)
     [ValidateSet("csv","json","both")][string]$OutputFormat = "csv",  # Output format: csv (default), json, or both
     [switch]$NonInteractive,   # force plain, non-interactive output (no progress bars / rich UI) - for CI / automation
-    [switch]$Quiet             # minimal console output (still writes the full log file)
+    [switch]$Quiet,            # minimal console output (still writes the full log file)
+    [switch]$SkipResilienceReport, # do not compute or write the cyber resilience posture report
+    [string[]]$Labels,             # limit BOTH passes to resources carrying any of these 'key=value' labels
+    [switch]$SkipCloudRewind,      # skip the Cloud Rewind billable-resource sizing pass
+    [switch]$SkipDataProtection    # skip the Data Protection inventory + resilience pass (run Cloud Rewind only)
 )
 
-# Load the shared console / diagnostics layer (src/common/CVSizing.Console.ps1).
+# Guard: at least one discovery pass must run.
+if ($SkipCloudRewind -and $SkipDataProtection) {
+    Write-Host 'ERROR: -SkipCloudRewind and -SkipDataProtection cannot both be set - nothing would run.' -ForegroundColor Red
+    exit 1
+}
+
+# Load the shared console / diagnostics + resilience + Cloud Rewind layers (src/common/).
 . (Join-Path $PSScriptRoot 'common' 'CVSizing.Console.ps1')
+. (Join-Path $PSScriptRoot 'common' 'CVSizing.Resilience.ps1')
+. (Join-Path $PSScriptRoot 'common' 'CVSizing.Resilience.GCP.ps1')   # GCP control definitions
+. (Join-Path $PSScriptRoot 'common' 'CVSizing.CloudRewind.ps1')      # provider-neutral Cloud Rewind engine
+. (Join-Path $PSScriptRoot 'common' 'CVSizing.CloudRewind.GCP.ps1')  # GCP billable taxonomy (derived)
 
 # Normalize -Projects if provided as a single comma-separated string inside quotes
 if ($Projects -and $Projects.Count -eq 1 -and $Projects[0] -match ',') {
@@ -228,6 +248,10 @@ if ($Types) {
     foreach ($t in $Types) { if ($ResourceTypeMap.ContainsKey($t)) { $Selected[$t] = $true } }
     if ($Selected.Count -eq 0) { Write-Host "No valid -Types specified. Use: VM, Storage"; exit 1 }
 } else { $Selected = @{}; $ResourceTypeMap.Keys | ForEach-Object { $Selected[$_] = $true } }
+
+# -SkipDataProtection: run Cloud Rewind only. Clearing $Selected skips the DP inventory dispatch; the resilience
+# pass and DP CSV exports are guarded by .Count and by -SkipDataProtection, so they no-op safely.
+if ($SkipDataProtection) { $Selected = @{} }
 
 # -------------------------
 # Helpers
@@ -1464,7 +1488,18 @@ function Get-GcpCloudSqlInstances {
                     if ($ipa.type -eq 'PRIMARY') { $publicIPs += $ipVal } elseif ($ipa.type -eq 'OUTGOING') { $outgoingIPs += $ipVal } else { $privateIPs += $ipVal }
                 }
             }
-            $items += [PSCustomObject]@{Type='CloudSQL';Project=$ProjectId;Name=$si.name;Region=$region;Zone=$zone;Engine=$engine;TierOrCapacity=$tier;State=$state;StorageGB=[double]$diskSizeGb;PrivateIPs=($privateIPs -join ';');PublicIPs=($publicIPs -join ';');OutgoingIPs=($outgoingIPs -join ';');Extra='';Error=''}
+            # Resilience posture signals (null-safe; missing paths yield $false/0, scored later).
+            $bc = $si.settings.backupConfiguration
+            $items += [PSCustomObject]@{Type='CloudSQL';Project=$ProjectId;Name=$si.name;Region=$region;Zone=$zone;Engine=$engine;TierOrCapacity=$tier;State=$state;StorageGB=[double]$diskSizeGb;PrivateIPs=($privateIPs -join ';');PublicIPs=($publicIPs -join ';');OutgoingIPs=($outgoingIPs -join ';');`
+                BackupEnabled=[bool]$bc.enabled;`
+                PitrEnabled=[bool]($bc.pointInTimeRecoveryEnabled -or $bc.binaryLogEnabled);`
+                RetainedBackups=[int]$bc.backupRetentionSettings.retainedBackups;`
+                TxLogRetentionDays=[int]$bc.transactionLogRetentionDays;`
+                CmkEncrypted=[bool]$si.diskEncryptionConfiguration.kmsKeyName;`
+                DeletionProtection=[bool]$si.settings.deletionProtectionEnabled;`
+                HasReplica=[bool](@($si.replicaNames).Count -gt 0);`
+                AvailabilityType=[string]$si.settings.availabilityType;`
+                Extra='';Error=''}
             if ($sqlObjs -and $sqlObjs.Count -gt 0 -and $cloudSqlInstCount -le 200) {
                 $pctInst=[int](($cloudSqlInstCount/[double]$sqlObjs.Count)*100); if ($pctInst -gt 100){$pctInst=100}
                 Write-Progress -Id 611 -Activity ("CloudSQL $ProjectId") -Status ("Instances ($cloudSqlInstCount/$($sqlObjs.Count)) - $pctInst%") -PercentComplete $pctInst -ErrorAction SilentlyContinue
@@ -2558,6 +2593,219 @@ if ($Selected.SNAPSHOT) {
     Write-Host "Collecting disk snapshots (backup coverage)..." -ForegroundColor Cyan
     $invResults.DiskSnapshots = Get-GcpSnapshotInventory -ProjectIds $targetProjects
     Write-Host "Found $($invResults.DiskSnapshots.Count) snapshots." -ForegroundColor Green
+}
+
+# ============================================================
+# CYBER RESILIENCE POSTURE REPORT  (skip with -SkipResilienceReport)
+# Scores each resource's CURRENT NATIVE GCP configuration against the Cloud Resilience Control Catalog.
+# Runs BEFORE the CSV exports so control columns land on every per-service CSV. Any signal we cannot collect
+# (or a failed full-reach call) scores as Unknown and is excluded from the score - it never fails the run.
+# ============================================================
+if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
+  try {
+    Write-CVSection 'Cyber Resilience Posture'
+    $gcpControls  = Get-CVGcpResilienceControls
+    $resilResults = New-Object System.Collections.Generic.List[object]
+
+    # Snapshot-derived signals (presence + cross-region) per source disk, from data already collected.
+    $snapByDisk = @{}
+    foreach ($s in @($invResults.DiskSnapshots)) {
+        if (-not $s.SourceDisk) { continue }
+        $k = "$($s.Project)|$($s.SourceDisk)".ToLower()
+        if (-not $snapByDisk.ContainsKey($k)) { $snapByDisk[$k] = @{ Count = 0; XRegion = $false } }
+        $snapByDisk[$k].Count++
+        $loc = "$($s.StorageLocations)"; $srcR = "$($s.Region)"
+        if (($loc -match ',') -or ($loc -match '^(us|eu|asia)$') -or ($srcR -and $loc -and ($loc.ToLower() -notmatch [regex]::Escape($srcR.ToLower())))) {
+            $snapByDisk[$k].XRegion = $true
+        }
+    }
+    foreach ($coll in @('AttachedDisks','UnattachedDisks')) {
+        foreach ($d in @($invResults.$coll)) {
+            if (-not $d) { continue }
+            $e = $snapByDisk["$($d.Project)|$($d.DiskName)".ToLower()]
+            Add-Member -InputObject $d -NotePropertyName XRegionBackup -NotePropertyValue ([bool]($e -and $e.XRegion)) -Force
+        }
+    }
+    $vmXRegion = @{}
+    foreach ($d in @($invResults.AttachedDisks)) {
+        if (-not $d -or -not $d.VMName) { continue }
+        foreach ($vn in ([string]$d.VMName -split ',')) {
+            $n = $vn.Trim(); if (-not $n) { continue }
+            if ($d.XRegionBackup) { $vmXRegion["$($d.Project)|$n".ToLower()] = $true }
+        }
+    }
+    foreach ($v in @($invResults.VMs)) {
+        if (-not $v) { continue }
+        Add-Member -InputObject $v -NotePropertyName XRegionBackup -NotePropertyValue ([bool]$vmXRegion["$($v.Project)|$($v.VMName)".ToLower()]) -Force
+    }
+
+    # Full-reach enrichment (defensive: any failure leaves the field absent -> Unknown).
+    foreach ($b in @($invResults.StorageBuckets)) {
+        if (-not $b -or -not $b.StorageBucket) { continue }
+        try {
+            $j = (& gcloud storage buckets describe "gs://$($b.StorageBucket)" --project $b.Project --format=json 2>$null) | ConvertFrom-Json
+            if ($j) {
+                Add-Member -InputObject $b -NotePropertyName Versioning          -NotePropertyValue ([bool]$j.versioning.enabled) -Force
+                Add-Member -InputObject $b -NotePropertyName PublicAccessBlocked -NotePropertyValue ("$($j.iamConfiguration.publicAccessPrevention)" -eq 'enforced') -Force
+                Add-Member -InputObject $b -NotePropertyName CmkEncrypted        -NotePropertyValue ([bool]$j.encryption.defaultKmsKeyName) -Force
+                Add-Member -InputObject $b -NotePropertyName RetentionLocked     -NotePropertyValue ([bool]$j.retentionPolicy.isLocked) -Force
+                Add-Member -InputObject $b -NotePropertyName SoftDeleteEnabled   -NotePropertyValue ([bool]([int]"$($j.softDeletePolicy.retentionDurationSeconds)" -gt 0)) -Force
+                Add-Member -InputObject $b -NotePropertyName MultiRegion         -NotePropertyValue ("$($j.locationType)" -in 'multi-region','dual-region') -Force
+            }
+        } catch {}
+    }
+    $fsBackups = @{}
+    foreach ($p in @($targetProjects)) {
+        try { $r = (& gcloud filestore backups list --project $p --format=json 2>$null) | ConvertFrom-Json; if ($r) { $fsBackups[$p] = @($r) } } catch {}
+    }
+    foreach ($f in @($invResults.FilestoreInstances)) {
+        if (-not $f) { continue }
+        Add-Member -InputObject $f -NotePropertyName EncryptedAtRest -NotePropertyValue $true -Force   # GCP encrypts Filestore at rest by default
+        Add-Member -InputObject $f -NotePropertyName HasBackup -NotePropertyValue ([bool]($fsBackups.ContainsKey($f.Project) -and @($fsBackups[$f.Project]).Count -gt 0)) -Force
+    }
+    $gkeBackups = @{}
+    foreach ($p in @($targetProjects)) {
+        try { $r = (& gcloud container backup-restore backup-plans list --project $p --location '-' --format=json 2>$null) | ConvertFrom-Json; if ($r) { $gkeBackups[$p] = @($r) } } catch {}
+    }
+    foreach ($g in @($invResults.GKEClusters)) {
+        if (-not $g) { continue }
+        Add-Member -InputObject $g -NotePropertyName HasBackupPlan -NotePropertyValue ([bool]($gkeBackups.ContainsKey($g.Project) -and @($gkeBackups[$g.Project]).Count -gt 0)) -Force
+    }
+
+    # Evaluate each resource type; append Ctl_*/ResilienceScore/ResilienceGaps columns onto the inventory rows.
+    $collections = @(
+        @{ Type='Database';  Set=$gcpControls.Database;  Rows=@($invResults.Databases) }
+        @{ Type='VM';        Set=$gcpControls.VM;        Rows=@($invResults.VMs) }
+        @{ Type='Disk';      Set=$gcpControls.Disk;      Rows=(@($invResults.AttachedDisks) + @($invResults.UnattachedDisks)) }
+        @{ Type='Storage';   Set=$gcpControls.Storage;   Rows=@($invResults.StorageBuckets) }
+        @{ Type='Filestore'; Set=$gcpControls.Filestore; Rows=@($invResults.FilestoreInstances) }
+        @{ Type='GKE';       Set=$gcpControls.GKE;       Rows=@($invResults.GKEClusters) }
+    )
+    $resilCatalog = New-Object System.Collections.Generic.List[object]
+    $resilShownErr = $false
+    foreach ($c in $collections) {
+        if (-not $c.Set) { continue }
+        foreach ($m in (Get-CVControlCatalog -Controls $c.Set -ResourceType $c.Type)) { $resilCatalog.Add($m) }
+        foreach ($row in $c.Rows) {
+            if (-not $row) { continue }
+            # Isolate per-row failures so one problematic resource can't sink the whole report.
+            try {
+                $ev = Invoke-CVResilience -Resource $row -Controls $c.Set
+                foreach ($kv in (ConvertTo-CVResilienceColumns -Evaluation $ev).GetEnumerator()) {
+                    Add-Member -InputObject $row -NotePropertyName $kv.Key -NotePropertyValue $kv.Value -Force
+                }
+                foreach ($res in $ev.Results) {
+                    Add-Member -InputObject $res -NotePropertyName ResourceType -NotePropertyValue $c.Type -Force
+                    $resilResults.Add($res)
+                }
+            } catch {
+                if (-not $resilShownErr) {
+                    $resilShownErr = $true
+                    Write-Host ("[Resilience] eval error on a $($c.Type) row: $($_.Exception.GetType().Name): $($_.Exception.Message) :: " + ($_.ScriptStackTrace -replace "`r?`n", ' <- ')) -ForegroundColor DarkYellow
+                }
+            }
+        }
+    }
+
+    # Summary + report CSVs (single-table each, consistent with the rest of the output).
+    $resilSummary = Get-CVResilienceSummary -Results $resilResults
+    if ($null -ne $resilSummary.OverallScore) {
+        Write-CVLog ("Overall native resilience score: {0}/100  ({1} controls assessed, {2} not assessed)" -f $resilSummary.OverallScore, $resilSummary.Assessed, $resilSummary.Excluded) -Level Success -Source 'Resilience'
+        foreach ($cat in $resilSummary.ByCategory) { Write-CVLog ("  {0,-14} {1,3}% met ({2}/{3})" -f $cat.Category, $cat.PercentMet, $cat.ControlsMet, $cat.ControlsTotal) -Level Info -Source 'Resilience' }
+        $resilSummary.ByCategory | Export-Csv -Path (Join-Path $outDir ("gcp_resilience_category_" + $dateStr + ".csv")) -NoTypeInformation
+        if ($resilSummary.TopGaps.Count) { $resilSummary.TopGaps | Select-Object Id,Title,Category,Severity,Count | Export-Csv -Path (Join-Path $outDir ("gcp_resilience_gaps_" + $dateStr + ".csv")) -NoTypeInformation }
+        $resilCatalog | Export-Csv -Path (Join-Path $outDir ("gcp_resilience_controls_" + $dateStr + ".csv")) -NoTypeInformation
+        Write-Host "gcp_resilience_*_$dateStr.csv (category, gaps, controls) written to $outDir" -ForegroundColor Cyan
+    } else {
+        Write-CVLog "No resilience controls could be assessed (no eligible resources or signals)." -Level Warning -Source 'Resilience'
+    }
+  } catch {
+    Write-CVLog "Resilience report failed: $($_.Exception.Message)" -Level Warning -Source 'Resilience'
+    # Surface the exact location (console-only mode has no structured log file; this reaches the transcript).
+    Write-Host ("[Resilience] $($_.Exception.GetType().Name): $($_.Exception.Message) :: " + ($_.ScriptStackTrace -replace "`r?`n", ' <- ')) -ForegroundColor DarkYellow
+  }
+}
+
+# ============================================================
+# CLOUD REWIND SIZING (GCP)  -  skip with -SkipCloudRewind
+# Self-contained sweep via Cloud Asset Inventory (gcloud asset search-all-resources) per project, classified
+# against the derived billable taxonomy. Emits one row per billable resource + a billable-vs-non-billable summary.
+# Honors -Labels (client-side). Independent of the Data Protection inventory. Requires the Cloud Asset API.
+# ============================================================
+if (-not $SkipCloudRewind) {
+  try {
+    Write-CVSection 'Cloud Rewind Sizing'
+    $crTax           = Get-CVGcpCloudRewindTaxonomy
+    $crAssetTypes    = (Get-CVGcpCloudRewindAssetTypes) -join ','
+    $crFilterTagKeys = Get-CVFilterTagKeys -FilterTags $Labels
+    $crRows          = New-Object System.Collections.Generic.List[object]
+    $crClassified    = New-Object System.Collections.Generic.List[object]
+
+    foreach ($proj in @($targetProjects)) {
+        $raw = & gcloud asset search-all-resources --scope="projects/$proj" --asset-types="$crAssetTypes" --format=json --quiet 2>$null
+        if ($LASTEXITCODE -ne 0) {
+            Write-CVLog "Cloud Rewind: asset search failed in $proj (is the Cloud Asset API enabled?). Skipping." -Level Warning -Source 'CloudRewind'
+            continue
+        }
+        $assets = @()
+        try { $assets = @($raw | ConvertFrom-Json -ErrorAction Stop) } catch { continue }
+
+        foreach ($asset in $assets) {
+            $at = $asset.assetType
+            $billable = Get-CVCloudRewindBillable -ResourceType $at -Taxonomy $crTax
+            if ($null -eq $billable) { continue }
+
+            $labelHash = @{}
+            if ($asset.labels) { foreach ($p in $asset.labels.PSObject.Properties) { $labelHash[$p.Name] = $p.Value } }
+            if (-not (Test-CVResourceMatch -Tags $labelHash -FilterTags $Labels)) { continue }
+
+            $class = Get-CVGcpCloudRewindClass -AssetType $at
+            $crClassified.Add([pscustomobject]@{ Account = $proj; AccountName = $proj; Billable = [bool]$billable; ResourceClass = $class })
+
+            if ($billable) {
+                $rname = if ($asset.displayName) { $asset.displayName } else { ("$($asset.name)" -split '/')[-1] }
+                $crRows.Add( (New-CVCloudRewindRow -Fields @{
+                    CloudProvider    = 'GCP'
+                    Account          = $proj
+                    AccountName      = $proj
+                    TenantOrOrg      = ''
+                    Region           = $asset.location
+                    ResourceGroup    = ''
+                    ResourceName     = $rname
+                    ResourceId       = $asset.name
+                    ResourceType     = $at
+                    ResourceState    = ''
+                    BillableReason   = (Get-CVGcpCloudRewindReason -AssetType $at)
+                    VpcOrVNet        = ''
+                    Subnet           = ''
+                    AvailabilityZone = $asset.location
+                    HasPublicIp      = ''
+                    DiscoveredAt     = $dateStr
+                } -Tags $labelHash -FilterTagKeys $crFilterTagKeys) )
+            }
+        }
+    }
+
+    $crCsv = Join-Path $outDir ("gcp_cloudrewind_" + $dateStr + ".csv")
+    if ($crRows.Count) {
+        $crRows | Export-Csv -Path $crCsv -NoTypeInformation
+        Write-Host "gcp_cloudrewind_$dateStr.csv ($($crRows.Count) billable resources) written to $outDir" -ForegroundColor Cyan
+    } else {
+        Write-CVLog 'Cloud Rewind: no billable resources found for the current scope.' -Level Warning -Source 'CloudRewind'
+    }
+
+    $crSummary = Get-CVCloudRewindSummary -Classified $crClassified
+    if (@($crSummary).Count) {
+        $crSummary | Export-Csv -Path (Join-Path $outDir ("gcp_cloudrewind_summary_" + $dateStr + ".csv")) -NoTypeInformation
+        $crTB  = (@($crSummary) | Measure-Object TotalBillable -Sum).Sum
+        $crTNB = (@($crSummary) | Measure-Object TotalNonBillable -Sum).Sum
+        Write-CVLog ("Cloud Rewind: {0} billable, {1} non-billable resources across {2} project(s)" -f $crTB, $crTNB, @($crSummary).Count) -Level Success -Source 'CloudRewind'
+        Write-Host "gcp_cloudrewind_summary_$dateStr.csv written to $outDir" -ForegroundColor Cyan
+    }
+  } catch {
+    Write-CVLog "Cloud Rewind (GCP) pass failed: $($_.Exception.Message)" -Level Warning -Source 'CloudRewind'
+    Write-Host ("[CloudRewind] $($_.Exception.GetType().Name): $($_.Exception.Message) :: " + ($_.ScriptStackTrace -replace "`r?`n", ' <- ')) -ForegroundColor DarkYellow
+  }
 }
 
 # ================= DB CSV EXPORTS =================

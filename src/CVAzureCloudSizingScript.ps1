@@ -201,6 +201,11 @@
        .\CVAzureCloudSizingScript.ps1 -Types VM
        .\CVAzureCloudSizingScript.ps1 -Types AKS  # AKS-only inventory
        .\CVAzureCloudSizingScript.ps1 -Subscriptions "MySubscription"
+       .\CVAzureCloudSizingScript.ps1 -SkipDataProtection          # Cloud Rewind billable-resource sizing only
+       .\CVAzureCloudSizingScript.ps1 -ResourceGroups rg1 -Tags Environment=Production   # scope both passes
+
+    Cloud Rewind sizing runs by default alongside Data Protection and writes azure_cloudrewind_<ts>.csv
+    (one row per billable resource) + azure_cloudrewind_summary_<ts>.csv. Use -SkipCloudRewind to skip it.
 #>  
   
 param(  
@@ -210,11 +215,26 @@ param(
     [string[]]$EnvTagValues,                 # Filter to these tag values only (e.g. "Production","Prod"). If omitted, all resources are included.
     [ValidateSet("csv","json","both")][string]$OutputFormat = "csv",  # Output format: csv (default), json, or both
     [switch]$NonInteractive,   # force plain, non-interactive output (no progress bars / rich UI) - for CI / automation
-    [switch]$Quiet             # minimal console output (still writes the full log file)
+    [switch]$Quiet,            # minimal console output (still writes the full log file)
+    [switch]$SkipResilienceReport, # do not compute or write the cyber resilience posture report
+    [string[]]$ResourceGroups,     # limit BOTH passes to these resource groups (union with -Tags). Omitted = all.
+    [string[]]$Tags,               # limit BOTH passes to resources carrying any of these 'Key=Value' tags. Omitted = all.
+    [switch]$SkipCloudRewind,      # skip the Cloud Rewind billable-resource sizing pass
+    [switch]$SkipDataProtection    # skip the Data Protection inventory + resilience pass (run Cloud Rewind only)
 )
 
-# Load the shared console / diagnostics layer (src/common/CVSizing.Console.ps1).
+# Guard: at least one discovery pass must run.
+if ($SkipCloudRewind -and $SkipDataProtection) {
+    Write-Host 'ERROR: -SkipCloudRewind and -SkipDataProtection cannot both be set - nothing would run.' -ForegroundColor Red
+    exit 1
+}
+
+# Load the shared console / diagnostics + resilience + Cloud Rewind layers (src/common/).
 . (Join-Path $PSScriptRoot 'common' 'CVSizing.Console.ps1')
+. (Join-Path $PSScriptRoot 'common' 'CVSizing.Resilience.ps1')
+. (Join-Path $PSScriptRoot 'common' 'CVSizing.Resilience.Azure.ps1')   # Azure control definitions
+. (Join-Path $PSScriptRoot 'common' 'CVSizing.CloudRewind.ps1')        # provider-neutral Cloud Rewind engine
+. (Join-Path $PSScriptRoot 'common' 'CVSizing.CloudRewind.Azure.ps1')  # Azure billable taxonomy + inclusion rules
 
 # AKS Helper Functions
 function Test-KubectlAvailable {
@@ -537,6 +557,16 @@ if ($Types) {
     $ResourceTypeMap.Keys | ForEach-Object { $Selected[$_] = $true }  
 }
 
+# -SkipDataProtection: run Cloud Rewind only. Clearing $Selected skips every DP per-service block (all guarded
+# by $Selected.<type>) and their CSVs, while the subscription loop still runs for the Cloud Rewind sweep.
+if ($SkipDataProtection) { $Selected = @{} }
+
+# Fold the legacy -EnvTagName/-EnvTagValues filter into the unified -Tags filter (Key=Value), so both passes
+# share one filter surface.
+if ($EnvTagValues -and $EnvTagValues.Count) {
+    $Tags = @($Tags) + @($EnvTagValues | ForEach-Object { "$EnvTagName=$_" })
+}
+
 # Early kubectl availability check if AKS is selected
 if ($Selected.AKS) {
     Write-Host "AKS resource type selected - checking kubectl availability..." -ForegroundColor Cyan
@@ -579,6 +609,7 @@ $fatalModules = @(
     'Az.Sql','Az.MySql','Az.PostgreSql','Az.Aks','Az.RecoveryServices','Az.VMware'
 )
 if (-not $peek.IsHeadless) { $fatalModules += 'PwshSpectreConsole' }
+if (-not $SkipCloudRewind) { $fatalModules += 'Az.Network' }   # Cloud Rewind attach checks (public IP / NIC)
 Assert-CVPreflight -FatalModules $fatalModules -ExitOnFatal | Out-Null
 
 # Initialize-CVConsole also calls Set-CVNativeNoiseSuppression -Provider Azure, which sets the
@@ -622,6 +653,13 @@ $ResourceTypeModules = @{
 Import-Module Az.Accounts -ErrorAction Stop
 foreach ($svc in @($Selected.Keys)) {
     foreach ($m in ($ResourceTypeModules[$svc] | Select-Object -Unique)) {
+        if (-not (Get-Module -Name $m)) { Import-Module $m -ErrorAction Stop }
+    }
+}
+
+# Cloud Rewind sweep needs Az.Resources (Get-AzResource) + Az.Compute/Az.Network (attach checks), independent of -Types.
+if (-not $SkipCloudRewind) {
+    foreach ($m in @('Az.Resources','Az.Compute','Az.Network')) {
         if (-not (Get-Module -Name $m)) { Import-Module $m -ErrorAction Stop }
     }
 }
@@ -703,6 +741,10 @@ $AVSClusters = @()
 
 # Process each subscription sequentially
 $subIdx = 0
+# -SkipDataProtection: skip the entire Data Protection pipeline (subscription loop + protection enrichment +
+# coverage) so only the Cloud Rewind pass below runs. DP arrays stay empty; downstream DP CSV/summary/JSON
+# exports are guarded by $Selected/.Count and no-op. (Cloud Rewind has its own subscription loop.)
+if (-not $SkipDataProtection) {
 $savedEAP = $ErrorActionPreference   # restored after the loop so the per-iteration "Stop" below does not leak to post-loop code
 foreach ($sub in $subs) {
     $subIdx++
@@ -1989,6 +2031,28 @@ Write-Progress -Id 1 -Activity "Processing Azure Subscriptions" -Completed
 Write-CVSection "Subscription Processing Complete"
 
 # ---------------------------------------------------------------------------
+# Run-wide resource-group filter (-ResourceGroups): scope the Data Protection inventory to the requested groups,
+# matching the Cloud Rewind pass ("entire run" filter). Applied via the ResourceGroup property every inventory
+# row carries; rows without a resolvable ResourceGroup are kept (conservative). -Tags is honored fully by the
+# Cloud Rewind pass; DP-side per-service tag capture is a follow-up.
+# ---------------------------------------------------------------------------
+if (-not $SkipDataProtection -and @($ResourceGroups).Count) {
+    $rgFilter = @($ResourceGroups | Where-Object { $_ -and "$_".Trim() })
+    $keepRg = {
+        param($obj)
+        if (-not $obj) { return $false }
+        $rg = $obj.ResourceGroup
+        if ([string]::IsNullOrWhiteSpace("$rg")) { return $true }   # unknown resource group -> keep
+        return [bool](@($rgFilter | Where-Object { $_.Trim() -ieq "$rg".Trim() }).Count)
+    }
+    foreach ($arrName in @('VMs','StorageAccounts','FileShares','NetAppVolumes','SqlInstancesInventory','SqlDbInventory','SqlMIDbInventory','MySQLServers','PostgreSQLServers','CosmosDBs','AKSClusters','UnmanagedDiskItems','AVSClusters','BackupItems')) {
+        $cur = Get-Variable -Name $arrName -ValueOnly -ErrorAction SilentlyContinue
+        if ($null -ne $cur) { Set-Variable -Name $arrName -Value @(@($cur) | Where-Object { & $keepRg $_ }) }
+    }
+    Write-CVLog "Data Protection scoped to resource group(s): $($rgFilter -join ', ')" -Level Info -Source 'Filter'
+}
+
+# ---------------------------------------------------------------------------
 # Protection enrichment: attribute Recovery Services backup items and managed-disk
 # snapshots back onto each VM row, so every resource carries its own coverage.
 # ---------------------------------------------------------------------------
@@ -2059,6 +2123,171 @@ if ($Selected.COSMOS) { Write-Host "Total CosmosDB Accounts found: $($CosmosDBs.
 if ($Selected.AKS) { Write-Host "Total AKS Clusters found: $($AKSClusters.Count)" -ForegroundColor Cyan }
 if ($Selected.AKS) { Write-Host "Total AKS Persistent Volumes found: $($AKSPersistentVolumes.Count)" -ForegroundColor Cyan }
 if ($Selected.AKS) { Write-Host "Total AKS Persistent Volume Claims found: $($AKSPersistentVolumeClaims.Count)" -ForegroundColor Cyan }
+}   # end of the Data Protection pipeline (-SkipDataProtection wrap)
+
+# ============================================================
+# CYBER RESILIENCE POSTURE REPORT  (skip with -SkipResilienceReport)
+# Scores each resource's CURRENT NATIVE Azure configuration against the Cloud Resilience Control Catalog.
+# Runs before the CSV exports so Ctl_* columns land on every per-service CSV. Unknown signals are excluded
+# from the score (never failing), and per-row failures are isolated. Empty environment -> "nothing to assess".
+# ============================================================
+if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
+  try {
+    Write-CVSection 'Cyber Resilience Posture'
+    $azControls   = Get-CVAzureResilienceControls
+    $resilResults = New-Object System.Collections.Generic.List[object]
+
+    # Full-reach enrichment for storage accounts (defensive: any failure leaves the field absent -> Unknown).
+    foreach ($sa in @($StorageAccounts)) {
+        if (-not $sa) { continue }
+        try {
+            $acct = Get-AzStorageAccount -ResourceGroupName $sa.ResourceGroup -Name $sa.StorageAccount -ErrorAction Stop
+            Add-Member -InputObject $sa -NotePropertyName PublicAccessBlocked -NotePropertyValue ($acct.AllowBlobPublicAccess -eq $false) -Force
+            Add-Member -InputObject $sa -NotePropertyName CmkEncrypted        -NotePropertyValue ("$($acct.Encryption.KeySource)" -eq 'Microsoft.Keyvault') -Force
+            try {
+                $bsp = Get-AzStorageBlobServiceProperty -ResourceGroupName $sa.ResourceGroup -StorageAccountName $sa.StorageAccount -ErrorAction Stop
+                Add-Member -InputObject $sa -NotePropertyName BlobVersioning    -NotePropertyValue ([bool]$bsp.IsVersioningEnabled) -Force
+                Add-Member -InputObject $sa -NotePropertyName SoftDeleteEnabled -NotePropertyValue ([bool]$bsp.DeleteRetentionPolicy.Enabled) -Force
+            } catch {}
+        } catch {}
+    }
+    # Azure Files is SSE-encrypted at rest by default.
+    foreach ($fsh in @($FileShares)) { if ($fsh) { Add-Member -InputObject $fsh -NotePropertyName EncryptedAtRest -NotePropertyValue $true -Force } }
+
+    # Evaluate each resource type; append Ctl_*/ResilienceScore/ResilienceGaps onto the inventory rows.
+    $collections = @(
+        @{ Type='VM';        Set=$azControls.VM;        Rows=@($VMs) }
+        @{ Type='Disk';      Set=$azControls.Disk;      Rows=@($UnmanagedDiskItems) }
+        @{ Type='Storage';   Set=$azControls.Storage;   Rows=@($StorageAccounts) }
+        @{ Type='SQL';       Set=$azControls.SQL;       Rows=@($SqlDbInventory) }
+        @{ Type='FlexDB';    Set=$azControls.FlexDB;    Rows=(@($MySQLServers) + @($PostgreSQLServers)) }
+        @{ Type='Cosmos';    Set=$azControls.Cosmos;    Rows=@($CosmosDBs) }
+        @{ Type='FileShare'; Set=$azControls.FileShare; Rows=@($FileShares) }
+        @{ Type='AKS';       Set=$azControls.AKS;       Rows=@($AKSClusters) }
+    )
+    $resilCatalog = New-Object System.Collections.Generic.List[object]
+    $resilShownErr = $false
+    foreach ($c in $collections) {
+        if (-not $c.Set) { continue }
+        foreach ($m in (Get-CVControlCatalog -Controls $c.Set -ResourceType $c.Type)) { $resilCatalog.Add($m) }
+        foreach ($row in $c.Rows) {
+            if (-not $row) { continue }
+            try {
+                $ev = Invoke-CVResilience -Resource $row -Controls $c.Set
+                foreach ($kv in (ConvertTo-CVResilienceColumns -Evaluation $ev).GetEnumerator()) {
+                    Add-Member -InputObject $row -NotePropertyName $kv.Key -NotePropertyValue $kv.Value -Force
+                }
+                foreach ($res in $ev.Results) {
+                    Add-Member -InputObject $res -NotePropertyName ResourceType -NotePropertyValue $c.Type -Force
+                    $resilResults.Add($res)
+                }
+            } catch {
+                if (-not $resilShownErr) {
+                    $resilShownErr = $true
+                    Write-Host ("[Resilience] eval error on a $($c.Type) row: $($_.Exception.GetType().Name): $($_.Exception.Message) :: " + ($_.ScriptStackTrace -replace "`r?`n", ' <- ')) -ForegroundColor DarkYellow
+                }
+            }
+        }
+    }
+
+    $resilSummary = Get-CVResilienceSummary -Results $resilResults
+    if ($null -ne $resilSummary.OverallScore) {
+        Write-CVLog ("Overall native resilience score: {0}/100  ({1} controls assessed, {2} not assessed)" -f $resilSummary.OverallScore, $resilSummary.Assessed, $resilSummary.Excluded) -Level Success -Source 'Resilience'
+        foreach ($cat in $resilSummary.ByCategory) { Write-CVLog ("  {0,-14} {1,3}% met ({2}/{3})" -f $cat.Category, $cat.PercentMet, $cat.ControlsMet, $cat.ControlsTotal) -Level Info -Source 'Resilience' }
+        $resilSummary.ByCategory | Export-Csv (Join-Path $outdir ("azure_resilience_category_$dateStr.csv")) -NoTypeInformation
+        if ($resilSummary.TopGaps.Count) { $resilSummary.TopGaps | Select-Object Id,Title,Category,Severity,Count | Export-Csv (Join-Path $outdir ("azure_resilience_gaps_$dateStr.csv")) -NoTypeInformation }
+        $resilCatalog | Export-Csv (Join-Path $outdir ("azure_resilience_controls_$dateStr.csv")) -NoTypeInformation
+        Write-Host "azure_resilience_*_$dateStr.csv (category, gaps, controls) written to $outdir" -ForegroundColor Cyan
+    } else {
+        Write-CVLog "No resilience controls could be assessed (no eligible resources or signals)." -Level Warning -Source 'Resilience'
+    }
+  } catch {
+    Write-CVLog "Resilience report failed: $($_.Exception.Message)" -Level Warning -Source 'Resilience'
+    Write-Host ("[Resilience] $($_.Exception.GetType().Name): $($_.Exception.Message) :: " + ($_.ScriptStackTrace -replace "`r?`n", ' <- ')) -ForegroundColor DarkYellow
+  }
+}
+
+# ============================================================
+# CLOUD REWIND SIZING  (skip with -SkipCloudRewind)
+# Self-contained sweep: Get-AzResource per subscription, classified against the Cloud Rewind billable taxonomy
+# (article 89349). Emits one row per BILLABLE resource plus a billable-vs-non-billable summary. Honors the
+# run-wide -ResourceGroups/-Tags filter. Independent of the Data Protection inventory above.
+# ============================================================
+if (-not $SkipCloudRewind) {
+  try {
+    Write-CVSection 'Cloud Rewind Sizing'
+    $crTax           = Get-CVAzureCloudRewindTaxonomy
+    $crFilterTagKeys = Get-CVFilterTagKeys -FilterTags $Tags
+    $crRows          = New-Object System.Collections.Generic.List[object]
+    $crClassified    = New-Object System.Collections.Generic.List[object]
+    $crShownErr      = $false
+
+    foreach ($sub in $subs) {
+        try { Set-AzContext -SubscriptionId $sub.Id | Out-Null }
+        catch { Write-CVLog "Cloud Rewind: cannot set context for $($sub.Name): $($_.Exception.Message)" -Level Warning -Source 'CloudRewind'; continue }
+
+        $crResources = @()
+        try { $crResources = @(Get-AzResource) }
+        catch { Write-CVLog "Cloud Rewind: Get-AzResource failed in $($sub.Name): $($_.Exception.Message)" -Level Warning -Source 'CloudRewind'; continue }
+
+        foreach ($r in $crResources) {
+            $billable = Get-CVCloudRewindBillable -ResourceType $r.ResourceType -Taxonomy $crTax
+            if ($null -eq $billable) { continue }                                   # not in the taxonomy -> ignore
+            if (-not (Test-CVResourceMatch -ResourceGroup $r.ResourceGroupName -Tags $r.Tags -FilterResourceGroups $ResourceGroups -FilterTags $Tags)) { continue }
+            try {
+                if (-not (Test-CVAzureCloudRewindInclude -Resource $r)) { continue } # unattached / OS disk / master / Flexible VMSS
+            } catch {
+                if (-not $crShownErr) { $crShownErr = $true; Write-Host "[CloudRewind] inclusion check error on $($r.ResourceType): $($_.Exception.Message)" -ForegroundColor DarkYellow }
+                continue
+            }
+
+            $class = Get-CVAzureCloudRewindClass -ResourceType $r.ResourceType
+            $crClassified.Add([pscustomobject]@{ Account = $sub.Id; AccountName = $sub.Name; Billable = [bool]$billable; ResourceClass = $class })
+
+            if ($billable) {
+                $crRows.Add( (New-CVCloudRewindRow -Fields @{
+                    CloudProvider    = 'Azure'
+                    Account          = $sub.Id
+                    AccountName      = $sub.Name
+                    TenantOrOrg      = $sub.TenantId
+                    Region           = $r.Location
+                    ResourceGroup    = $r.ResourceGroupName
+                    ResourceName     = $r.Name
+                    ResourceId       = $r.ResourceId
+                    ResourceType     = $r.ResourceType
+                    ResourceState    = ''
+                    BillableReason   = (Get-CVAzureCloudRewindReason -ResourceType $r.ResourceType)
+                    VpcOrVNet        = ''      # topology enrichment: fast-follow
+                    Subnet           = ''
+                    AvailabilityZone = ''
+                    HasPublicIp      = ''
+                    DiscoveredAt     = $dateStr
+                } -Tags $r.Tags -FilterTagKeys $crFilterTagKeys) )
+            }
+        }
+    }
+
+    $crCsv = Join-Path $outdir ("azure_cloudrewind_$dateStr.csv")
+    if ($crRows.Count) {
+        $crRows | Export-Csv $crCsv -NoTypeInformation
+        Write-Host "azure_cloudrewind_$dateStr.csv ($($crRows.Count) billable resources) written to $outdir" -ForegroundColor Cyan
+    } else {
+        Write-CVLog 'Cloud Rewind: no billable resources found for the current scope.' -Level Warning -Source 'CloudRewind'
+    }
+
+    $crSummary = Get-CVCloudRewindSummary -Classified $crClassified
+    if (@($crSummary).Count) {
+        $crSummary | Export-Csv (Join-Path $outdir ("azure_cloudrewind_summary_$dateStr.csv")) -NoTypeInformation
+        $crTB  = (@($crSummary) | Measure-Object TotalBillable -Sum).Sum
+        $crTNB = (@($crSummary) | Measure-Object TotalNonBillable -Sum).Sum
+        Write-CVLog ("Cloud Rewind: {0} billable, {1} non-billable resources across {2} subscription(s)" -f $crTB, $crTNB, @($crSummary).Count) -Level Success -Source 'CloudRewind'
+        Write-Host "azure_cloudrewind_summary_$dateStr.csv written to $outdir" -ForegroundColor Cyan
+    }
+  } catch {
+    Write-CVLog "Cloud Rewind pass failed: $($_.Exception.Message)" -Level Warning -Source 'CloudRewind'
+    Write-Host ("[CloudRewind] $($_.Exception.GetType().Name): $($_.Exception.Message) :: " + ($_.ScriptStackTrace -replace "`r?`n", ' <- ')) -ForegroundColor DarkYellow
+  }
+}
 
 # Write all resources to CSV files
 Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing CSV files..." -PercentComplete 0

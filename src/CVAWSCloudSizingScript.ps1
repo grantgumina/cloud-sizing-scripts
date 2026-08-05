@@ -72,6 +72,11 @@
         – ZIP archive of the run's output files
     Logs/aws_YYYY-MM-DD_HHMMSS.log
         – Complete execution log
+
+    Cloud Rewind sizing (default; -SkipCloudRewind to skip) additionally writes to Output/aws_.../:
+        - aws_cloudrewind_<account>_YYYY-MM-DD_HHMMSS.csv          (one row per billable resource)
+        - aws_cloudrewind_summary_<account>_YYYY-MM-DD_HHMMSS.csv  (billable vs non-billable totals)
+    Use -SkipDataProtection for Cloud Rewind only; -Tags Key=Value scopes the Cloud Rewind pass.
 #>
 
 
@@ -108,11 +113,25 @@ param (
     [switch]$SelectiveZipping = $true,
     [ValidateSet("csv","json","both")][string]$OutputFormat = "csv",  # Output format: csv (default), json, or both
     [switch]$NonInteractive,   # force plain, non-interactive output (no progress bars / rich UI) - for CI / automation
-    [switch]$Quiet             # minimal console output (still writes the full log file)
+    [switch]$Quiet,            # minimal console output (still writes the full log file)
+    [switch]$SkipResilienceReport, # do not compute or write the cyber resilience posture report
+    [string[]]$ResourceGroups,     # (reserved) AWS resource-group filtering is a follow-up; -Tags is applied today
+    [string[]]$Tags,               # limit the Cloud Rewind pass to resources carrying any of these 'Key=Value' tags
+    [switch]$SkipCloudRewind,      # skip the Cloud Rewind billable-resource sizing pass
+    [switch]$SkipDataProtection    # skip the Data Protection inventory pass (run Cloud Rewind only)
 )
 
-# Load the shared console / diagnostics layer (src/common/CVSizing.Console.ps1).
+# Guard: at least one discovery pass must run.
+if ($SkipCloudRewind -and $SkipDataProtection) {
+    Write-Host 'ERROR: -SkipCloudRewind and -SkipDataProtection cannot both be set - nothing would run.' -ForegroundColor Red
+    exit 1
+}
+
+# Load the shared console / diagnostics + resilience + Cloud Rewind layers (src/common/).
 . (Join-Path $PSScriptRoot 'common' 'CVSizing.Console.ps1')
+. (Join-Path $PSScriptRoot 'common' 'CVSizing.Resilience.ps1')
+. (Join-Path $PSScriptRoot 'common' 'CVSizing.CloudRewind.ps1')      # provider-neutral Cloud Rewind engine
+. (Join-Path $PSScriptRoot 'common' 'CVSizing.CloudRewind.AWS.ps1')  # AWS billable taxonomy (derived)
 
 
 [System.Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'
@@ -2732,6 +2751,94 @@ function Get-EFSFileSystemSize {
     }
 }
 
+# ============================================================
+# CLOUD REWIND SIZING (AWS)  -  skip with -SkipCloudRewind
+# Self-contained per-account sweep via the Resource Groups Tagging API (Get-RGTResource, one call per region).
+# Each resource ARN is classified against the derived billable taxonomy; emits one row per billable resource plus
+# a billable-vs-non-billable summary. Honors -Tags (client-side). Independent of the Data Protection inventory.
+# ============================================================
+function Invoke-AWSCloudRewindSweep {
+    param([object]$Credential, [object[]]$Regions, [hashtable]$AccountInfo)
+    try {
+        Write-CVSection 'Cloud Rewind Sizing'
+        if (@($ResourceGroups).Count) {
+            Write-CVLog 'Cloud Rewind (AWS): -ResourceGroups filtering is a follow-up for AWS; applying -Tags only.' -Level Warning -Source 'CloudRewind'
+        }
+        $crTax           = Get-CVAwsCloudRewindTaxonomy
+        $crFilterTagKeys = Get-CVFilterTagKeys -FilterTags $Tags
+        $crRows          = New-Object System.Collections.Generic.List[object]
+        $crClassified    = New-Object System.Collections.Generic.List[object]
+        $accountSuffix   = if ($AccountInfo.AccountAlias -and $AccountInfo.AccountAlias -ne 'Unknown') { $AccountInfo.AccountAlias } else { $AccountInfo.Account }
+
+        foreach ($region in @($Regions)) {
+            $region = Format-RegionName -Region $region
+            $resources = @()
+            try { $resources = @(Get-RGTResource -Credential $Credential -Region $region -ErrorAction Stop) }
+            catch { Write-CVLog "Cloud Rewind: Get-RGTResource failed in $region : $($_.Exception.Message)" -Level Warning -Source 'CloudRewind'; continue }
+
+            foreach ($res in $resources) {
+                $arn = $res.ResourceARN
+                $billable = Get-CVAwsCloudRewindBillable -Arn $arn -Taxonomy $crTax
+                if ($null -eq $billable) { continue }
+
+                $tagHash = @{}
+                foreach ($t in @($res.Tags)) { if ($t.Key) { $tagHash[$t.Key] = $t.Value } }
+                if (-not (Test-CVResourceMatch -Tags $tagHash -FilterTags $Tags)) { continue }
+
+                $token = Get-CVAwsArnType -Arn $arn
+                $class = Get-CVAwsCloudRewindClass -Token $token
+                $crClassified.Add([pscustomobject]@{ Account = $AccountInfo.Account; AccountName = $accountSuffix; Billable = [bool]$billable; ResourceClass = $class })
+
+                if ($billable) {
+                    $name = ("$arn" -split '[:/]')[-1]
+                    $crRows.Add( (New-CVCloudRewindRow -Fields @{
+                        CloudProvider    = 'AWS'
+                        Account          = $AccountInfo.Account
+                        AccountName      = $accountSuffix
+                        TenantOrOrg      = ''
+                        Region           = $region
+                        ResourceGroup    = ''
+                        ResourceName     = $name
+                        ResourceId       = $arn
+                        ResourceType     = $token
+                        ResourceState    = ''
+                        BillableReason   = (Get-CVAwsCloudRewindReason -Token $token)
+                        VpcOrVNet        = ''
+                        Subnet           = ''
+                        AvailabilityZone = $region
+                        HasPublicIp      = ''
+                        DiscoveredAt     = $date_string
+                    } -Tags $tagHash -FilterTagKeys $crFilterTagKeys) )
+                }
+            }
+        }
+
+        $crFile = "aws_cloudrewind_${accountSuffix}_$date_string.csv"
+        $crPath = Join-Path $script:Config.OutputPath $crFile
+        if ($crRows.Count) {
+            $crRows | Export-Csv -Path $crPath -NoTypeInformation
+            $script:AllOutputFiles.Add($crPath) | Out-Null
+            Write-ScriptOutput "$crFile ($($crRows.Count) billable resources) written to $($script:Config.OutputPath)" -Level Info
+        } else {
+            Write-CVLog "Cloud Rewind: no billable resources found for account $($AccountInfo.Account)." -Level Warning -Source 'CloudRewind'
+        }
+
+        $crSummary = Get-CVCloudRewindSummary -Classified $crClassified
+        if (@($crSummary).Count) {
+            $crSumFile = "aws_cloudrewind_summary_${accountSuffix}_$date_string.csv"
+            $crSumPath = Join-Path $script:Config.OutputPath $crSumFile
+            $crSummary | Export-Csv -Path $crSumPath -NoTypeInformation
+            $script:AllOutputFiles.Add($crSumPath) | Out-Null
+            $tb  = (@($crSummary) | Measure-Object TotalBillable -Sum).Sum
+            $tnb = (@($crSummary) | Measure-Object TotalNonBillable -Sum).Sum
+            Write-ScriptOutput "Cloud Rewind: $tb billable, $tnb non-billable resources for account $($AccountInfo.Account)" -Level Success
+        }
+    }
+    catch {
+        Write-CVLog "Cloud Rewind (AWS) pass failed: $($_.Exception.Message)" -Level Warning -Source 'CloudRewind'
+    }
+}
+
 function Invoke-AWSDataCollection {
     param([object]$Credential)
 
@@ -2756,25 +2863,32 @@ function Invoke-AWSDataCollection {
         Initialize-ServiceCollections -AccountId $accountInfo.Account
         $script:AccountsProcessed += $accountInfo
 
-        $awsRegionCounter = 1
-        foreach ($awsRegion in $awsRegions) {
-            $awsRegion = Format-RegionName -Region $awsRegion
-            Show-ScriptProgress -Activity "Region $awsRegion" -Status "Region $awsRegionCounter of $($awsRegions.Count)" -PercentComplete (($awsRegionCounter / $awsRegions.Count) * 100)
+        if (-not $SkipDataProtection) {
+            $awsRegionCounter = 1
+            foreach ($awsRegion in $awsRegions) {
+                $awsRegion = Format-RegionName -Region $awsRegion
+                Show-ScriptProgress -Activity "Region $awsRegion" -Status "Region $awsRegionCounter of $($awsRegions.Count)" -PercentComplete (($awsRegionCounter / $awsRegions.Count) * 100)
 
-            Set-RegionPartition -Region $awsRegion
+                Set-RegionPartition -Region $awsRegion
 
-            foreach ($serviceName in $script:ServiceRegistry.Keys) {
-                Invoke-ServiceInventory -ServiceName $serviceName -Credential $Credential -Region $awsRegion -AccountInfo $accountInfo -AccountAlias $accountInfo.AccountAlias
+                foreach ($serviceName in $script:ServiceRegistry.Keys) {
+                    Invoke-ServiceInventory -ServiceName $serviceName -Credential $Credential -Region $awsRegion -AccountInfo $accountInfo -AccountAlias $accountInfo.AccountAlias
+                }
+
+                $awsRegionCounter++
             }
 
-            $awsRegionCounter++
+            Write-ScriptOutput "Region processing completed for account $($accountInfo.Account)" -Level Success
+
+            # Per-service CSVs (one file per discovered service type) plus the Excel summary workbook.
+            Export-ServiceCSVFiles -AccountId $accountInfo.Account -AccountAlias $accountInfo.AccountAlias
+            New-AccountLevelSummary -AccountId $accountInfo.Account -AccountAlias $accountInfo.AccountAlias
         }
 
-        Write-ScriptOutput "Region processing completed for account $($accountInfo.Account)" -Level Success
-
-        # Per-service CSVs (one file per discovered service type) plus the Excel summary workbook.
-        Export-ServiceCSVFiles -AccountId $accountInfo.Account -AccountAlias $accountInfo.AccountAlias
-        New-AccountLevelSummary -AccountId $accountInfo.Account -AccountAlias $accountInfo.AccountAlias
+        # Cloud Rewind billable-resource sizing (independent of the Data Protection inventory above).
+        if (-not $SkipCloudRewind) {
+            Invoke-AWSCloudRewindSweep -Credential $Credential -Regions $awsRegions -AccountInfo $accountInfo
+        }
     }
     catch {
         Write-ScriptOutput "Error in AWS data collection: $_" -Level Error
@@ -3549,6 +3663,7 @@ try {
         'AWS.Tools.ElastiCache', 'AWS.Tools.Backup'
     )
     if (-not $peek.IsHeadless) { $fatalModules += 'PwshSpectreConsole' }
+    if (-not $SkipCloudRewind) { $fatalModules += 'AWS.Tools.ResourceGroupsTaggingAPI' }   # Cloud Rewind resource sweep
     Assert-CVPreflight -FatalModules $fatalModules -ExitOnFatal | Out-Null
 
     Initialize-CVConsole -Cloud AWS -LogPath $script:LogPath -Title 'AWS Cost Sizing Analysis' `
@@ -3578,15 +3693,18 @@ try {
     Write-ScriptOutput "=== Processing Summary ===" -Level Success
     Write-ScriptOutput "Accounts processed: $($script:AccountsProcessed.Count)" -Level Info
 
-    if ($script:AccountsProcessed.Count -gt 0) {
-        ComprehensiveSummary
-    }
+    # DP cross-account summary + per-service counts - only meaningful when the Data Protection pass ran.
+    if (-not $SkipDataProtection) {
+        if ($script:AccountsProcessed.Count -gt 0) {
+            ComprehensiveSummary
+        }
 
-    foreach ($account in $script:AccountsProcessed) {
-        Write-ScriptOutput "Account: $($account.Account) ($($account.AccountAlias))" -Level Info
-        foreach ($serviceName in $script:ServiceRegistry.Keys) {
-            $count = $script:ServiceDataByAccount[$account.Account][$serviceName].Count
-            Write-ScriptOutput "  $serviceName`: $count items" -Level Info
+        foreach ($account in $script:AccountsProcessed) {
+            Write-ScriptOutput "Account: $($account.Account) ($($account.AccountAlias))" -Level Info
+            foreach ($serviceName in $script:ServiceRegistry.Keys) {
+                $count = $script:ServiceDataByAccount[$account.Account][$serviceName].Count
+                Write-ScriptOutput "  $serviceName`: $count items" -Level Info
+            }
         }
     }
 

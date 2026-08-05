@@ -18,6 +18,34 @@ cd dy-cloud-sizing-scripts/src
 
 Each script loads the shared console/diagnostics layer from `common/` automatically. Add `-NonInteractive` for plain, pipe-safe output (CI / automation). Setup and full parameter details are in the per-cloud docs below.
 
+## Two sizing passes: Data Protection + Cloud Rewind
+
+Every AWS/Azure/GCP run performs **two independent passes by default**:
+
+1. **Data Protection sizing** — the per-service resource inventory (VMs, storage, databases, …), protection columns, and the cyber-resilience posture report.
+2. **Cloud Rewind sizing** — counts the resources Commvault **Cloud Rewind** (Appranix) bills for. It runs its own lightweight sweep (Azure `Get-AzResource`, AWS Resource Groups Tagging API, GCP Cloud Asset Inventory), classifies each resource billable / non-billable and Data / Config, and writes:
+   - `<cloud>_cloudrewind_<ts>.csv` — one row per **billable** resource: account/region/resource group scope, resource name and native type, why it is billable, and topology. The two widest columns (`ResourceId`, then the flattened `Tags` blob) are last so they don't crowd out the rest in a spreadsheet; a `-Tags` filter adds one narrow `Tag_<key>` column per filtered key just before `Tags`.
+   - `<cloud>_cloudrewind_summary_<ts>.csv` — `BillableData` / `BillableConfig` / `NonBillableData` / `NonBillableConfig` totals per account.
+
+### Choosing passes and scope
+
+```powershell
+./CVAzureCloudSizingScript.ps1                                  # both passes (default)
+./CVAzureCloudSizingScript.ps1 -SkipDataProtection             # Cloud Rewind only
+./CVAzureCloudSizingScript.ps1 -SkipCloudRewind                # Data Protection only
+
+# Scope the run (filters both passes where supported)
+./CVAzureCloudSizingScript.ps1 -ResourceGroups rg1,rg2 -Tags Environment=Production
+./CVAWSCloudSizingScript.ps1   -DefaultProfile -Tags Environment=Production
+./CVGoogleCloudSizingScript.ps1 -Projects my-proj -Labels env=production
+```
+
+Filters are `Key=Value` (union: a resource matches if it is in **any** listed resource group **or** carries **any** listed tag/label). `-ResourceGroups`/`-Tags` apply on Azure & AWS; `-Labels` on GCP.
+
+**Accuracy note:** the **Azure** billable taxonomy is authoritative (Cloud Rewind support article 89349). The **AWS and GCP** taxonomies are **derived** by applying the same pattern to the public supported-resource lists — verify the billable arrays in `src/common/CVSizing.CloudRewind.{AWS,GCP}.ps1` against your Cloud Rewind billing before relying on those counts. Attach/exclusion refinements (unattached volumes/IPs) and per-resource topology columns are AWS/GCP follow-ups.
+
+**Extra prerequisites for the Cloud Rewind pass:** AWS needs `AWS.Tools.ResourceGroupsTaggingAPI`; Azure needs `Az.Resources` + `Az.Network`; GCP needs the **Cloud Asset API** (`cloudasset.googleapis.com`) enabled. Add `-SkipCloudRewind` to run without them.
+
 ## Repository layout
 
 ```
