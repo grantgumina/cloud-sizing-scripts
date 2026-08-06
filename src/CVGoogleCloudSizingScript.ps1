@@ -228,6 +228,31 @@ Initialize-CVConsole -Cloud GCP -Title 'GCP Resource Inventory' `
 if ($Types)    { Write-CVLog "Types: $($Types -join ', ')" -Level Info -Source 'Init' }
 if ($Projects) { Write-CVLog "Projects: $($Projects -join ', ')" -Level Info -Source 'Init' }
 
+function Test-CVGcloudQuotaProject {
+    <#
+      .SYNOPSIS  Warn early when gcloud's active project is missing or deleted.
+      .DESCRIPTION gcloud sends core/project as the quota/billing project on many API calls. When it points at a
+                   deleted project every such call fails with USER_PROJECT_DENIED, in a message that names the
+                   stale project rather than the one being scanned - which reads like "the API is disabled" in
+                   every project at once. Catching it here turns a whole class of confusing failures into one line.
+    #>
+    [CmdletBinding()] param()
+    $cur = (& gcloud config get-value core/project --quiet 2>$null | Out-String).Trim()
+    if (-not $cur -or $cur -eq '(unset)') {
+        Write-CVLog "gcloud core/project is unset. Some APIs bill quota to it and may fail; run 'gcloud config set project <id>'." `
+                    -Level Warning -Source 'Preflight' -Scope @{ Category = 'QuotaProject' }
+        return
+    }
+    $probe = & gcloud projects describe $cur --format=json --quiet 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-CVLog ("gcloud core/project '{0}' does not resolve (deleted or inaccessible). It is sent as the quota project, so Cloud Asset / Spanner / other API calls will fail in EVERY scanned project until you run 'gcloud config set project <live-id>'." -f $cur) `
+                    -Level Warning -Source 'Preflight' -Scope @{ Category = 'QuotaProject'; Project = $cur }
+    } else {
+        Write-CVLog "gcloud quota project: $cur" -Level Debug -Source 'Preflight'
+    }
+}
+Test-CVGcloudQuotaProject
+
 
 # Resource type mapping
 $ResourceTypeMap = @{
@@ -277,16 +302,90 @@ function Get-RegionFromZone {
     return ($z -replace '-[a-z]$','')
 }
 
+function Get-CVWorkerLineLevel {
+    <#
+      .SYNOPSIS  Pick a log level for a per-project worker line from its own tag.
+      .DESCRIPTION Workers tag their lines [X-Project-Warn] / -Skip / -Error / -Debug. Replaying every one of
+                   them at Debug meant that in console-only mode (where Start-Transcript owns the file and Debug
+                   is never rendered) NONE of them reached the log - so "VMs=0" was indistinguishable from
+                   "we could not list VMs in this project". The failures have to survive.
+    #>
+    [CmdletBinding()]
+    param([string]$Line)
+    if ($Line -match '-Error\]|JSON parse failed')       { return 'Error' }
+    if ($Line -match '-Warn\]|-Skip\]|failed|denied|not enabled|is disabled') { return 'Warning' }
+    return 'Debug'
+}
+
+function Invoke-CVGcloudJson {
+    <#
+      .SYNOPSIS  Run a JSON-emitting gcloud command and report success or failure explicitly.
+      .DESCRIPTION Callers must be able to tell "the API says there is nothing" (Ok with empty Data) from
+                   "we could not look" (Ok = $false). Collapsing the two is what turns a disabled API into a
+                   fabricated "unprotected" finding, so this never returns bare $null on failure.
+                   ApiDisabled/CommandMissing classify the two failure modes worth acting on.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string[]]$Arguments)
+
+    $raw  = & gcloud @Arguments --format=json --quiet 2>&1
+    $code = $LASTEXITCODE
+    $text = ($raw | Out-String).Trim()
+
+    if ($code -ne 0) {
+        return [pscustomobject]@{
+            Ok             = $false
+            Data           = $null
+            Error          = $text
+            # gcloud reports a disabled API as PERMISSION_DENIED/SERVICE_DISABLED - not a real permission problem.
+            ApiDisabled    = [bool]($text -match 'SERVICE_DISABLED|has not been used in project|API .*not enabled|is disabled')
+            CommandMissing = [bool]($text -match 'Invalid choice')
+        }
+    }
+    $data = $null
+    if (-not [string]::IsNullOrWhiteSpace($text)) {
+        try { $data = $text | ConvertFrom-Json }
+        catch {
+            return [pscustomobject]@{ Ok=$false; Data=$null; Error="JSON parse failed: $($_.Exception.Message)"; ApiDisabled=$false; CommandMissing=$false }
+        }
+    }
+    return [pscustomobject]@{ Ok=$true; Data=$data; Error=''; ApiDisabled=$false; CommandMissing=$false }
+}
+
+function Invoke-CVGcloudJsonAnyTrack {
+    <#
+      .SYNOPSIS  As Invoke-CVGcloudJson, but tolerant of a command that only exists on an alternate release track.
+      .DESCRIPTION Tries GA first, then the supplied fallback tracks, and only advances when gcloud reports
+                   "Invalid choice" (the surface does not exist here) - never when the call failed for a real
+                   reason. Returns the result plus the Track that answered, so callers can cache it.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [string[]]$FallbackTracks = @('beta','alpha'),
+        [string]$PreferTrack
+    )
+    $tracks = if ($PSBoundParameters.ContainsKey('PreferTrack')) { ,$PreferTrack } else { @('') + $FallbackTracks }
+    $last = $null
+    foreach ($t in $tracks) {
+        $argv = if ([string]::IsNullOrEmpty($t)) { $Arguments } else { @($t) + $Arguments }
+        $last = Invoke-CVGcloudJson -Arguments $argv
+        Add-Member -InputObject $last -NotePropertyName Track -NotePropertyValue $t -Force
+        if ($last.Ok -or -not $last.CommandMissing) { return $last }
+    }
+    return $last
+}
+
 function Ensure-Kubectl {
     param([switch]$Force)
     $env:CLOUDSDK_CORE_DISABLE_PROMPTS = '1'
     Write-Host '[Ensure-Kubectl] Ensuring kubectl presence.' -ForegroundColor Cyan
 
     # Detect platform
-    $isWindows = $false
+    $isWin = $false
     try {
-        if ($env:OS -eq 'Windows_NT' -or [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) { $isWindows = $true }
-    } catch { if ($env:OS -match 'Windows') { $isWindows = $true } }
+        if ($env:OS -eq 'Windows_NT' -or [System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) { $isWin = $true }
+    } catch { if ($env:OS -match 'Windows') { $isWin = $true } }
 
     function Add-PathSegment {
         param([string]$Dir,[switch]$Windows)
@@ -338,7 +437,7 @@ function Ensure-Kubectl {
         if ($needInstall.Count -gt 0) {
             Write-Host "[Ensure-Kubectl] Installing: $($needInstall -join ', ')" -ForegroundColor Yellow
             # Windows non-interactive workaround: copy bundled python so component install can proceed headless
-            if ($isWindows) {
+            if ($isWin) {
                 try {
                     Write-Host '[Ensure-Kubectl] (Windows) Preparing bundled Python for non-interactive component install...' -ForegroundColor Cyan
                     $copyOut = & gcloud components copy-bundled-python 2>&1
@@ -359,7 +458,7 @@ function Ensure-Kubectl {
                 Write-Warning "[Ensure-Kubectl] Component install error: $($_.Exception.Message)"
             }
             # Bundled python limitation handling (simpler): if failure, run copy-bundled-python and retry install once
-            if ($isWindows -and ($componentInstallOutput -match 'Cannot use bundled Python installation')) {
+            if ($isWin -and ($componentInstallOutput -match 'Cannot use bundled Python installation')) {
                 Write-Warning '[Ensure-Kubectl] Bundled Python restriction detected; copying bundled python and retrying.'
                 try {
                     $cpy = & gcloud components copy-bundled-python 2>&1
@@ -387,8 +486,8 @@ function Ensure-Kubectl {
         if (-not $resolved) { $resolved = Resolve-KubectlLocal }
         # Always add gcloud bin path so plugin executable is on PATH for downloaded kubectl too
         $gcloudBin = Split-Path -Parent $gcloudCmd.Source
-        Add-PathSegment -Dir $gcloudBin -Windows:$isWindows
-    if ($resolved) { Add-PathSegment -Dir (Split-Path -Parent $resolved) -Windows:$isWindows; Write-Host "[Ensure-Kubectl] Using kubectl from gcloud dir: $resolved" -ForegroundColor Green }
+        Add-PathSegment -Dir $gcloudBin -Windows:$isWin
+    if ($resolved) { Add-PathSegment -Dir (Split-Path -Parent $resolved) -Windows:$isWin; Write-Host "[Ensure-Kubectl] Using kubectl from gcloud dir: $resolved" -ForegroundColor Green }
         # Ensure plugin exists / install retry if missing
         $pluginCmd = Get-Command gke-gcloud-auth-plugin -ErrorAction SilentlyContinue
         if (-not $pluginCmd) {
@@ -402,7 +501,7 @@ function Ensure-Kubectl {
     }
 
     # Linux apt path (when gcloud not sufficient or absent)
-    if (-not $isWindows) {
+    if (-not $isWin) {
         $apt = Get-Command apt-get -ErrorAction SilentlyContinue
         if ($apt) {
             Write-Host '[Ensure-Kubectl] Attempting apt-get install.' -ForegroundColor Cyan
@@ -422,7 +521,7 @@ function Ensure-Kubectl {
     try { $stable = (Invoke-WebRequest -UseBasicParsing -Uri 'https://dl.k8s.io/release/stable.txt' -TimeoutSec 25).Content.Trim() } catch { $stable='v1.30.0' }
     if (-not $stable) { $stable='v1.30.0' }
     $arch='amd64'
-    if ($isWindows) {
+    if ($isWin) {
         $destDir = Join-Path $env:TEMP 'kubectl-bin'
         New-Item -ItemType Directory -Path $destDir -Force | Out-Null
         $destFile = Join-Path $destDir 'kubectl.exe'
@@ -435,9 +534,9 @@ function Ensure-Kubectl {
     }
     try {
         Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $destFile -TimeoutSec 90
-        if (-not $isWindows) { try { chmod +x $destFile 2>$null } catch {} }
+        if (-not $isWin) { try { chmod +x $destFile 2>$null } catch {} }
         if (Test-Path $destFile) {
-            Add-PathSegment -Dir $destDir -Windows:$isWindows
+            Add-PathSegment -Dir $destDir -Windows:$isWin
             $resolved = $destFile
             Write-Host ("[Ensure-Kubectl] Downloaded kubectl {0} -> {1}" -f $stable,$destFile) -ForegroundColor Green
         }
@@ -445,7 +544,7 @@ function Ensure-Kubectl {
 
     if ($resolved) {
         # Add gcloud bin path (if available) for plugin resolution in downloaded kubectl scenario
-        if ($gcloudCmd) { Add-PathSegment -Dir (Split-Path -Parent $gcloudCmd.Source) -Windows:$isWindows }
+        if ($gcloudCmd) { Add-PathSegment -Dir (Split-Path -Parent $gcloudCmd.Source) -Windows:$isWin }
         $env:USE_GKE_GCLOUD_AUTH_PLUGIN = 'True'
         $pluginCmd = Get-Command gke-gcloud-auth-plugin -ErrorAction SilentlyContinue
         if (-not $pluginCmd -and $gcloudCmd) {
@@ -857,7 +956,7 @@ function Get-GcpVMInventory {
     # End - VM Project ScriptBlock
 
     $effectiveMax = [Math]::Min($MaxThreads, [Math]::Max(1,$ProjectIds.Count))
-    $vmStatuses = New-Object System.Collections.Generic.List[object]
+    $vmStatuses = New-Object System.Collections.Generic.List[psobject]
     if (-not $LightMode) {
         # Existing runspace-pool implementation (default)
         $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
@@ -874,12 +973,14 @@ function Get-GcpVMInventory {
             $still=@()
             foreach ($rs in $runspaces) {
                 if ($rs.Handle.IsCompleted) {
-                    try { $result = $rs.PS.EndInvoke($rs.Handle) } catch { Write-CVLog "VM inventory failed for project" -Level Error -Source 'VM' -Scope @{ Project = $rs.Project } -Exception $_; $result=$null }
+                    # Unwrap the PSDataCollection first: reading .VMs off it uses member enumeration, which returns
+                    # $null for an empty array and makes the accumulate below append a phantom null row.
+                    try { $result = Get-CVRunspaceResult $rs.PS.EndInvoke($rs.Handle) } catch { Write-CVLog "VM inventory failed for project" -Level Error -Source 'VM' -Scope @{ Project = $rs.Project } -Exception $_; $result=$null }
                     $completed++
                     if ($result) {
-                        $allVMs += $result.VMs; $allAttached += $result.AttachedDisks; $allAllDisks += $result.AllDisks; $allUnattached += $result.UnattachedDisks
+                        $allVMs += ConvertTo-CVItemArray $result.VMs; $allAttached += ConvertTo-CVItemArray $result.AttachedDisks; $allAllDisks += ConvertTo-CVItemArray $result.AllDisks; $allUnattached += ConvertTo-CVItemArray $result.UnattachedDisks
                         $durations.Add($result.DurationSec/60) | Out-Null
-                        foreach ($l in $result.Logs) { Write-CVLog $l -Level Debug -Source 'GCP' }
+                        foreach ($l in $result.Logs) { Write-CVLog $l -Level (Get-CVWorkerLineLevel $l) -Source 'GCP' -Scope @{ Project = $result.Project } }
                         Write-Host ("[Project-Done] {0} VMs={1} Disks={2} ElapsedSec={3}" -f $result.Project,$result.VMs.Count,$result.AllDisks.Count,$result.DurationSec) -ForegroundColor Green
                         Write-Host '--------------------------------------------------' -ForegroundColor DarkGray
                         $statusObj = [PSCustomObject]@{
@@ -936,13 +1037,13 @@ function Get-GcpVMInventory {
             $remaining=@()
             foreach ($a in $active) {
                 if ($a.Handle.IsCompleted) {
-                    try { $result = $a.PS.EndInvoke($a.Handle) } catch { Write-CVLog "VM inventory failed for project" -Level Error -Source 'VM' -Scope @{ Project = $a.Project } -Exception $_; $result=$null }
+                    try { $result = Get-CVRunspaceResult $a.PS.EndInvoke($a.Handle) } catch { Write-CVLog "VM inventory failed for project" -Level Error -Source 'VM' -Scope @{ Project = $a.Project } -Exception $_; $result=$null }
                     $a.PS.Dispose()
                     $completed++
                     if ($result) {
-                        $allVMs += $result.VMs; $allAttached += $result.AttachedDisks; $allAllDisks += $result.AllDisks; $allUnattached += $result.UnattachedDisks
+                        $allVMs += ConvertTo-CVItemArray $result.VMs; $allAttached += ConvertTo-CVItemArray $result.AttachedDisks; $allAllDisks += ConvertTo-CVItemArray $result.AllDisks; $allUnattached += ConvertTo-CVItemArray $result.UnattachedDisks
                         $durations.Add($result.DurationSec/60) | Out-Null
-                        foreach ($l in $result.Logs) { Write-CVLog $l -Level Debug -Source 'GCP' }
+                        foreach ($l in $result.Logs) { Write-CVLog $l -Level (Get-CVWorkerLineLevel $l) -Source 'GCP' -Scope @{ Project = $result.Project } }
                         Write-Host ("[Project-Done] {0} VMs={1} Disks={2} ElapsedSec={3}" -f $result.Project,$result.VMs.Count,$result.AllDisks.Count,$result.DurationSec) -ForegroundColor Green
                         Write-Host '--------------------------------------------------' -ForegroundColor DarkGray
                         $vmStatuses.Add([PSCustomObject]@{ Project=$result.Project; Success= -not ($result.ApiDisabled -or $result.PermissionIssue); VMCount=$result.VMs.Count; DiskCount=$result.AllDisks.Count; ApiDisabled=$result.ApiDisabled; PermissionIssue=$result.PermissionIssue; Timeout=$false }) | Out-Null
@@ -1104,7 +1205,7 @@ function Get-GcpStorageInventory {
         foreach ($r in $rsList) {
             if ($r.Handle.IsCompleted) {
                 try { $res=$r.PS.EndInvoke($r.Handle) } catch { $res=$null; Write-CVLog "Bucket listing failed for project" -Level Error -Source 'Storage' -Scope @{ Project = $r.Project } -Exception $_ }
-                if ($res) { $projResults += $res }
+                if ($res) { $projResults += ConvertTo-CVItemArray $res }
                 $completed++
             } else { $next += $r }
         }
@@ -1164,7 +1265,8 @@ function Get-GcpStorageInventory {
         $next=@()
         foreach ($br in $bucketRunspaces) {
             if ($br.Handle.IsCompleted) {
-                try { $res=$br.PS.EndInvoke($br.Handle) } catch { $res=$null; Write-CVLog "Bucket sizing failed" -Level Error -Source 'Storage' -Scope @{ Project = $br.Project; Bucket = $br.Bucket } -Exception $_ }
+                # One bucket per runspace: unwrap so the property reads below hit the object, not the collection.
+                try { $res=Get-CVRunspaceResult $br.PS.EndInvoke($br.Handle) } catch { $res=$null; Write-CVLog "Bucket sizing failed" -Level Error -Source 'Storage' -Scope @{ Project = $br.Project; Bucket = $br.Bucket } -Exception $_ }
                 if ($res) {
                     $sized += $res
                     Write-Host ("Bucket={0} Project={1} Location={2} SizeGB={3}" -f $res.StorageBucket,$res.Project,$res.Location,$res.UsedCapacityGB) -ForegroundColor Cyan
@@ -1322,7 +1424,7 @@ function Get-GcpFileShareInventory {
             $next=@()
             foreach ($rs in $runspaces) {
                 if ($rs.Handle.IsCompleted) {
-                    try { $res=$rs.PS.EndInvoke($rs.Handle) } catch { $res=$null; Write-CVLog "Fileshare inventory failed for project" -Level Error -Source 'Fileshare' -Scope @{ Project = $rs.Project } -Exception $_ }
+                    try { $res=Get-CVRunspaceResult $rs.PS.EndInvoke($rs.Handle) } catch { $res=$null; Write-CVLog "Fileshare inventory failed for project" -Level Error -Source 'Fileshare' -Scope @{ Project = $rs.Project } -Exception $_ }
                     $completed++
                     if ($res) {
                         # Force array semantics to avoid single-object collapsing (which breaks .Count checks)
@@ -1344,7 +1446,7 @@ function Get-GcpFileShareInventory {
                             if ($recovered.Count -gt 0) { Write-Host ("[FS-Recover] Project={0} ReconstructedShares={1}" -f $rs.Project,$recovered.Count) -ForegroundColor Yellow; $projShares=$recovered }
                         }
                         if ($projShares) { $all += $projShares }
-                        foreach ($l in $res.Logs){ Write-CVLog $l -Level Debug -Source 'GCP'; $allLogs.Add($l) | Out-Null }
+                        foreach ($l in $res.Logs){ Write-CVLog $l -Level (Get-CVWorkerLineLevel $l) -Source 'GCP' -Scope @{ Project = $res.Project }; $allLogs.Add($l) | Out-Null }
                         $shareCt = if ($projShares) { (@($projShares)).Count } else { 0 }
                         Write-Host ("[FS-Project-Done] {0} Shares={1} ElapsedSec={2}" -f $res.Project,$shareCt,$res.DurationSec) -ForegroundColor Green
                     }
@@ -1373,7 +1475,7 @@ function Get-GcpFileShareInventory {
             $remain=@()
             foreach ($a in $active) {
                 if ($a.Handle.IsCompleted) {
-                    try { $res=$a.PS.EndInvoke($a.Handle) } catch { $res=$null; Write-CVLog "Fileshare inventory failed for project" -Level Error -Source 'Fileshare' -Scope @{ Project = $a.Project } -Exception $_ }
+                    try { $res=Get-CVRunspaceResult $a.PS.EndInvoke($a.Handle) } catch { $res=$null; Write-CVLog "Fileshare inventory failed for project" -Level Error -Source 'Fileshare' -Scope @{ Project = $a.Project } -Exception $_ }
                     $a.PS.Dispose(); $completed++
                     if ($res) {
                         $projShares = @($res.Shares)
@@ -1393,7 +1495,7 @@ function Get-GcpFileShareInventory {
                             if ($recovered.Count -gt 0) { Write-Host ("[FS-Recover] Project={0} ReconstructedShares={1}" -f $a.Project,$recovered.Count) -ForegroundColor Yellow; $projShares=$recovered }
                         }
                         if ($projShares) { $all += $projShares }
-                        foreach ($l in $res.Logs){ Write-CVLog $l -Level Debug -Source 'GCP'; $allLogs.Add($l) | Out-Null }
+                        foreach ($l in $res.Logs){ Write-CVLog $l -Level (Get-CVWorkerLineLevel $l) -Source 'GCP' -Scope @{ Project = $res.Project }; $allLogs.Add($l) | Out-Null }
                         $shareCt = if ($projShares) { (@($projShares)).Count } else { 0 }
                         Write-Host ("[FS-Project-Done] {0} Shares={1} ElapsedSec={2}" -f $res.Project,$shareCt,$res.DurationSec) -ForegroundColor Green
                     }
@@ -1781,7 +1883,7 @@ function Get-GcpBigQueryDatasets {
         Write-Log ("[DB][BigQuery] ({0}) DatasetStart {1} ({2}/{3})" -f $ProjectId,$datasetId,$dsIndex,$datasetTotal) -Level DEBUG
 
         # List tables in dataset (handle both array output and object with 'tables' + pagination)
-        $tables = New-Object System.Collections.Generic.List[object]
+        $tables = New-Object System.Collections.Generic.List[psobject]
         $pageToken = $null; $listAttempt = 0; $fetchedPages = 0
         do {
             $listAttempt++
@@ -1932,7 +2034,7 @@ function Get-GcpBigQueryDatasets {
                         if ($a.Handle.IsCompleted) {
                             try { $out = $a.PS.EndInvoke($a.Handle) } catch { $out=$null }
                             try { $a.PS.Dispose() } catch {}
-                            if ($out) { $tableResults += $out }
+                            if ($out) { $tableResults += ConvertTo-CVItemArray $out }
                             $completed++
                             if ($tableIds.Count -gt 0 -and ($completed -eq 1 -or $completed -eq $tableIds.Count -or ($completed % 25 -eq 0))) {
                                 $pct = [int](($completed/[double]$tableIds.Count)*100)
@@ -2087,8 +2189,11 @@ function Get-GcpDatabaseInventory {
     if (-not $script:DbProjectStatuses) { $script:DbProjectStatuses = New-Object System.Collections.Concurrent.ConcurrentBag[object] }
     $projQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new(); foreach ($p in $ProjectIds) { $projQueue.Enqueue($p) }
     $totalProjects = $ProjectIds.Count
-    # Thread-safe progress counter (only add type once)
-    if (-not ([System.AppDomain]::CurrentDomain.GetAssemblies() | Where-Object { $_.GetTypes() | Where-Object Name -eq 'DbProg' })) {
+    # Thread-safe progress counter (only add type once). Resolve the type by name rather than sweeping every
+    # loaded assembly with GetTypes() - that throws ReflectionTypeLoadException for any assembly with an
+    # unresolvable member, which is routine when hosted (VS Code PowerShell extension, Az modules) and buried
+    # the real output under screens of "does not have an implementation" noise.
+    if (-not ('DbProg' -as [type])) {
         Add-Type -TypeDefinition @"
 public class DbProg { private static int counter = 0; public static int Increment(){ return System.Threading.Interlocked.Increment(ref counter);} }
 "@
@@ -2248,8 +2353,8 @@ function Get-GcpGkeInventory {
             [object[]]$ProjectDisks,
             [string]$KubectlPath
         )
-        $pvDetails = New-Object System.Collections.Generic.List[object]
-        $pvcDetails= New-Object System.Collections.Generic.List[object]
+        $pvDetails = New-Object System.Collections.Generic.List[psobject]
+        $pvcDetails= New-Object System.Collections.Generic.List[psobject]
         $pvCap=0; $pvCount=0; $source=''
         if (-not $UseKubectl) {
             return @{ PvDetails=$pvDetails; PvcDetails=$pvcDetails; CapacityGiB=0; Count=0; Source=''; }
@@ -2365,9 +2470,9 @@ function Get-GcpGkeInventory {
         return @{ PvDetails=$pvDetails; PvcDetails=$pvcDetails; CapacityGiB=[math]::Round($pvCap,2); Count=$pvCount; Source=$source }
     }
 
-    $allClusters   = New-Object System.Collections.Generic.List[object]
-    $allPvDetails  = New-Object System.Collections.Generic.List[object]
-    $allPvcDetails = New-Object System.Collections.Generic.List[object]
+    $allClusters   = New-Object System.Collections.Generic.List[psobject]
+    $allPvDetails  = New-Object System.Collections.Generic.List[psobject]
+    $allPvcDetails = New-Object System.Collections.Generic.List[psobject]
 
     foreach ($proj in $ProjectIds) {
         $projStart=[DateTime]::UtcNow
@@ -2529,7 +2634,15 @@ function Get-GcpFilestoreInventory {
     $results = @()
     foreach ($proj in $ProjectIds) {
         try {
-            $raw = gcloud --quiet filestore instances list --project $proj --format=json 2>$null | ConvertFrom-Json
+            # A failed lookup is NOT an empty environment. Silently continuing here reported "Found 0 Filestore
+            # shares" for projects the script was never able to query.
+            $res = Invoke-CVGcloudJson -Arguments @('filestore','instances','list','--project',$proj)
+            if (-not $res.Ok) {
+                Write-CVLog ("Filestore instance listing failed - counted as unknown, not zero: {0}" -f (($res.Error -split "`r?`n")[0])) `
+                            -Level Warning -Source 'Filestore' -Scope @{ Project = $proj; Category = $(if ($res.ApiDisabled) { 'ApiDisabled' } else { 'LookupFailed' }) }
+                continue
+            }
+            $raw = $res.Data
             if (-not $raw) { continue }
             foreach ($inst in $raw) {
                 foreach ($fs in $inst.fileShares) {
@@ -2556,12 +2669,25 @@ function Get-GcpFilestoreInventory {
 # ---------------------------------------------------------------
 # DISK SNAPSHOTS (backup coverage proxy)
 # ---------------------------------------------------------------
+# Projects whose snapshot listing failed. Consumed by the resilience pass so their disks/VMs score snapshot
+# coverage as Unknown rather than as a confirmed gap.
+$script:SnapshotLookupFailed = @{}
+
 function Get-GcpSnapshotInventory {
     param([string[]]$ProjectIds)
     $results = @()
     foreach ($proj in $ProjectIds) {
         try {
-            $raw = gcloud --quiet compute snapshots list --project $proj --format=json 2>$null | ConvertFrom-Json
+            # Snapshots are the backup-coverage signal for disks and VMs, so a swallowed failure here does not
+            # just lose a row - it downgrades every disk in the project to "no snapshots" in the resilience score.
+            $res = Invoke-CVGcloudJson -Arguments @('compute','snapshots','list','--project',$proj)
+            if (-not $res.Ok) {
+                Write-CVLog ("Snapshot listing failed - disks in this project will score snapshot coverage as Unknown: {0}" -f (($res.Error -split "`r?`n")[0])) `
+                            -Level Warning -Source 'Snapshot' -Scope @{ Project = $proj; Category = $(if ($res.ApiDisabled) { 'ApiDisabled' } else { 'LookupFailed' }) }
+                $script:SnapshotLookupFailed[$proj] = $true
+                continue
+            }
+            $raw = $res.Data
             if (-not $raw) { continue }
             foreach ($snap in $raw) {
                 $results += [PSCustomObject]@{
@@ -2605,7 +2731,7 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
   try {
     Write-CVSection 'Cyber Resilience Posture'
     $gcpControls  = Get-CVGcpResilienceControls
-    $resilResults = New-Object System.Collections.Generic.List[object]
+    $resilResults = New-Object System.Collections.Generic.List[psobject]
 
     # Snapshot-derived signals (presence + cross-region) per source disk, from data already collected.
     $snapByDisk = @{}
@@ -2619,11 +2745,14 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
             $snapByDisk[$k].XRegion = $true
         }
     }
+    # Where the snapshot listing itself failed we know nothing about coverage, so leave the signal $null
+    # (Unknown -> excluded from the score) instead of $false (a scored gap we never actually verified).
     foreach ($coll in @('AttachedDisks','UnattachedDisks')) {
         foreach ($d in @($invResults.$coll)) {
             if (-not $d) { continue }
             $e = $snapByDisk["$($d.Project)|$($d.DiskName)".ToLower()]
-            Add-Member -InputObject $d -NotePropertyName XRegionBackup -NotePropertyValue ([bool]($e -and $e.XRegion)) -Force
+            $xr = if ($script:SnapshotLookupFailed[$d.Project]) { $null } else { [bool]($e -and $e.XRegion) }
+            Add-Member -InputObject $d -NotePropertyName XRegionBackup -NotePropertyValue $xr -Force
         }
     }
     $vmXRegion = @{}
@@ -2636,7 +2765,8 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
     }
     foreach ($v in @($invResults.VMs)) {
         if (-not $v) { continue }
-        Add-Member -InputObject $v -NotePropertyName XRegionBackup -NotePropertyValue ([bool]$vmXRegion["$($v.Project)|$($v.VMName)".ToLower()]) -Force
+        $xr = if ($script:SnapshotLookupFailed[$v.Project]) { $null } else { [bool]$vmXRegion["$($v.Project)|$($v.VMName)".ToLower()] }
+        Add-Member -InputObject $v -NotePropertyName XRegionBackup -NotePropertyValue $xr -Force
     }
 
     # Full-reach enrichment (defensive: any failure leaves the field absent -> Unknown).
@@ -2654,22 +2784,50 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
             }
         } catch {}
     }
+    # Filestore backups. A project whose lookup FAILED must stay Unknown ($null) rather than $false - otherwise a
+    # disabled Filestore API is scored as "no backups configured", which is a fabricated gap.
     $fsBackups = @{}
+    $fsLookupOk = @{}
     foreach ($p in @($targetProjects)) {
-        try { $r = (& gcloud filestore backups list --project $p --format=json 2>$null) | ConvertFrom-Json; if ($r) { $fsBackups[$p] = @($r) } } catch {}
+        $r = Invoke-CVGcloudJson -Arguments @('filestore','backups','list','--project',$p)
+        if ($r.Ok) { $fsLookupOk[$p] = $true; $fsBackups[$p] = @($r.Data) }
+        else {
+            Write-CVLog ("Filestore backup lookup unavailable ({0}) - HasBackup will read Unknown" -f $(if ($r.ApiDisabled) { 'API disabled' } else { 'lookup failed' })) `
+                        -Level Warning -Source 'Filestore' -Scope @{ Project = $p; Category = $(if ($r.ApiDisabled) { 'ApiDisabled' } else { 'LookupFailed' }) }
+        }
     }
     foreach ($f in @($invResults.FilestoreInstances)) {
         if (-not $f) { continue }
         Add-Member -InputObject $f -NotePropertyName EncryptedAtRest -NotePropertyValue $true -Force   # GCP encrypts Filestore at rest by default
-        Add-Member -InputObject $f -NotePropertyName HasBackup -NotePropertyValue ([bool]($fsBackups.ContainsKey($f.Project) -and @($fsBackups[$f.Project]).Count -gt 0)) -Force
+        $hasBackup = if ($fsLookupOk.ContainsKey($f.Project)) { [bool](@($fsBackups[$f.Project]).Count -gt 0) } else { $null }
+        Add-Member -InputObject $f -NotePropertyName HasBackup -NotePropertyValue $hasBackup -Force
     }
-    $gkeBackups = @{}
+
+    # Backup for GKE. `gcloud container backup-restore` is beta-only today: on GA it fails with
+    # "Invalid choice: 'backup-restore'", which the previous code swallowed - so HasBackupPlan was always $false
+    # and every gke-backup control reported a gap that had never actually been checked. Resolve the release track
+    # once (GA first, so this keeps working when the command graduates) and reuse it across projects.
+    $gkeBackups   = @{}
+    $gkeLookupOk  = @{}
+    $gkeBrTrack   = $null
     foreach ($p in @($targetProjects)) {
-        try { $r = (& gcloud container backup-restore backup-plans list --project $p --location '-' --format=json 2>$null) | ConvertFrom-Json; if ($r) { $gkeBackups[$p] = @($r) } } catch {}
+        $gkeArgs = @('container','backup-restore','backup-plans','list','--project',$p,'--location','-')
+        $r = if ($null -ne $gkeBrTrack) { Invoke-CVGcloudJsonAnyTrack -Arguments $gkeArgs -PreferTrack $gkeBrTrack }
+             else                       { Invoke-CVGcloudJsonAnyTrack -Arguments $gkeArgs }
+        if ($r.Ok) { $gkeBrTrack = $r.Track; $gkeLookupOk[$p] = $true; $gkeBackups[$p] = @($r.Data) }
+        else {
+            if (-not $r.CommandMissing) { $gkeBrTrack = $r.Track }
+            $why = if ($r.CommandMissing) { 'command not available on any release track' }
+                   elseif ($r.ApiDisabled) { 'Backup for GKE API disabled' }
+                   else { 'lookup failed' }
+            Write-CVLog "Backup for GKE lookup unavailable ($why) - HasBackupPlan will read Unknown" `
+                        -Level Warning -Source 'GKE' -Scope @{ Project = $p; Category = $(if ($r.ApiDisabled) { 'ApiDisabled' } else { 'LookupFailed' }) }
+        }
     }
     foreach ($g in @($invResults.GKEClusters)) {
         if (-not $g) { continue }
-        Add-Member -InputObject $g -NotePropertyName HasBackupPlan -NotePropertyValue ([bool]($gkeBackups.ContainsKey($g.Project) -and @($gkeBackups[$g.Project]).Count -gt 0)) -Force
+        $hasPlan = if ($gkeLookupOk.ContainsKey($g.Project)) { [bool](@($gkeBackups[$g.Project]).Count -gt 0) } else { $null }
+        Add-Member -InputObject $g -NotePropertyName HasBackupPlan -NotePropertyValue $hasPlan -Force
     }
 
     # Evaluate each resource type; append Ctl_*/ResilienceScore/ResilienceGaps columns onto the inventory rows.
@@ -2681,7 +2839,7 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         @{ Type='Filestore'; Set=$gcpControls.Filestore; Rows=@($invResults.FilestoreInstances) }
         @{ Type='GKE';       Set=$gcpControls.GKE;       Rows=@($invResults.GKEClusters) }
     )
-    $resilCatalog = New-Object System.Collections.Generic.List[object]
+    $resilCatalog = New-Object System.Collections.Generic.List[psobject]
     $resilShownErr = $false
     foreach ($c in $collections) {
         if (-not $c.Set) { continue }
@@ -2738,17 +2896,21 @@ if (-not $SkipCloudRewind) {
     $crTax           = Get-CVGcpCloudRewindTaxonomy
     $crAssetTypes    = (Get-CVGcpCloudRewindAssetTypes) -join ','
     $crFilterTagKeys = Get-CVFilterTagKeys -FilterTags $Labels
-    $crRows          = New-Object System.Collections.Generic.List[object]
-    $crClassified    = New-Object System.Collections.Generic.List[object]
+    $crRows          = New-Object System.Collections.Generic.List[psobject]
+    $crClassified    = New-Object System.Collections.Generic.List[psobject]
 
     foreach ($proj in @($targetProjects)) {
-        $raw = & gcloud asset search-all-resources --scope="projects/$proj" --asset-types="$crAssetTypes" --format=json --quiet 2>$null
-        if ($LASTEXITCODE -ne 0) {
-            Write-CVLog "Cloud Rewind: asset search failed in $proj (is the Cloud Asset API enabled?). Skipping." -Level Warning -Source 'CloudRewind'
+        $crRes = Invoke-CVGcloudJson -Arguments @('asset','search-all-resources',"--scope=projects/$proj","--asset-types=$crAssetTypes")
+        if (-not $crRes.Ok) {
+            # Report what gcloud actually said. Guessing "is the Cloud Asset API enabled?" hid a completely
+            # different root cause (a deleted core/project being used as the quota project) across every project.
+            $crWhy = if ($crRes.ApiDisabled) { 'Cloud Asset API not enabled' } else { 'asset search failed' }
+            $crDetail = ($crRes.Error -split "`r?`n" | Where-Object { $_ -match '\S' } | Select-Object -First 1)
+            Write-CVLog "Cloud Rewind: $crWhy in $proj - $crDetail" -Level Warning -Source 'CloudRewind' `
+                        -Scope @{ Project = $proj; Category = $(if ($crRes.ApiDisabled) { 'ApiDisabled' } else { 'LookupFailed' }) }
             continue
         }
-        $assets = @()
-        try { $assets = @($raw | ConvertFrom-Json -ErrorAction Stop) } catch { continue }
+        $assets = @($crRes.Data)
 
         foreach ($asset in $assets) {
             $at = $asset.assetType
@@ -2918,8 +3080,10 @@ if ($Selected.DB -and $invResults.Databases -and (@($invResults.Databases)).Coun
     if ($anyTables) {
         $bqTablesCsv = Join-Path $outDir ("gcp_bigquery_tables_" + $dateStr + ".csv")
         'Project,Dataset,TableName,LogicalBytes,PhysicalBytes,LogicalGB,PhysicalGB' | Out-File -FilePath $bqTablesCsv -Encoding utf8
-        # Reconstruct table details from logs (DEBUG lines) if not explicitly captured elsewhere
-        foreach ($line in $script:ChildLogQueue) {
+        # Reconstruct table details from logs (DEBUG lines) if not explicitly captured elsewhere.
+        # The queue is populated at $Global: scope by the worker log helper; reading $script: here matched nothing,
+        # so this block silently produced a header-only CSV.
+        foreach ($line in $Global:ChildLogQueue) {
             if ($line -match '\[DB\]\[BigQuery\]\[Table-Info\] \(([^)]+)\) Dataset=([^ ]+) Table=([^ ]+) LogicalBytes=([0-9]+) PhysicalBytes=([0-9]+)') {
                 $proj=$Matches[1]; $ds=$Matches[2]; $tbl=$Matches[3]; $lbytes=[int64]$Matches[4]; $pbytes=[int64]$Matches[5]
                 $lgb=[math]::Round($lbytes/1GB,2); $pgb=[math]::Round($pbytes/1GB,2)
@@ -3220,12 +3384,22 @@ if ($Selected.FILESHARE -and $invResults.FileShares -and (@($invResults.FileShar
         $fsFailCsv = Join-Path $outDir ("gcp_filestore_failures_" + $dateStr + ".csv")
         $fail |
             Select-Object Project, InstanceName, ShareName, State,
+                          @{ n = 'FailureCategory'; e = {
+                                # gcloud returns PERMISSION_DENIED for a merely-disabled API. Separating the two
+                                # matters: one is "enable this service", the other is "grant this role".
+                                $m = "$($_.Error)"
+                                if     ($m -match '(?i)SERVICE_DISABLED|has not been used in project|API .*not enabled|is disabled') { 'ApiDisabled' }
+                                elseif ($m -match '(?i)PERMISSION_DENIED|permission|forbidden|403')                                  { 'PermissionDenied' }
+                                else                                                                                                 { 'Other' } } },
                           @{ n = 'ErrorSnippet'; e = {
-                                $m = $_.Error
-                                if ($m -match '(?s)(ERROR:.*?)(Activation|Google developers|Cloud Filestore API has not been used|$)') { $m = $Matches[1] }
-                                $first = ($m -split "`n")[0]
-                                if ($first.Length -gt 260) { $first = $first.Substring(0,257) + '...' }
-                                $first } } |
+                                # The previous pattern cut the message at "Cloud Filestore API has not been used",
+                                # which is precisely the actionable part - every row read just "PERMISSION_DENIED: ".
+                                $m = ("$($_.Error)" -replace "`r?`n", ' ') -replace '\s{2,}', ' '
+                                $m = ($m -split 'Google developers console API activation')[0].Trim()
+                                if ($m.Length -gt 400) { $m = $m.Substring(0,397) + '...' }
+                                $m } },
+                          @{ n = 'ActivationUrl'; e = {
+                                if ("$($_.Error)" -match '(https://console\.developers\.google\.com/apis/api/\S+)') { $Matches[1].TrimEnd('.',',') } else { '' } } } |
             Sort-Object Project, InstanceName, ShareName |
             Export-Csv -Path $fsFailCsv -NoTypeInformation
         Write-Host "gcp_filestore_failures_$dateStr.csv file has been written to $outDir" -ForegroundColor Cyan
@@ -3612,6 +3786,17 @@ Stop-Transcript | Out-Null   # end transcript (separate from detail log)
 Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Creating ZIP archive..." -PercentComplete 90
 $zipFile = $runPaths.ZipPath
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+
+# The transcript lives in Logs/, outside $outDir, so zipping $outDir alone silently shipped an archive with no
+# log in it - while the closing message promised one. Copy it in first; the log is the whole point when a
+# customer sends this back to explain a failed run.
+try {
+    if ($transcriptFile -and (Test-Path -LiteralPath $transcriptFile)) {
+        Copy-Item -LiteralPath $transcriptFile -Destination (Join-Path $outDir (Split-Path $transcriptFile -Leaf)) -Force -ErrorAction Stop
+    }
+} catch {
+    Write-Warning "Could not stage the run log into the output folder: $($_.Exception.Message)"
+}
 
 try {
     [IO.Compression.ZipFile]::CreateFromDirectory($outDir, $zipFile)

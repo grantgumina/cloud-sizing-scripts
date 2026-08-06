@@ -74,7 +74,7 @@ Initialize-CVConsole -Cloud GCP -LogPath $log -NonInteractive | Out-Null
 $W = 6; $N = 40
 $lists = 1..$W | ForEach-Object -ThrottleLimit 6 -Parallel {
     . $using:helperPath
-    $l = [System.Collections.Generic.List[object]]::new()
+    $l = [System.Collections.Generic.List[psobject]]::new()
     $log = New-CVWorkerLogger -RecordList $l
     $p = "proj-$_"
     for ($i = 0; $i -lt $using:N; $i++) { & $log "Failed to size bucket in $p : deadline exceeded" 'Error' 'Storage' @{ Project = $p } }

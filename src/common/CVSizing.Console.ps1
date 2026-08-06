@@ -721,6 +721,33 @@ function Get-CVCommandInstallHint {
     }
 }
 
+function Test-CVRuntimeCompatibility {
+    <#
+      .SYNOPSIS  Verify the PowerShell runtime still supports the collection idioms the sizing scripts rely on.
+      .DESCRIPTION On PowerShell 7.6.3 / .NET 10.0.9, `@($list)` over a List[object] throws
+                   "ArgumentException: Argument types do not match" from the engine's own array binder. The
+                   scripts moved to List[psobject] to dodge it, but a future runtime could regress a different
+                   type - and the failure mode is a mid-run abort swallowed into a one-line warning. Detecting
+                   it here turns "the report is quietly missing" into "your pwsh build is not supported".
+      .OUTPUTS   Array of human-readable incompatibility strings (empty when the runtime is good).
+    #>
+    [CmdletBinding()] param()
+    $problems = @()
+    foreach ($t in 'psobject','string','pscustomobject','hashtable') {
+        try {
+            $l = New-Object "System.Collections.Generic.List[$t]"
+            $null = @($l)
+            $l.Add(($(if ($t -eq 'string') { 'x' } elseif ($t -eq 'hashtable') { @{} } else { [pscustomobject]@{A=1} })))
+            $null = @($l)
+        } catch {
+            $problems += "@() over List[$t] fails on this runtime ($($_.Exception.GetType().Name): $($_.Exception.Message))"
+        }
+    }
+    # Plain return, NOT `,$problems`: the comma wrapper would emit an empty array as a single pipeline object,
+    # so a healthy runtime would read as one unnamed problem and fire the warning on every run.
+    return $problems
+}
+
 function Assert-CVPreflight {
     <#
       .SYNOPSIS  Fail fast on missing hard dependencies; report optional ones as degraded.
@@ -736,6 +763,16 @@ function Assert-CVPreflight {
         [hashtable]$OptionalCommands,       # label -> command name(s)
         [switch]$ExitOnFatal
     )
+
+    # Runtime sanity first: a broken collection binder corrupts results everywhere downstream, and no amount of
+    # correct dependencies compensates for it.
+    $runtimeIssues = @(Test-CVRuntimeCompatibility)
+    if ($runtimeIssues.Count) {
+        $rmsg = "Unsupported PowerShell runtime (pwsh $($PSVersionTable.PSVersion) / .NET $([System.Environment]::Version)): " +
+                ($runtimeIssues -join '; ') + ". Results from this build cannot be trusted - run tests/Invoke-CVEnvironmentTests.ps1."
+        if (Test-CVConsoleReady) { Write-CVLog -Message $rmsg -Level Error -Source 'Preflight' }
+        else { Write-Host "[Preflight] $rmsg" -ForegroundColor Red }
+    }
 
     $missingModules  = if ($FatalModules)  { @(Test-CVModuleDependency  -Name $FatalModules)  } else { @() }
     $missingCommands = if ($FatalCommands) { @(Test-CVCommandDependency -Name $FatalCommands) } else { @() }
@@ -839,12 +876,12 @@ function New-CVWorkerLogger {
       .DESCRIPTION The returned scriptblock appends structured records to $RecordList and NEVER touches the host
                    ($Host / Write-Host / Spectre / Write-Progress). The worker returns $RecordList; the parent
                    replays it via Receive-CVWorkerRecords. This preserves runspace safety by construction.
-      .EXAMPLE   $records = [System.Collections.Generic.List[object]]::new()
+      .EXAMPLE   $records = [System.Collections.Generic.List[psobject]]::new()
                  $log = New-CVWorkerLogger -RecordList $records
                  & $log 'started' 'Info' 'VM'      # inside the worker
     #>
     [CmdletBinding()]
-    param([Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$RecordList)
+    param([Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[psobject]]$RecordList)
 
     return {
         param([string]$Message, [string]$Level = 'Info', [string]$Source, [hashtable]$Scope, $Exception)
@@ -879,6 +916,35 @@ function Receive-CVWorkerRecords {
             }
         }
     }
+}
+
+function Get-CVRunspaceResult {
+    <#
+      .SYNOPSIS  Unwrap a runspace's output collection to the single object the worker returned.
+      .DESCRIPTION [PowerShell]::EndInvoke() hands back a PSDataCollection, NOT the object the worker returned.
+                   Reading a property off that collection goes through member enumeration, which silently yields
+                   $null whenever the property holds an EMPTY array - and `$acc += $null` then appends a phantom
+                   null element to the accumulator. Every caller must unwrap before touching properties.
+      .EXAMPLE   $result = Get-CVRunspaceResult $ps.EndInvoke($handle)
+    #>
+    [CmdletBinding()]
+    param([Parameter(Position = 0)]$Output)
+    $last = $null
+    foreach ($o in $Output) { if ($null -ne $o) { $last = $o } }
+    return $last
+}
+
+function ConvertTo-CVItemArray {
+    <#
+      .SYNOPSIS  Normalize any worker-returned collection to a null-free object[] that is safe to `+=`.
+      .DESCRIPTION Guards the accumulate step: `$acc += $null` and `$acc += @($null)` both append a phantom
+                   element that later surfaces as a bogus inventory count and an Export-Csv null-binding error.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Position = 0)]$Value)
+    $out = @()
+    foreach ($v in $Value) { if ($null -ne $v) { $out += $v } }
+    return ,$out
 }
 
 #endregion

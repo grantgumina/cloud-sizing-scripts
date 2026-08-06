@@ -2152,7 +2152,7 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
   try {
     Write-CVSection 'Cyber Resilience Posture'
     $azControls   = Get-CVAzureResilienceControls
-    $resilResults = New-Object System.Collections.Generic.List[object]
+    $resilResults = New-Object System.Collections.Generic.List[psobject]
 
     # Full-reach enrichment for storage accounts (defensive: any failure leaves the field absent -> Unknown).
     foreach ($sa in @($StorageAccounts)) {
@@ -2182,7 +2182,7 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         @{ Type='FileShare'; Set=$azControls.FileShare; Rows=@($FileShares) }
         @{ Type='AKS';       Set=$azControls.AKS;       Rows=@($AKSClusters) }
     )
-    $resilCatalog = New-Object System.Collections.Generic.List[object]
+    $resilCatalog = New-Object System.Collections.Generic.List[psobject]
     $resilShownErr = $false
     foreach ($c in $collections) {
         if (-not $c.Set) { continue }
@@ -2235,8 +2235,8 @@ if (-not $SkipCloudRewind) {
     Write-CVSection 'Cloud Rewind Sizing'
     $crTax           = Get-CVAzureCloudRewindTaxonomy
     $crFilterTagKeys = Get-CVFilterTagKeys -FilterTags $Tags
-    $crRows          = New-Object System.Collections.Generic.List[object]
-    $crClassified    = New-Object System.Collections.Generic.List[object]
+    $crRows          = New-Object System.Collections.Generic.List[psobject]
+    $crClassified    = New-Object System.Collections.Generic.List[psobject]
     # Discovery returns resources already attach/exclusion-filtered (KQL for Graph, Test-CVAzureCloudRewindInclude
     # for Arm), so the classify loop below must NOT re-apply the inclusion test.
     $crItems = @(Invoke-CVAzureCloudRewindDiscovery -Backend $CloudRewindDiscovery -Subs $subs)

@@ -130,6 +130,7 @@ if ($SkipCloudRewind -and $SkipDataProtection) {
 # Load the shared console / diagnostics + resilience + Cloud Rewind layers (src/common/).
 . (Join-Path $PSScriptRoot 'common' 'CVSizing.Console.ps1')
 . (Join-Path $PSScriptRoot 'common' 'CVSizing.Resilience.ps1')
+. (Join-Path $PSScriptRoot 'common' 'CVSizing.Resilience.AWS.ps1')   # AWS control definitions
 . (Join-Path $PSScriptRoot 'common' 'CVSizing.CloudRewind.ps1')      # provider-neutral Cloud Rewind engine
 . (Join-Path $PSScriptRoot 'common' 'CVSizing.CloudRewind.AWS.ps1')  # AWS billable taxonomy (derived)
 
@@ -578,6 +579,175 @@ function Invoke-ServiceInventory {
     }
 }
 
+# ============================================================
+# CYBER RESILIENCE POSTURE (AWS)  -  skip with -SkipResilienceReport
+# Scores each resource's CURRENT NATIVE AWS configuration against the Cloud Resilience Control Catalog.
+# Runs per account BEFORE that account's CSVs are written, so Ctl_*/ResilienceScore columns land on every
+# per-service CSV - matching the GCP and Azure passes. Any signal we could not collect scores as Unknown and
+# is excluded from the score; it never fails the run.
+# ============================================================
+$script:ResilienceResults = New-Object System.Collections.Generic.List[psobject]
+$script:ResilienceCatalog = New-Object System.Collections.Generic.List[psobject]
+$script:ResilienceErrShown = $false
+
+# Inventory service name -> control set in Get-CVAwsResilienceControls. Services absent here simply are not scored.
+$script:AwsResilienceMap = @{
+    EC2               = 'EC2'
+    UnattachedVolumes = 'EBS'
+    RDS               = 'RDS'
+    Aurora            = 'RDS'
+    DocumentDB        = 'RDS'
+    S3                = 'S3'
+    EFS               = 'EFS'
+    DynamoDB          = 'DynamoDB'
+    Redshift          = 'Redshift'
+}
+
+function Invoke-AWSResiliencePass {
+    <#
+      .SYNOPSIS  Append Ctl_*/ResilienceScore/ResilienceGaps columns to one account's inventory rows.
+    #>
+    param([Parameter(Mandatory)][string]$AccountId)
+
+    if ($SkipResilienceReport) { return }
+    try {
+        $controls = Get-CVAwsResilienceControls
+        foreach ($serviceName in @($script:AwsResilienceMap.Keys)) {
+            $setName = $script:AwsResilienceMap[$serviceName]
+            $set     = $controls[$setName]
+            if (-not $set) { continue }
+
+            $rows = @($script:ServiceDataByAccount[$AccountId][$serviceName])
+            if (-not $rows.Count) { continue }
+
+            # Catalog rows are per resource type, emitted once for the whole run.
+            if (-not ($script:ResilienceCatalog | Where-Object { $_.ResourceType -eq $setName })) {
+                foreach ($m in (Get-CVControlCatalog -Controls $set -ResourceType $setName)) { $script:ResilienceCatalog.Add($m) }
+            }
+
+            foreach ($row in $rows) {
+                if (-not $row) { continue }
+                # Isolate per-row failures so one problematic resource cannot sink the whole report.
+                try {
+                    $ev = Invoke-CVResilience -Resource $row -Controls $set
+                    foreach ($kv in (ConvertTo-CVResilienceColumns -Evaluation $ev).GetEnumerator()) {
+                        Add-Member -InputObject $row -NotePropertyName $kv.Key -NotePropertyValue $kv.Value -Force
+                    }
+                    foreach ($res in $ev.Results) {
+                        Add-Member -InputObject $res -NotePropertyName ResourceType -NotePropertyValue $setName -Force
+                        $script:ResilienceResults.Add($res)
+                    }
+                } catch {
+                    if (-not $script:ResilienceErrShown) {
+                        $script:ResilienceErrShown = $true
+                        Write-CVLog "Resilience evaluation failed on a $setName row" -Level Warning -Source 'Resilience' -Exception $_
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-CVLog "Resilience pass failed for account ${AccountId}: $($_.Exception.Message)" -Level Warning -Source 'Resilience'
+    }
+}
+
+function Write-AWSResilienceReport {
+    <# .SYNOPSIS  Write the run-wide resilience summary / gaps / catalog CSVs. #>
+    param([Parameter(Mandatory)][string]$OutputPath, [Parameter(Mandatory)][string]$DateString)
+
+    if ($SkipResilienceReport) { return }
+    try {
+        Write-CVSection 'Cyber Resilience Posture'
+        $summary = Get-CVResilienceSummary -Results $script:ResilienceResults
+        if ($null -eq $summary.OverallScore) {
+            Write-CVLog "No resilience controls could be assessed (no eligible resources or signals)." -Level Warning -Source 'Resilience'
+            return
+        }
+        Write-CVLog ("Overall native resilience score: {0}/100  ({1} controls assessed, {2} not assessed)" -f $summary.OverallScore, $summary.Assessed, $summary.Excluded) -Level Success -Source 'Resilience'
+        foreach ($cat in $summary.ByCategory) {
+            Write-CVLog ("  {0,-14} {1,3}% met ({2}/{3})" -f $cat.Category, $cat.PercentMet, $cat.ControlsMet, $cat.ControlsTotal) -Level Info -Source 'Resilience'
+        }
+        $summary.ByCategory | Export-Csv -Path (Join-Path $OutputPath ("aws_resilience_category_" + $DateString + ".csv")) -NoTypeInformation
+        if ($summary.TopGaps.Count) {
+            $summary.TopGaps | Select-Object Id,Title,Category,Severity,Count |
+                Export-Csv -Path (Join-Path $OutputPath ("aws_resilience_gaps_" + $DateString + ".csv")) -NoTypeInformation
+        }
+        $script:ResilienceCatalog | Export-Csv -Path (Join-Path $OutputPath ("aws_resilience_controls_" + $DateString + ".csv")) -NoTypeInformation
+        Write-ScriptOutput "aws_resilience_*_$DateString.csv (category, gaps, controls) written to $OutputPath" -Level Success
+    } catch {
+        Write-CVLog "Resilience report failed: $($_.Exception.Message)" -Level Warning -Source 'Resilience'
+    }
+}
+
+# ── AWS Backup lookup helpers ──────────────────────────────────────────────
+# AWS Tools for PowerShell has carried more than one name for these cmdlets across module versions, and a
+# hard-coded wrong name fails as CommandNotFound - which a bare catch turns into "this resource has no backups".
+# Resolving from a candidate list keeps the check honest across versions and degrades to Unknown, never to a
+# fabricated "Unprotected".
+$script:AWSBackupProtectedCache = @{}
+$script:AWSBackupCmdWarned      = $false
+$script:AWSRecoveryPointCmd     = $null
+
+function Resolve-CVAwsCommand {
+    param([Parameter(Mandatory)][string[]]$Candidates)
+    foreach ($c in $Candidates) {
+        if (Get-Command -Name $c -ErrorAction SilentlyContinue) { return $c }
+    }
+    return $null
+}
+
+function Get-AWSBackupProtectedArn {
+    <#
+      .SYNOPSIS  Region-scoped list of ARNs covered by AWS Backup.
+      .OUTPUTS   String[] of ARNs (possibly empty) when the lookup succeeded; $null when it could not be performed.
+    #>
+    param($Credential, [string]$Region)
+
+    if ($script:AWSBackupProtectedCache.ContainsKey($Region)) {
+        $cached = $script:AWSBackupProtectedCache[$Region]
+        if ($null -eq $cached) { return $null }
+        return ,$cached
+    }
+
+    $cmdName = Resolve-CVAwsCommand -Candidates @('Get-BAKProtectedResourceList','Get-BKPProtectedResourceList','Get-BAKProtectedResource')
+    if (-not $cmdName) {
+        if (-not $script:AWSBackupCmdWarned) {
+            $script:AWSBackupCmdWarned = $true
+            Write-ScriptOutput "AWS Backup protected-resource cmdlet not found (install AWS.Tools.Backup) - AWSBackupProtected will read Unknown." -Level Warning
+        }
+        $script:AWSBackupProtectedCache[$Region] = $null
+        return $null
+    }
+    try {
+        $items = & $cmdName -Credential $Credential -Region $Region -ErrorAction Stop
+        $arns  = @($items | ForEach-Object { $_.ResourceArn } | Where-Object { $_ })
+        $script:AWSBackupProtectedCache[$Region] = $arns
+        Write-ScriptOutput "AWS Backup: $($arns.Count) protected resource(s) in $Region (via $cmdName)." -Level Info
+        return ,$arns
+    } catch {
+        Write-ScriptOutput "AWS Backup protected-resource lookup failed in ${Region}: $($_.Exception.Message)" -Level Warning
+        $script:AWSBackupProtectedCache[$Region] = $null
+        return $null
+    }
+}
+
+function Get-AWSBackupRecoveryPoint {
+    <#
+      .SYNOPSIS  Most recent AWS Backup recovery point for one resource ARN, or $null when unknown/none.
+    #>
+    param([string]$ResourceArn, $Credential, [string]$Region)
+    if (-not $ResourceArn) { return $null }
+    if (-not $script:AWSRecoveryPointCmd) {
+        $script:AWSRecoveryPointCmd = Resolve-CVAwsCommand -Candidates @(
+            'Get-BAKRecoveryPointsByResourceList','Get-BAKRecoveryPointsByResource','Get-BKPRecoveryPointsByResource')
+        if (-not $script:AWSRecoveryPointCmd) { return $null }
+    }
+    try {
+        $rps = & $script:AWSRecoveryPointCmd -ResourceArn $ResourceArn -MaxResult 1 -Credential $Credential -Region $Region -ErrorAction Stop
+        if ($rps -and @($rps).Count -gt 0) { return @($rps)[0] }
+        return $null
+    } catch { return $null }
+}
+
 function Process-EC2Instance {
     param($Item, $Credential, $Region, $AccountInfo, $AccountAlias)
 
@@ -630,24 +800,38 @@ function Process-EC2Instance {
     $latestSnapshotDate = $null
     $snapshotCount = 0
     $snapshotSizeGiB = 0
-    try {
-        $backupItems = Get-BAKListProtectedResource -Credential $Credential -Region $Region -ErrorAction SilentlyContinue
-        if ($backupItems) {
-            $awsBackupProtected = ($backupItems | Where-Object { $_.ResourceArn -like "*$($Item.InstanceId)*" }).Count -gt 0
+
+    # AWS Backup protected-resource list is per REGION, not per instance - fetch once and reuse.
+    $protectedArns = Get-AWSBackupProtectedArn -Credential $Credential -Region $Region
+    if ($null -ne $protectedArns) {
+        $awsBackupProtected = @($protectedArns | Where-Object { $_ -like "*$($Item.InstanceId)*" }).Count -gt 0
+    }
+
+    # EBS snapshots belong to VOLUMES, not instances: 'source-instance-id' is not a valid DescribeSnapshots
+    # filter, so the old call was rejected by the API and the bare catch reported every instance as having
+    # zero snapshots. Filter on the volume IDs already collected above.
+    $volumeIds = @($ebsVolumes | ForEach-Object { $_.VolumeId } | Where-Object { $_ })
+    if ($volumeIds.Count -gt 0) {
+        try {
+            # DescribeSnapshots caps filter values, so chunk defensively for instances with many volumes.
+            $snaps = @()
+            for ($i = 0; $i -lt $volumeIds.Count; $i += 200) {
+                $chunk = $volumeIds[$i..([Math]::Min($i + 199, $volumeIds.Count - 1))]
+                $snapFilter = @(@{ Name = 'volume-id'; Values = @($chunk) })
+                $snaps += @(Get-EC2Snapshot -Filter $snapFilter -OwnerId 'self' -Credential $Credential -Region $Region -ErrorAction Stop)
+            }
+            if ($snaps.Count -gt 0) {
+                $snapshotCount = $snaps.Count
+                # EBS snapshot VolumeSize is the source volume size in GiB (AWS bills only changed blocks,
+                # but provisioned size is the consistent figure available without extra API calls).
+                $snapshotSizeGiB = [double](($snaps | Measure-Object -Property VolumeSize -Sum).Sum)
+                $latestSnap = $snaps | Sort-Object StartTime -Descending | Select-Object -First 1
+                $latestSnapshotDate = if ($latestSnap) { $latestSnap.StartTime } else { $null }
+            }
+        } catch {
+            Write-ScriptOutput "Snapshot lookup failed for $($Item.InstanceId) in ${Region}: $($_.Exception.Message)" -Level Warning
         }
-    } catch {}
-    try {
-        $snapFilter = @(@{ Name = 'source-instance-id'; Values = @($Item.InstanceId) })
-        $snaps = Get-EC2Snapshot -Filter $snapFilter -Credential $Credential -Region $Region -ErrorAction SilentlyContinue
-        if ($snaps) {
-            $snapshotCount = $snaps.Count
-            # EBS snapshot VolumeSize is the source volume size in GiB (AWS bills only changed blocks,
-            # but provisioned size is the consistent figure available without extra API calls).
-            $snapshotSizeGiB = [double](($snaps | Measure-Object -Property VolumeSize -Sum).Sum)
-            $latestSnap = $snaps | Sort-Object StartTime -Descending | Select-Object -First 1
-            $latestSnapshotDate = if ($latestSnap) { $latestSnap.StartTime } else { $null }
-        }
-    } catch {}
+    }
 
     # ── Encryption: check all attached EBS volumes ─────────────────────────
     $allEncrypted = if ($ebsVolumes.Count -gt 0) { ($ebsVolumes | Where-Object { -not $_.Encrypted }).Count -eq 0 } else { $null }
@@ -660,9 +844,12 @@ function Process-EC2Instance {
     $iamProfile = if ($Item.IamInstanceProfile) { $Item.IamInstanceProfile.Arn } else { $null }
 
     # ── Protection status inference ────────────────────────────────────────
-    $protectionStatus = if ($awsBackupProtected) { 'Protected' }
-                        elseif ($snapshotCount -gt 0) { 'Snapshot-Only' }
-                        else { 'Unprotected' }
+    # 'Unprotected' is a claim, so only make it when both signals were actually collected. When the AWS Backup
+    # list could not be read ($protectedArns is $null) and no snapshots were found, the honest answer is Unknown.
+    $protectionStatus = if ($awsBackupProtected)                        { 'Protected' }
+                        elseif ($snapshotCount -gt 0)                   { 'Snapshot-Only' }
+                        elseif ($null -eq $protectedArns)               { 'Unknown' }
+                        else                                            { 'Unprotected' }
 
     $ec2Obj = [PSCustomObject]@{
         AwsAccountId          = $AccountInfo.Account
@@ -1527,12 +1714,7 @@ function Process-RDSInstance {
         $dbStatus = if ($Item.DBInstanceStatus) { $Item.DBInstanceStatus } else { 'unknown' }
 
         # ── AWS Backup coverage ───────────────────────────────────────────
-        $awsBackupProtected = $false
-        try {
-            $rps = Get-BAKRecoveryPointsByResource -ResourceArn $Item.DBInstanceArn -MaxResult 1 `
-                -Credential $Credential -Region $Region -ErrorAction SilentlyContinue
-            $awsBackupProtected = ($rps -and $rps.Count -gt 0)
-        } catch {}
+        $awsBackupProtected = [bool](Get-AWSBackupRecoveryPoint -ResourceArn $Item.DBInstanceArn -Credential $Credential -Region $Region)
 
         $protectionStatus = if ($awsBackupProtected) { 'Protected' }
                             elseif ($automatedBackupsEnabled) { 'Automated-Backup' }
@@ -1801,11 +1983,10 @@ function Process-AWSBackupResource {
         $lastBackupTime = $null
         $backupStatus   = 'Unknown'
         try {
-            $rps = Get-BAKRecoveryPointsByResource -ResourceArn $Item.ResourceArn -MaxResult 1 `
-                -Credential $Credential -Region $Region -ErrorAction SilentlyContinue
-            if ($rps -and $rps.Count -gt 0) {
-                $lastBackupTime = $rps[0].CreationDate
-                $backupStatus   = $rps[0].Status
+            $rp = Get-AWSBackupRecoveryPoint -ResourceArn $Item.ResourceArn -Credential $Credential -Region $Region
+            if ($rp) {
+                $lastBackupTime = $rp.CreationDate
+                $backupStatus   = $rp.Status
             }
         } catch {}
 
@@ -2768,8 +2949,8 @@ function Invoke-AWSCloudRewindSweep {
         }
         $crTax           = Get-CVAwsCloudRewindTaxonomy
         $crFilterTagKeys = Get-CVFilterTagKeys -FilterTags $Tags
-        $crRows          = New-Object System.Collections.Generic.List[object]
-        $crClassified    = New-Object System.Collections.Generic.List[object]
+        $crRows          = New-Object System.Collections.Generic.List[psobject]
+        $crClassified    = New-Object System.Collections.Generic.List[psobject]
         $accountSuffix   = if ($AccountInfo.AccountAlias -and $AccountInfo.AccountAlias -ne 'Unknown') { $AccountInfo.AccountAlias } else { $AccountInfo.Account }
 
         foreach ($region in @($Regions)) {
@@ -2851,12 +3032,24 @@ function Invoke-AWSDataCollection {
             $script:Config.DefaultQueryRegion
         }
 
-        $awsRegions = Get-ProcessingRegions -Credential $Credential -QueryRegion $queryRegion
+        # Cheap local check first: when no credential source exists at all, every AWS call below would spend
+        # ~30s in the SDK provider chain before failing with the same answer.
+        if (-not (Test-AWSCredentialPreflight -Credential $Credential)) { return }
+
+        # Identity BEFORE regions. Both need credentials, but this one reports the provider-chain detail, so
+        # resolving it first means a credential failure is explained once instead of surfacing as a confusing
+        # "failed to list EC2 regions" and then being explained.
         $accountInfo = Get-AWSAccountInfo -Credential $Credential -QueryRegion $queryRegion
 
         if (-not $accountInfo) {
             # The detailed error was already recorded by Get-AWSAccountInfo; just note the skip (no duplicate Error).
             Write-CVLog "Skipping account - identity could not be determined" -Level Debug -Source 'Auth'
+            return
+        }
+
+        $awsRegions = Get-ProcessingRegions -Credential $Credential -QueryRegion $queryRegion
+        if (-not $awsRegions -or @($awsRegions).Count -eq 0) {
+            Write-CVLog "No regions to process for account $($accountInfo.Account) - skipping. Pass -Regions to set them explicitly." -Level Error -Source 'Region'
             return
         }
 
@@ -2882,6 +3075,9 @@ function Invoke-AWSDataCollection {
 
             Write-ScriptOutput "Region processing completed for account $($accountInfo.Account)" -Level Success
 
+            # Score native resilience posture BEFORE the CSVs are written so the Ctl_* columns land on them.
+            Invoke-AWSResiliencePass -AccountId $accountInfo.Account
+
             # Per-service CSVs (one file per discovered service type) plus the Excel summary workbook.
             Export-ServiceCSVFiles -AccountId $accountInfo.Account -AccountAlias $accountInfo.AccountAlias
             New-AccountLevelSummary -AccountId $accountInfo.Account -AccountAlias $accountInfo.AccountAlias
@@ -2897,6 +3093,78 @@ function Invoke-AWSDataCollection {
     }
 }
 
+function Get-AWSCredentialSource {
+    <#
+      .SYNOPSIS  Local, instant check for credential sources the AWS SDK's default chain could resolve.
+      .DESCRIPTION Deliberately mirrors only the sources that are visible WITHOUT a network call. Used to fail
+                   fast: if nothing here is present and instance metadata is unreachable, no AWS call can
+                   possibly succeed, and waiting ~30s per API call to rediscover that helps nobody.
+      .OUTPUTS   String[] describing each source found (empty when none).
+    #>
+    [CmdletBinding()] param()
+    $sources = @()
+    if ($env:AWS_ACCESS_KEY_ID -and $env:AWS_SECRET_ACCESS_KEY)  { $sources += 'AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY' }
+    if ($env:AWS_PROFILE)                                        { $sources += "AWS_PROFILE=$($env:AWS_PROFILE)" }
+    if ($env:AWS_WEB_IDENTITY_TOKEN_FILE)                        { $sources += 'AWS_WEB_IDENTITY_TOKEN_FILE' }
+    if ($env:AWS_CONTAINER_CREDENTIALS_RELATIVE_URI -or
+        $env:AWS_CONTAINER_CREDENTIALS_FULL_URI)                 { $sources += 'container credential provider' }
+
+    $sharedDir =
+        if ($script:Config.ProfileLocation -and $script:Config.ProfileLocation.ProfileLocation) {
+            Split-Path -Parent $script:Config.ProfileLocation.ProfileLocation
+        } elseif ($env:HOME)        { Join-Path $env:HOME '.aws' }
+        elseif ($env:USERPROFILE)   { Join-Path $env:USERPROFILE '.aws' }
+        else                        { $null }
+
+    if ($sharedDir) {
+        foreach ($f in @('credentials','config')) {
+            $p = Join-Path $sharedDir $f
+            if (Test-Path -LiteralPath $p -PathType Leaf) { $sources += $p }
+        }
+    }
+    return $sources
+}
+
+function Test-AWSInstanceMetadata {
+    <# .SYNOPSIS  Is the EC2 instance metadata service reachable? Short timeout - it is the last-resort provider. #>
+    [CmdletBinding()] param([int]$TimeoutSec = 2)
+    if ($env:AWS_EC2_METADATA_DISABLED -eq 'true') { return $false }
+    try {
+        $null = Invoke-WebRequest -Uri 'http://169.254.169.254/latest/api/token' -Method Put `
+                    -Headers @{ 'X-aws-ec2-metadata-token-ttl-seconds' = '60' } `
+                    -TimeoutSec $TimeoutSec -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+
+function Test-AWSCredentialPreflight {
+    <#
+      .SYNOPSIS  Fail fast, with remediation, when no AWS credential source exists at all.
+      .DESCRIPTION Only applies to the default credential chain ($Credential = $null). When the caller already
+                   resolved a credential object we have nothing to add. Returns $true to continue.
+    #>
+    [CmdletBinding()] param([object]$Credential)
+
+    if ($null -ne $Credential) { return $true }
+
+    $sources = @(Get-AWSCredentialSource)
+    if ($sources.Count) {
+        Write-CVLog "AWS credential source(s): $($sources -join '; ')" -Level Debug -Source 'Preflight'
+        return $true
+    }
+    if (Test-AWSInstanceMetadata) {
+        Write-CVLog "AWS credentials will come from EC2 instance metadata." -Level Debug -Source 'Preflight'
+        return $true
+    }
+
+    Write-CVLog ("No AWS credentials found. Checked: AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY, AWS_PROFILE, " +
+                 "AWS_WEB_IDENTITY_TOKEN_FILE, container credential provider, the shared credentials/config " +
+                 "files, and EC2 instance metadata (unreachable). Run 'aws configure' (or 'aws configure sso'), " +
+                 "export the access-key variables, or pass -ProfileLocation / -CrossAccountRoleName.") `
+                -Level Error -Source 'Preflight'
+    return $false
+}
+
 function Get-ProcessingRegions {
     param([object]$Credential, [string]$QueryRegion)
 
@@ -2905,9 +3173,11 @@ function Get-ProcessingRegions {
     } else {
         try {
             $profileLocationParams = $script:Config.ProfileLocation
-            return Get-EC2Region @profileLocationParams -Region $QueryRegion -Credential $Credential | Select-Object -ExpandProperty RegionName
+            return Get-EC2Region @profileLocationParams -Region $QueryRegion -Credential $Credential -ErrorAction Stop | Select-Object -ExpandProperty RegionName
         } catch {
-            Write-ScriptOutput "Failed to list EC2 regions (query region $QueryRegion)" -Level Error
+            # Carry the exception: without it this reads as a bare "EC2 query failed" and hides the real cause
+            # (most often credential resolution, since this is the first AWS call the script makes).
+            Write-CVLog "Failed to list EC2 regions (query region $QueryRegion)" -Level Error -Source 'Region' -Exception $_
             return @()
         }
     }
@@ -3710,6 +3980,9 @@ try {
         }
     }
 
+    # Run-wide resilience posture report (per-account scoring already ran before each account's CSV export).
+    Write-AWSResilienceReport -OutputPath $script:Config.OutputPath -DateString $date_string
+
     # ============================================================
     # JSON EXPORT (when OutputFormat is json or both)
     # ============================================================
@@ -3771,19 +4044,25 @@ try {
         function Get-ProtectionCounts {
             param([array]$Items)
             if (-not $Items -or $Items.Count -eq 0) {
-                return @{ protected = 0; unprotected = 0; partial = 0; total = 0; coverage_pct = 0.0 }
+                return @{ protected = 0; unprotected = 0; partial = 0; unknown = 0; total = 0; assessed = 0; coverage_pct = $null }
             }
             $protected   = ($Items | Where-Object { $_.ProtectionStatus -eq 'Protected' }).Count
             $automated   = ($Items | Where-Object { $_.ProtectionStatus -in @('Automated-Backup','Snapshot-Only','Versioned') }).Count
-            $unprotected = ($Items | Where-Object { $_.ProtectionStatus -eq 'Unprotected' -or -not $_.ProtectionStatus }).Count
+            $unprotected = ($Items | Where-Object { $_.ProtectionStatus -eq 'Unprotected' }).Count
+            # Resources we could not assess are reported separately and excluded from the coverage denominator -
+            # rolling them into "unprotected" would overstate exposure using data we never collected.
+            $unknown     = ($Items | Where-Object { $_.ProtectionStatus -eq 'Unknown' -or -not $_.ProtectionStatus }).Count
             $total       = $Items.Count
+            $assessed     = $protected + $automated + $unprotected
             $coveredCount = $protected + $automated
             return @{
                 protected       = $protected
                 partial         = $automated
                 unprotected     = $unprotected
+                unknown         = $unknown
                 total           = $total
-                coverage_pct    = if ($total -gt 0) { [math]::Round(($coveredCount / $total) * 100, 1) } else { 0.0 }
+                assessed        = $assessed
+                coverage_pct    = if ($assessed -gt 0) { [math]::Round(($coveredCount / $assessed) * 100, 1) } else { $null }
             }
         }
 

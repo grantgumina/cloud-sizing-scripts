@@ -221,11 +221,11 @@ function Invoke-CVAzureCloudRewindGraphDiscovery {
         $sid = "$($s.Id)"; $tid = "$($s.TenantId)"
         $nameById[$sid] = $s.Name; $tenantById[$sid] = $s.TenantId
         # .Contains, not .ContainsKey - [ordered]@{} is an OrderedDictionary, which has no ContainsKey method.
-        if (-not $byTenant.Contains($tid)) { $byTenant[$tid] = New-Object System.Collections.Generic.List[object] }
+        if (-not $byTenant.Contains($tid)) { $byTenant[$tid] = New-Object System.Collections.Generic.List[psobject] }
         $byTenant[$tid].Add($s)
     }
 
-    $out = New-Object System.Collections.Generic.List[object]
+    $out = New-Object System.Collections.Generic.List[psobject]
     $origContext = $null
     try { $origContext = Get-AzContext } catch { }
     $currentTenant = ''
@@ -283,7 +283,7 @@ function Invoke-CVAzureCloudRewindGraphDiscovery {
 function Get-CVAzureCloudRewindArmDiscovery {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Subs, [hashtable]$Taxonomy = (Get-CVAzureCloudRewindTaxonomy))
-    $out      = New-Object System.Collections.Generic.List[object]
+    $out      = New-Object System.Collections.Generic.List[psobject]
     $shownErr = $false
     foreach ($sub in $Subs) {
         try { Set-AzContext -SubscriptionId $sub.Id | Out-Null }
