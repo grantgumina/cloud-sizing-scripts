@@ -77,8 +77,23 @@ param(
     [string]   $CertificatePassword,
     [switch]   $UseInteractiveLogin,
     [string[]] $Types,  # Exchange, SharePoint, OneDrive, Teams, Groups
-    [ValidateSet("csv","json","both")][string]$OutputFormat = "csv"  # Output format: csv (default), json, or both
+    [ValidateSet("csv","json","both")][string]$OutputFormat = "csv",  # Output format: csv (default), json, or both
+    [string]$OutputDirectory       # write Output/ and Logs/ under this root instead of the repo/script location
 )
+
+# Load the shared console / diagnostics layer (src/common/). Dot-sourcing a MISSING file is non-terminating, so
+# check first and name what is absent rather than cascading CommandNotFoundExceptions. Must stay inline.
+$cvCommonDir = Join-Path $PSScriptRoot 'common'
+$cvRequired  = @('CVSizing.Console.ps1')
+$cvMissing = @($cvRequired | Where-Object { -not (Test-Path -LiteralPath (Join-Path $cvCommonDir $_) -PathType Leaf) })
+if ($cvMissing.Count) {
+    Write-Host "FATAL: the shared layer this script depends on was not found." -ForegroundColor Red
+    Write-Host "Expected under: $cvCommonDir" -ForegroundColor Red
+    $cvMissing | ForEach-Object { Write-Host "  missing: $_" -ForegroundColor Red }
+    Write-Host "This script cannot run standalone. Copy the whole src/ directory (the script AND src/common/)." -ForegroundColor Yellow
+    exit 1
+}
+foreach ($cvFile in $cvRequired) { . (Join-Path $cvCommonDir $cvFile) }
 
 [System.Threading.Thread]::CurrentThread.CurrentCulture   = 'en-US'
 [System.Threading.Thread]::CurrentThread.CurrentUICulture = 'en-US'
@@ -105,10 +120,12 @@ if ($Types) {
 # Output directory & logging
 # ---------------------------------------------------------------
 $dateStr = Get-Date -Format "yyyy-MM-dd_HHmmss"
-$outDir  = Join-Path $PWD ("m365-inv-" + $dateStr)
-New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+# This was the only sizing script that never called Initialize-CVRunPaths: it built its output directory from
+# $PWD, so results landed wherever the caller happened to be cd'd - and then recursively deleted that directory.
+$runPaths = Initialize-CVRunPaths -Cloud 'M365' -TimeStamp $dateStr -StartPath $PSScriptRoot -OutputRoot $OutputDirectory
+$outDir   = $runPaths.OutputDir
 
-$logFile = Join-Path $outDir "m365_sizing_script_output_$dateStr.log"
+$logFile = $runPaths.LogPath
 Start-Transcript -Path $logFile -Append | Out-Null
 
 Write-Host "=== Microsoft 365 Resource Inventory Started ===" -ForegroundColor Green
@@ -118,21 +135,25 @@ Write-Host "  Types    : $($Selected.Keys -join ', ')" -ForegroundColor Cyan
 # ---------------------------------------------------------------
 # Module installation
 # ---------------------------------------------------------------
-function Ensure-Module {
-    param([string]$Name)
-    if (-not (Get-Module -ListAvailable -Name $Name)) {
-        Write-Host "Installing module $Name ..." -ForegroundColor Yellow
-        try { Install-Module $Name -Scope CurrentUser -Force -AllowClobber } catch { Write-Warning "Could not install $Name : $_" }
+# Microsoft.Graph.* submodules all pin an exact Microsoft.Graph.Authentication version, so installing them one
+# at a time with -Force -AllowClobber (what this used to do, swallowing failures to Write-Warning) is the
+# canonical way to end up with a side-by-side version mismatch that no amount of -Force or new sessions fixes.
+# Validate up front instead and print one install command that installs them together - matching the opinionated
+# contract of the AWS/Azure/GCP scripts.
+$m365Modules = @(
+    'Microsoft.Graph.Authentication', 'Microsoft.Graph.Users', 'Microsoft.Graph.Reports',
+    'Microsoft.Graph.Teams', 'Microsoft.Graph.Groups', 'Microsoft.Graph.Sites'
+)
+Assert-CVPreflight -FatalModules $m365Modules -ExitOnFatal | Out-Null
+foreach ($m in $m365Modules) {
+    try { Import-Module $m -ErrorAction Stop }
+    catch {
+        Write-Host "FATAL: '$m' is installed but failed to import: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "This is usually a mixed-version Microsoft.Graph install. Reinstall them together:" -ForegroundColor Yellow
+        Write-Host "  Install-Module $($m365Modules -join ',') -Scope CurrentUser -Force" -ForegroundColor Yellow
+        exit 1
     }
-    try { Import-Module $Name -ErrorAction Stop } catch { Write-Warning "Could not load $Name : $_" }
 }
-
-Ensure-Module "Microsoft.Graph.Authentication"
-Ensure-Module "Microsoft.Graph.Users"
-Ensure-Module "Microsoft.Graph.Reports"
-Ensure-Module "Microsoft.Graph.Teams"
-Ensure-Module "Microsoft.Graph.Groups"
-Ensure-Module "Microsoft.Graph.Sites"
 
 # ---------------------------------------------------------------
 # Authentication
@@ -456,11 +477,18 @@ if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
 # ---------------------------------------------------------------
 Stop-Transcript
 
-$zipFile = Join-Path $PWD ("m365_sizing_" + $dateStr + ".zip")
+$zipFile = $runPaths.ZipPath
 Add-Type -AssemblyName System.IO.Compression.FileSystem
+# Stage the transcript into the run folder so the ZIP actually contains the log.
+try {
+    if ($logFile -and (Test-Path -LiteralPath $logFile)) {
+        Copy-Item -LiteralPath $logFile -Destination (Join-Path $outDir (Split-Path $logFile -Leaf)) -Force -ErrorAction Stop
+    }
+} catch { Write-Warning "Could not stage the run log into the output folder: $($_.Exception.Message)" }
 [IO.Compression.ZipFile]::CreateFromDirectory($outDir, $zipFile)
 
-Remove-Item -Path $outDir -Recurse -Force
+# The loose per-run folder is KEPT alongside the ZIP, matching the other three scripts. The previous
+# Remove-Item -Recurse -Force deleted a $PWD-derived directory - including the transcript still inside it.
 
 Write-Host "`nInventory complete. Results in $zipFile" -ForegroundColor Green
 if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {

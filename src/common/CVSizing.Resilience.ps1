@@ -41,6 +41,92 @@ function Get-CVTri { param($Value) if ($null -eq $Value) { return $null } return
 
 #endregion
 
+#region ---------------------------------------------------------- Collection status (did we actually look?)
+
+<#
+    Get-CVTri only converts $null to Unknown, so a posture field left at its $false initializer is scored as a
+    GAP - an affirmative "this resource is not protected" finding. That is correct when we queried the API and
+    found nothing, and badly wrong when the query never ran or failed.
+
+    Those two cases were indistinguishable: an Azure VM row was created with BackupEnabled = $false before any
+    backup data was collected, so a disabled API, a 403, a wrong cmdlet parameter set, or simply omitting
+    -Types Backup all produced a confident High-severity "0% backup coverage" report.
+
+    These helpers record, per scope (subscription / project / account) and per signal, whether collection actually
+    succeeded. Callers resolve a value through Resolve-CVSignal so anything not collected surfaces as Unknown.
+#>
+
+$script:CVCollectionStatus = @{}
+
+function Reset-CVCollectionStatus {
+    <# .SYNOPSIS  Clear all recorded collection statuses (call once at run start; used by tests). #>
+    [CmdletBinding()] param()
+    $script:CVCollectionStatus = @{}
+}
+
+function Set-CVCollectionStatus {
+    <#
+      .SYNOPSIS  Record whether a signal was successfully collected for a scope.
+      .PARAMETER Scope   Subscription / project / account identifier.
+      .PARAMETER Signal  Logical signal name, e.g. BACKUP, SNAPSHOT, METRICS.
+      .PARAMETER Status  Ok = queried successfully. Failed = queried and it errored. Skipped = never attempted.
+      .DESCRIPTION Failed and Skipped never downgrade an existing Ok: within one scope a signal may be gathered
+                   from several calls, and one later failure should not erase data we did collect.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Scope,
+        [Parameter(Mandatory)][string]$Signal,
+        [Parameter(Mandatory)][ValidateSet('Ok', 'Failed', 'Skipped')][string]$Status
+    )
+    $k = "$Scope|$Signal".ToLower()
+    if ($Status -ne 'Ok' -and $script:CVCollectionStatus[$k] -eq 'Ok') { return }
+    $script:CVCollectionStatus[$k] = $Status
+}
+
+function Get-CVCollectionStatus {
+    <# .SYNOPSIS  Status for a scope+signal. Never recorded means never attempted -> 'Skipped'. #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Scope, [Parameter(Mandatory)][string]$Signal)
+    $k = "$Scope|$Signal".ToLower()
+    if ($script:CVCollectionStatus.ContainsKey($k)) { return $script:CVCollectionStatus[$k] }
+    return 'Skipped'
+}
+
+function Resolve-CVSignal {
+    <#
+      .SYNOPSIS  Return $Value only when the signal was actually collected; otherwise $null (Unknown).
+      .DESCRIPTION The single guard that stops "we could not look" from being reported as "it is not there".
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Scope,
+        [Parameter(Mandatory)][string]$Signal,
+        [Parameter(Position = 0)]$Value
+    )
+    if ((Get-CVCollectionStatus -Scope $Scope -Signal $Signal) -eq 'Ok') { return $Value }
+    return $null
+}
+
+function Get-CVCollectionStatusMap {
+    <#
+      .SYNOPSIS  All recorded statuses as scope -> @{ SIGNAL = status }, for passing to attribution helpers.
+    #>
+    [CmdletBinding()] param()
+    $map = @{}
+    foreach ($k in $script:CVCollectionStatus.Keys) {
+        $parts  = $k -split '\|', 2
+        if ($parts.Count -ne 2) { continue }
+        $scope  = $parts[0]
+        $signal = $parts[1].ToUpper()
+        if (-not $map.ContainsKey($scope)) { $map[$scope] = @{} }
+        $map[$scope][$signal] = $script:CVCollectionStatus[$k]
+    }
+    return $map
+}
+
+#endregion
+
 #region ---------------------------------------------------------------- Evaluation
 
 function ConvertTo-CVOutcome {

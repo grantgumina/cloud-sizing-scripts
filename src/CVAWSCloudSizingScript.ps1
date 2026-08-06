@@ -118,7 +118,8 @@ param (
     [string[]]$ResourceGroups,     # (reserved) AWS resource-group filtering is a follow-up; -Tags is applied today
     [string[]]$Tags,               # limit the Cloud Rewind pass to resources carrying any of these 'Key=Value' tags
     [switch]$SkipCloudRewind,      # skip the Cloud Rewind billable-resource sizing pass
-    [switch]$SkipDataProtection    # skip the Data Protection inventory pass (run Cloud Rewind only)
+    [switch]$SkipDataProtection,   # skip the Data Protection inventory pass (run Cloud Rewind only)
+    [string]$OutputDirectory       # write Output/ and Logs/ under this root instead of the repo/script location
 )
 
 # Guard: at least one discovery pass must run.
@@ -128,11 +129,28 @@ if ($SkipCloudRewind -and $SkipDataProtection) {
 }
 
 # Load the shared console / diagnostics + resilience + Cloud Rewind layers (src/common/).
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.Console.ps1')
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.Resilience.ps1')
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.Resilience.AWS.ps1')   # AWS control definitions
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.CloudRewind.ps1')      # provider-neutral Cloud Rewind engine
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.CloudRewind.AWS.ps1')  # AWS billable taxonomy (derived)
+# Dot-sourcing a MISSING file is non-terminating, so an incomplete copy used to march on through cascading
+# CommandNotFoundExceptions and silently skip Assert-CVPreflight. Check first, and name what is missing.
+# This block must stay inline - it is the thing that guards dot-sourcing.
+$cvCommonDir = Join-Path $PSScriptRoot 'common'
+$cvRequired  = @(
+    'CVSizing.Console.ps1'          # console / diagnostics / run paths
+    'CVSizing.Resilience.ps1'       # provider-neutral scoring engine
+    'CVSizing.Resilience.AWS.ps1'   # AWS control definitions
+    'CVSizing.Kubectl.ps1'          # cross-platform kubectl provisioning
+    'CVSizing.CloudRewind.ps1'      # provider-neutral Cloud Rewind engine
+    'CVSizing.CloudRewind.AWS.ps1'  # AWS billable taxonomy (derived)
+)
+$cvMissing = @($cvRequired | Where-Object { -not (Test-Path -LiteralPath (Join-Path $cvCommonDir $_) -PathType Leaf) })
+if ($cvMissing.Count) {
+    Write-Host "FATAL: the shared layer this script depends on was not found." -ForegroundColor Red
+    Write-Host "Expected under: $cvCommonDir" -ForegroundColor Red
+    $cvMissing | ForEach-Object { Write-Host "  missing: $_" -ForegroundColor Red }
+    Write-Host "This script cannot run standalone. Copy the whole src/ directory (the script AND src/common/)," -ForegroundColor Yellow
+    Write-Host "or clone the repository, and run it from there." -ForegroundColor Yellow
+    exit 1
+}
+foreach ($cvFile in $cvRequired) { . (Join-Path $cvCommonDir $cvFile) }
 
 
 [System.Threading.Thread]::CurrentThread.CurrentCulture = 'en-US'
@@ -312,7 +330,7 @@ $script:Config = @{
     DefaultGovCloudQueryRegion = "us-gov-west-1"
     Partition = if ($Partition) { $Partition } else { "Standard" }
     ProfileLocation = if ($ProfileLocation) { @{ProfileLocation = $ProfileLocation} } else { @{} }
-    OutputPath = (Get-Location).Path
+    OutputPath = $null   # set from Initialize-CVRunPaths below; a CWD default silently misplaces output
     SkipBucketTags = $SkipBucketTags.IsPresent
     DebugBucketTags = $DebugBucketTags.IsPresent
 }
@@ -321,9 +339,11 @@ $date = Get-Date
 $date_string = $date.ToString("yyyy-MM-dd_HHmmss")
 
 # Resolve this run's Output/ and Logs/ directories at the repo top level (or CWD when run outside the repo).
-$script:RunPaths = Initialize-CVRunPaths -Cloud 'AWS' -TimeStamp $date_string -StartPath $PSScriptRoot
+$script:RunPaths = Initialize-CVRunPaths -Cloud 'AWS' -TimeStamp $date_string -StartPath $PSScriptRoot -OutputRoot $OutputDirectory
 $script:Config.OutputPath = $script:RunPaths.OutputDir
-$script:OutputDirectory   = $script:RunPaths.OutputDir   # consumed by the JSON export path
+# Distinct from the -OutputDirectory PARAMETER above (which is the requested ROOT): this is the resolved
+# per-run output directory consumed by the JSON export path.
+$script:ResolvedOutputDir = $script:RunPaths.OutputDir
 $script:LogPath           = $script:RunPaths.LogPath
 $script:LogFile           = Split-Path $script:RunPaths.LogPath -Leaf
 
@@ -1287,43 +1307,18 @@ function Ensure-Kubectl {
     if (-not (Get-Command kubectl -ErrorAction SilentlyContinue)) {
         Write-ScriptOutput "kubectl not found. Attempting to install for PVC/node enumeration." -Level Warning
 
-        if ($env:OS -like "*Windows*") {
-            try {
-                $kubectlVersion = (Invoke-RestMethod https://dl.k8s.io/release/stable.txt).Trim()
-                $kubectlUrl = "https://dl.k8s.io/release/$kubectlVersion/bin/windows/amd64/kubectl.exe"
-                $kubectlDir = "C:\kubectl"
-                if (-not (Test-Path $kubectlDir)) {
-                    try {
-                        New-Item -ItemType Directory -Path $kubectlDir -Force | Out-Null
-                    } catch {
-                        $kubectlDir = Join-Path $env:TEMP "kubectl"
-                        if (-not (Test-Path $kubectlDir)) {
-                            New-Item -ItemType Directory -Path $kubectlDir -Force | Out-Null
-                        }
-                        Write-ScriptOutput "Using fallback path $kubectlDir instead of C:\kubectl" -Level Warning
-                    }
-                }
-
-                $kubectlPath = Join-Path $kubectlDir "kubectl.exe"
-
-                Write-ScriptOutput "Downloading kubectl from $kubectlUrl to $kubectlPath..." -Level Info
-                Invoke-WebRequest -Uri $kubectlUrl -OutFile $kubectlPath -UseBasicParsing
-
-                $env:Path += ";$kubectlDir"
-                $script:KubectlInstalled = $true
-                $script:KubectlDir = $kubectlDir 
-
-                if (Get-Command kubectl -ErrorAction SilentlyContinue) {
-                    Write-ScriptOutput "kubectl is now available: $((kubectl version --client --short 2>$null) -join ' ')" -Level Success
-                } else {
-                    Write-ScriptOutput "kubectl download succeeded, but it's not in PATH. Please add $kubectlDir to your system PATH manually." -Level Warning
-                }
-            } catch {
-                Write-ScriptOutput "Failed to auto-install kubectl: $_" -Level Error
-                Write-ScriptOutput "Please install kubectl manually from https://kubernetes.io/docs/tasks/tools/ and add it to your PATH." -Level Warning
-            }
+        # Delegated to common/CVSizing.Kubectl.ps1. Previously this auto-installed on Windows only (into a
+        # hardcoded C:\kubectl) and the non-Windows branch just said "install manually" - so -Types EKS on
+        # macOS/Linux silently produced no persistent-volume data, unlike the Azure and GCP scripts which both
+        # auto-provision.
+        $k = Install-CVKubectl
+        if ($k.Installed) {
+            $script:KubectlInstalled = ($k.Source -eq 'Downloaded')   # only clean up what WE installed
+            $script:KubectlDir       = $k.Dir
+            Write-ScriptOutput "kubectl ready at $($k.Path) [$($k.Platform), $($k.Source)]" -Level Success
         } else {
-            Write-ScriptOutput "Non-Windows OS detected. Please install kubectl manually." -Level Warning
+            Write-ScriptOutput "Could not provision kubectl for $($k.Platform): $($k.Error)" -Level Warning
+            Write-ScriptOutput "Install kubectl from https://kubernetes.io/docs/tasks/tools/ and add it to PATH; EKS persistent-volume data will be skipped." -Level Warning
         }
     } else {
         Write-ScriptOutput "kubectl is already available." -Level Info
@@ -2845,7 +2840,13 @@ function Get-S3BucketSizeAccurate {
 
         try {
             if (-not ([System.Type]::GetType("Amazon.S3.AmazonS3Client, AWSSDK.S3"))) {
-                $mods = Get-Module -ListAvailable | Where-Object { $_.ModuleBase }
+                # Get-Module -ListAvailable returns one entry PER INSTALLED VERSION in no guaranteed order, and
+                # this used to be unfiltered by name - so the first AWSSDK.S3.dll found anywhere on PSModulePath
+                # won for the whole process, frequently an older side-by-side copy left behind by an upgrade.
+                # LoadFrom cannot be undone in-process, which is exactly the "module version that will not update
+                # no matter how many new sessions or -Force installs" symptom. Filter by name, newest first.
+                $mods = Get-Module -ListAvailable -Name 'AWS.Tools.*' -ErrorAction SilentlyContinue |
+                            Where-Object { $_.ModuleBase } | Sort-Object Version -Descending
                 foreach ($m in $mods) {
                     try {
                         $candidate = Get-ChildItem -Path $m.ModuleBase -Filter "AWSSDK.S3.dll" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -3398,7 +3399,10 @@ function Invoke-AuthenticationScenarios {
                     $basicType = [System.Type]::GetType("Amazon.Runtime.BasicSessionAWSCredentials, AWSSDK.Core")
                     if (-not $basicType) {
                         try {
-                            $mods = Get-Module -ListAvailable | Where-Object { $_.ModuleBase }
+                            # Newest AWS.Tools.* first - see the AWSSDK.S3 note above. An unfiltered, unordered
+                            # scan pinned whichever stale side-by-side version happened to be enumerated first.
+                            $mods = Get-Module -ListAvailable -Name 'AWS.Tools.*' -ErrorAction SilentlyContinue |
+                                        Where-Object { $_.ModuleBase } | Sort-Object Version -Descending
                             $dllPath = $null
                             foreach ($m in $mods) {
                                 try {
@@ -4160,7 +4164,8 @@ try {
         }
 
         $jsonTimestamp = (Get-Date -Format "yyyy-MM-dd_HHmmss")
-        $jsonOutDir = if ($script:OutputDirectory) { $script:OutputDirectory } else { $PSScriptRoot }
+        # Never fall back to $PSScriptRoot - that wrote the JSON report into the script's own source directory.
+        $jsonOutDir = if ($script:ResolvedOutputDir) { $script:ResolvedOutputDir } else { $script:RunPaths.OutputDir }
         if (-not (Test-Path $jsonOutDir)) { New-Item -ItemType Directory -Path $jsonOutDir -Force | Out-Null }
         $jsonPath = Join-Path $jsonOutDir ("aws_sizing_" + $jsonTimestamp + ".json")
         $jsonDoc | ConvertTo-Json -Depth 10 | Set-Content -Path $jsonPath -Encoding UTF8
@@ -4173,7 +4178,9 @@ try {
 
     if ($script:KubectlInstalled -and $script:KubectlDir) {
         try {
-            $env:Path = ($env:Path -split ';' | Where-Object { $_ -ne $script:KubectlDir }) -join ';'
+            # Platform separator: ';' is Windows-only, and kubectl is now auto-provisioned on macOS/Linux too.
+            $pathSep  = [IO.Path]::PathSeparator
+            $env:Path = ($env:Path -split $pathSep | Where-Object { $_ -ne $script:KubectlDir }) -join $pathSep
             if (Test-Path $script:KubectlDir) {
                 Remove-Item $script:KubectlDir -Recurse -Force
                 Write-ScriptOutput "kubectl uninstalled successfully from $script:KubectlDir." -Level Info

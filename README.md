@@ -172,4 +172,8 @@ Output/              Run output (CSV/JSON/Excel + ZIP), one timestamped subfolde
 Logs/                Run logs, one file per run                                              (git-ignored)
 ```
 
-Every run writes its output to `Output/<cloud>_<timestamp>/` (with the ZIP beside it) and its log to `Logs/<cloud>_<timestamp>.log`, at the repository top level. When a script is run outside a repository, those folders are created in the current directory instead.
+Every run writes its output to `Output/<cloud>_<timestamp>/` (with the ZIP beside it) and its log to `Logs/<cloud>_<timestamp>.log`, at the repository top level.
+
+Outside a repository — a copied-out `src/` folder, a container image — those folders are created **next to the script** rather than in the current directory, so the location does not depend on where you happened to `cd`. Pass `-OutputDirectory <path>` to any of the sizing scripts to choose the root explicitly (the OCI script takes `--output-dir=<path>`).
+
+> **Changed:** earlier versions used the current working directory outside a repository, which scattered output across wherever the shell was and failed outright from a non-writable directory. Runs from inside a checkout are unaffected.

@@ -148,7 +148,8 @@ param(
     [switch]$SkipResilienceReport, # do not compute or write the cyber resilience posture report
     [string[]]$Labels,             # limit BOTH passes to resources carrying any of these 'key=value' labels
     [switch]$SkipCloudRewind,      # skip the Cloud Rewind billable-resource sizing pass
-    [switch]$SkipDataProtection    # skip the Data Protection inventory + resilience pass (run Cloud Rewind only)
+    [switch]$SkipDataProtection,   # skip the Data Protection inventory + resilience pass (run Cloud Rewind only)
+    [string]$OutputDirectory       # write Output/ and Logs/ under this root instead of the repo/script location
 )
 
 # Guard: at least one discovery pass must run.
@@ -158,11 +159,28 @@ if ($SkipCloudRewind -and $SkipDataProtection) {
 }
 
 # Load the shared console / diagnostics + resilience + Cloud Rewind layers (src/common/).
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.Console.ps1')
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.Resilience.ps1')
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.Resilience.GCP.ps1')   # GCP control definitions
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.CloudRewind.ps1')      # provider-neutral Cloud Rewind engine
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.CloudRewind.GCP.ps1')  # GCP billable taxonomy (derived)
+# Dot-sourcing a MISSING file is non-terminating, so an incomplete copy used to march on through cascading
+# CommandNotFoundExceptions and silently skip Assert-CVPreflight. Check first, and name what is missing.
+# This block must stay inline - it is the thing that guards dot-sourcing.
+$cvCommonDir = Join-Path $PSScriptRoot 'common'
+$cvRequired  = @(
+    'CVSizing.Console.ps1'          # console / diagnostics / run paths
+    'CVSizing.Resilience.ps1'       # provider-neutral scoring engine
+    'CVSizing.Resilience.GCP.ps1'   # GCP control definitions
+    'CVSizing.Kubectl.ps1'          # cross-platform kubectl provisioning
+    'CVSizing.CloudRewind.ps1'      # provider-neutral Cloud Rewind engine
+    'CVSizing.CloudRewind.GCP.ps1'  # GCP billable taxonomy (derived)
+)
+$cvMissing = @($cvRequired | Where-Object { -not (Test-Path -LiteralPath (Join-Path $cvCommonDir $_) -PathType Leaf) })
+if ($cvMissing.Count) {
+    Write-Host "FATAL: the shared layer this script depends on was not found." -ForegroundColor Red
+    Write-Host "Expected under: $cvCommonDir" -ForegroundColor Red
+    $cvMissing | ForEach-Object { Write-Host "  missing: $_" -ForegroundColor Red }
+    Write-Host "This script cannot run standalone. Copy the whole src/ directory (the script AND src/common/)," -ForegroundColor Yellow
+    Write-Host "or clone the repository, and run it from there." -ForegroundColor Yellow
+    exit 1
+}
+foreach ($cvFile in $cvRequired) { . (Join-Path $cvCommonDir $cvFile) }
 
 # Normalize -Projects if provided as a single comma-separated string inside quotes
 if ($Projects -and $Projects.Count -eq 1 -and $Projects[0] -match ',') {
@@ -195,7 +213,7 @@ $MinimalOutput = $false
 # -------------------------
 $dateStr = (Get-Date).ToString("yyyy-MM-dd_HHmmss")
 # Resolve this run's Output/ and Logs/ directories at the repo top level (or CWD when run outside the repo).
-$runPaths = Initialize-CVRunPaths -Cloud 'GCP' -TimeStamp $dateStr -StartPath $PSScriptRoot
+$runPaths = Initialize-CVRunPaths -Cloud 'GCP' -TimeStamp $dateStr -StartPath $PSScriptRoot -OutputRoot $OutputDirectory
 $outDir = $runPaths.OutputDir
 New-Item -Path $outDir -ItemType Directory -Force | Out-Null
 
@@ -228,6 +246,11 @@ Initialize-CVConsole -Cloud GCP -Title 'GCP Resource Inventory' `
 if ($Types)    { Write-CVLog "Types: $($Types -join ', ')" -Level Info -Source 'Init' }
 if ($Projects) { Write-CVLog "Projects: $($Projects -join ', ')" -Level Info -Source 'Init' }
 
+# Everything below runs inside a top-level handler. Without one, an unhandled terminating error produced no run
+# summary, no diagnostics and no Stop-Transcript - the user saw a raw stack trace and no indication of what had
+# already been collected. (AWS has had this; Azure and GCP did not.)
+try {
+
 function Test-CVGcloudQuotaProject {
     <#
       .SYNOPSIS  Warn early when gcloud's active project is missing or deleted.
@@ -243,7 +266,7 @@ function Test-CVGcloudQuotaProject {
                     -Level Warning -Source 'Preflight' -Scope @{ Category = 'QuotaProject' }
         return
     }
-    $probe = & gcloud projects describe $cur --format=json --quiet 2>&1
+    $null = & gcloud projects describe $cur --format=json --quiet 2>&1
     if ($LASTEXITCODE -ne 0) {
         Write-CVLog ("gcloud core/project '{0}' does not resolve (deleted or inaccessible). It is sent as the quota project, so Cloud Asset / Spanner / other API calls will fail in EVERY scanned project until you run 'gcloud config set project <live-id>'." -f $cur) `
                     -Level Warning -Source 'Preflight' -Scope @{ Category = 'QuotaProject'; Project = $cur }
@@ -514,33 +537,18 @@ function Ensure-Kubectl {
         }
     }
 
-    # Direct download fallback (works for both platforms)
+    # Direct download fallback. Delegated to common/CVSizing.Kubectl.ps1: the previous block pinned $arch='amd64'
+    # and hardcoded /tmp/kubectl-bin, so it fetched an amd64 Linux binary onto Apple Silicon and Graviton hosts
+    # alike. The shared helper resolves OS and architecture from the runtime, uses the platform temp directory,
+    # and verifies the binary actually executes before reporting success.
     Write-Host '[Ensure-Kubectl] Falling back to direct download.' -ForegroundColor Cyan
-    try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor 3072 -bor 12288 } catch {}
-    $stable = ''
-    try { $stable = (Invoke-WebRequest -UseBasicParsing -Uri 'https://dl.k8s.io/release/stable.txt' -TimeoutSec 25).Content.Trim() } catch { $stable='v1.30.0' }
-    if (-not $stable) { $stable='v1.30.0' }
-    $arch='amd64'
-    if ($isWin) {
-        $destDir = Join-Path $env:TEMP 'kubectl-bin'
-        New-Item -ItemType Directory -Path $destDir -Force | Out-Null
-        $destFile = Join-Path $destDir 'kubectl.exe'
-        $url = "https://dl.k8s.io/release/$stable/bin/windows/$arch/kubectl.exe"
+    $k = Install-CVKubectl
+    if ($k.Installed) {
+        $resolved = $k.Path
+        Write-Host ("[Ensure-Kubectl] kubectl ready -> {0} [{1}, {2}]" -f $k.Path, $k.Platform, $k.Source) -ForegroundColor Green
     } else {
-        $destDir = '/tmp/kubectl-bin'
-        if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
-        $destFile = Join-Path $destDir 'kubectl'
-        $url = "https://dl.k8s.io/release/$stable/bin/linux/$arch/kubectl"
+        Write-Warning "[Ensure-Kubectl] Download failed for $($k.Platform): $($k.Error)"
     }
-    try {
-        Invoke-WebRequest -UseBasicParsing -Uri $url -OutFile $destFile -TimeoutSec 90
-        if (-not $isWin) { try { chmod +x $destFile 2>$null } catch {} }
-        if (Test-Path $destFile) {
-            Add-PathSegment -Dir $destDir -Windows:$isWin
-            $resolved = $destFile
-            Write-Host ("[Ensure-Kubectl] Downloaded kubectl {0} -> {1}" -f $stable,$destFile) -ForegroundColor Green
-        }
-    } catch { Write-Warning "[Ensure-Kubectl] Download failed: $($_.Exception.Message)" }
 
     if ($resolved) {
         # Add gcloud bin path (if available) for plugin resolution in downloaded kubectl scenario
@@ -1089,7 +1097,17 @@ function Update-BucketWorkProgress {
 
 # MultiThreading - Script Blocks for Bucket sizing
 $bucketSizingScriptBlock = {
-    param($projectName, $bucket, $minimalFlag)
+    param($projectName, $bucket, $minimalFlag, $workerLogQueue)
+        # Runspace-local logger. The parent's Write-Log is NOT in scope here: the pool is built from
+        # [InitialSessionState]::CreateDefault() and .AddScript() re-parses only this block's text, so every
+        # Write-Log call inside this worker threw CommandNotFoundException instead of emitting its warning -
+        # meaning every bucket whose gsutil du failed produced a confusing crash instead of "size unavailable".
+        # Enqueue plain strings and let the parent replay them via Receive-CVWorkerRecords, which already accepts
+        # raw strings for exactly this case.
+        function Write-Log {
+            param([string]$Message, [string]$Level = 'INFO')
+            if ($workerLogQueue) { $workerLogQueue.Enqueue("[$Level] $Message") }
+        }
         # -------------------------
         # Bucket sizing helper
         # Strategy:
@@ -1253,9 +1271,12 @@ function Get-GcpStorageInventory {
     $iss2 = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
     $pool2 = [RunspaceFactory]::CreateRunspacePool(1,$maxBucketThreads,$iss2,$Host); $pool2.Open()
     $bucketRunspaces=@(); $index=0
+    # Thread-safe queue the workers log into; drained on the parent thread after the pool completes. Passing the
+    # queue by argument keeps runspace safety by construction - the workers never touch $Host or the console layer.
+    $bucketLogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
     foreach ($bd in $allBucketDescriptors) {
         $index++
-        $ps=[PowerShell]::Create().AddScript($bucketSizingScriptBlock).AddArgument($bd.Project).AddArgument([PSCustomObject]@{ name=$bd.Name; location=$bd.Location; storageClass=$bd.StorageClass }).AddArgument($MinimalOutput)
+        $ps=[PowerShell]::Create().AddScript($bucketSizingScriptBlock).AddArgument($bd.Project).AddArgument([PSCustomObject]@{ name=$bd.Name; location=$bd.Location; storageClass=$bd.StorageClass }).AddArgument($MinimalOutput).AddArgument($bucketLogQueue)
         $ps.RunspacePool=$pool2
         $bucketRunspaces += [PSCustomObject]@{ PS=$ps; Handle=$ps.BeginInvoke(); Project=$bd.Project; Bucket=$bd.Name }
     }
@@ -1285,6 +1306,13 @@ function Get-GcpStorageInventory {
     }
     Write-Progress -Id 401 -Activity 'Bucket Sizing' -Completed
     $pool2.Close(); $pool2.Dispose()
+
+    # Replay the workers' log lines on the parent thread, where the console layer actually exists.
+    $bucketLogLine = $null
+    while ($bucketLogQueue.TryDequeue([ref]$bucketLogLine)) {
+        $lvl = if ($bucketLogLine -match '^\[(WARN|ERROR|DEBUG|INFO)\]') { $Matches[1] } else { 'INFO' }
+        Write-Log -Level $lvl -Message ($bucketLogLine -replace '^\[(WARN|ERROR|DEBUG|INFO)\]\s*', '')
+    }
 
     $script:StorageProjectStatuses = $projectStatuses
     return $sized
@@ -3813,3 +3841,16 @@ if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
     Write-Host "JSON sizing report (gcp_sizing_$dateStr.json) is included in the ZIP for Sales AI Hub upload." -ForegroundColor Cyan
 }
 Write-Host "All output files (including the log) are compressed into the ZIP archive." -ForegroundColor Cyan
+
+}
+catch {
+    # Test-CVConsoleReady exists precisely for this: only use the console layer if it actually initialized.
+    if ((Get-Command Test-CVConsoleReady -ErrorAction SilentlyContinue) -and (Test-CVConsoleReady)) {
+        Write-CVLog "Critical error in main execution" -Level Error -Source 'Main' -Exception $_
+        Write-CVSummary -Title 'GCP Sizing Run Summary (aborted)'
+    } else {
+        Write-Host "Critical error in main execution: $_" -ForegroundColor Red
+    }
+    try { Stop-Transcript | Out-Null } catch { }
+    exit 1
+}

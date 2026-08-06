@@ -139,6 +139,9 @@ function Initialize-CVConsole {
     # Quiet native module chatter as early as possible.
     Set-CVNativeNoiseSuppression -Provider $Cloud
 
+    # Progress renders only in the interactive tiers; size its erase region to this terminal.
+    if ($cap.Tier -ne 'Plain-Headless') { Set-CVProgressWidth }
+
     # Header banner (skipped when Quiet).
     if (-not $Quiet -and $Title) {
         Write-CVSection -Title $Title
@@ -174,20 +177,26 @@ function Sync-CVPending {
 
 function Get-CVBaseRoot {
     <#
-      .SYNOPSIS  The repo top-level directory (nearest ancestor containing a .git), or the current directory when
-                 run outside a repo (e.g. a script copied out and run standalone).
+      .SYNOPSIS  The repo top-level directory (nearest ancestor containing a .git), else the script's own location.
+      .DESCRIPTION Outside a checkout this used to return (Get-Location).Path, DISCARDING the $StartPath the caller
+                   passed in. Every non-repo copy - a zip sent to a customer, the k8s image (which COPYs src/ with
+                   no .git) - therefore wrote Output/ and Logs/ wherever the user happened to be cd'd, and running
+                   from an unwritable directory failed outright. Falling back to $StartPath (the calling script's
+                   $PSScriptRoot) makes the location deterministic; -OutputRoot on Initialize-CVRunPaths overrides
+                   it entirely.
     #>
     [CmdletBinding()]
     param([string]$StartPath)
-    if (-not $StartPath) { $StartPath = (Get-Location).Path }
-    $dir = $StartPath
-    while ($dir) {
-        if (Test-Path -LiteralPath (Join-Path $dir '.git')) { return $dir }
-        $parent = Split-Path $dir -Parent
-        if (-not $parent -or $parent -eq $dir) { break }
-        $dir = $parent
+    $dir = if ($StartPath) { $StartPath } else { (Get-Location).Path }
+    $probe = $dir
+    while ($probe) {
+        if (Test-Path -LiteralPath (Join-Path $probe '.git')) { return $probe }
+        $parent = Split-Path $probe -Parent
+        if (-not $parent -or $parent -eq $probe) { break }
+        $probe = $parent
     }
-    return (Get-Location).Path
+    # No repo above us: use where the script actually lives, not where the shell happens to be.
+    return $dir
 }
 
 function Initialize-CVRunPaths {
@@ -201,15 +210,24 @@ function Initialize-CVRunPaths {
     param(
         [Parameter(Mandatory)][string]$Cloud,
         [Parameter(Mandatory)][string]$TimeStamp,
-        [string]$StartPath           # pass the calling script's $PSScriptRoot
+        [string]$StartPath,          # pass the calling script's $PSScriptRoot
+        [string]$OutputRoot          # explicit override (-OutputDirectory); wins over repo/script detection
     )
-    $root      = Get-CVBaseRoot -StartPath $StartPath
+    $root      = if ($OutputRoot) { $OutputRoot } else { Get-CVBaseRoot -StartPath $StartPath }
     $runName   = ('{0}_{1}' -f $Cloud.ToLower(), $TimeStamp)
     $outputTop = Join-Path $root 'Output'
     $outputDir = Join-Path $outputTop $runName
     $logsDir   = Join-Path $root 'Logs'
-    New-Item -ItemType Directory -Force -Path $outputDir | Out-Null
-    New-Item -ItemType Directory -Force -Path $logsDir   | Out-Null
+    # An unwritable root used to surface as an unhandled New-Item throw on line 1 of the run, with no indication
+    # of which path was at fault or that -OutputDirectory exists.
+    try {
+        New-Item -ItemType Directory -Force -Path $outputDir -ErrorAction Stop | Out-Null
+        New-Item -ItemType Directory -Force -Path $logsDir   -ErrorAction Stop | Out-Null
+    } catch {
+        Write-Host "FATAL: cannot create the output directories under '$root': $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Pass -OutputDirectory <path> to write somewhere else." -ForegroundColor Yellow
+        throw
+    }
     return [pscustomobject]@{
         Root      = $root
         RunName   = $runName
@@ -217,6 +235,64 @@ function Initialize-CVRunPaths {
         LogsDir   = $logsDir
         LogPath   = Join-Path $logsDir  ("$runName.log")
         ZipPath   = Join-Path $outputTop ("$runName.zip")   # sibling of OutputDir (avoids zipping the zip into itself)
+    }
+}
+
+function Export-CVCsv {
+    <#
+      .SYNOPSIS  Export-Csv that cannot silently drop columns.
+      .DESCRIPTION Export-Csv derives its header from the FIRST object only, so any property that appears later in
+                   the collection is discarded without warning. Our rows are legitimately heterogeneous - Tag_*
+                   columns are flattened per resource, and error paths emit a short object - so this bit hard:
+
+                     first row FEWER props : "Name","Type"                        <- Tag_env, StorageGB LOST
+                     union projection      : "Name","Type","Tag_env","StorageGB"
+
+                   The most common victim was Tag_*: one untagged first VM erased every tag column in the file,
+                   which reads as "the tool doesn't collect tags".
+
+                   Builds the union of property names in first-seen order and projects every row through it.
+      .PARAMETER PreferredOrder  Names to place first when present, so existing consumers keep their column order
+                                 and newly added fields append rather than shifting positions.
+      .PARAMETER Append  Passed through to Export-Csv. Note the union is computed from THIS call's rows only.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory, ValueFromPipeline)][AllowEmptyCollection()]$InputObject,
+        [Parameter(Mandatory)][string]$Path,
+        [string[]]$PreferredOrder,
+        [switch]$Append,
+        [switch]$NoHeaderOnEmpty
+    )
+    begin { $rows = [System.Collections.Generic.List[psobject]]::new() }
+    process {
+        foreach ($o in @($InputObject)) { if ($null -ne $o) { $rows.Add($o) } }
+    }
+    end {
+        if ($rows.Count -eq 0) {
+            if (-not $NoHeaderOnEmpty -and $PreferredOrder -and $PreferredOrder.Count) {
+                # Header-only file so downstream consumers still see the expected schema.
+                ($PreferredOrder | ForEach-Object { '"' + ($_ -replace '"', '""') + '"' }) -join ',' |
+                    Set-Content -Path $Path -Encoding UTF8
+            }
+            return
+        }
+
+        $keys = [System.Collections.Specialized.OrderedDictionary]::new()
+        foreach ($p in @($PreferredOrder)) {
+            if ($p -and -not $keys.Contains($p)) { $keys[$p] = $true }
+        }
+        foreach ($r in $rows) {
+            foreach ($n in $r.PSObject.Properties.Name) {
+                if (-not $keys.Contains($n)) { $keys[$n] = $true }
+            }
+        }
+        # Drop preferred names that no row actually has, so we do not invent empty columns.
+        $present = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($r in $rows) { foreach ($n in $r.PSObject.Properties.Name) { [void]$present.Add($n) } }
+        $ordered = @($keys.Keys | Where-Object { $present.Contains($_) })
+
+        $rows | Select-Object -Property $ordered | Export-Csv -Path $Path -NoTypeInformation -Append:$Append
     }
 }
 
@@ -322,6 +398,13 @@ function Write-CVRecord {
     if ($level -eq 'Debug' -and $script:CVConsole -and -not $script:CVConsole.ShowDebug) { return }
 
     # 4) Console render, per tier.
+    #    Flatten embedded newlines for the console only - the file already has the full text (step 2). Worker
+    #    runspaces hand us raw CLI stderr (gcloud hard-wraps its PERMISSION_DENIED text), and a multi-line
+    #    Write-Host paints several full-width rows. The native progress pane then repaints over those rows but
+    #    only erases $PSStyle.Progress.MaxWidth columns, so the tail of each wrapped row survives and freezes
+    #    into scrollback as ragged right-hand fragments. See Set-CVProgressWidth for the other half of the fix.
+    if ($msg -match "`r|`n") { $msg = ($msg -replace "\s*\r?\n\s*", ' ').Trim() }
+
     $tier = if ($script:CVConsole) { $script:CVConsole.Tier } else { 'Plain-Interactive' }
     $ts   = $Record.Time.ToString('HH:mm:ss')
     $tag  = if ($source) { "[$source] " } else { '' }
@@ -411,6 +494,26 @@ function Write-CVSection {
 # Live progress uses native Write-Progress (styled by $PSStyle) in both interactive tiers; suppressed when headless.
 # Rendering is parent-thread only (Write-Progress from worker runspaces garbles the host).
 
+function Set-CVProgressWidth {
+    <#
+      .SYNOPSIS  Match the native progress pane's erase width to the real terminal width.
+      .DESCRIPTION $PSStyle.Progress.MaxWidth defaults to 120. The Minimal view blanks its reserved rows out to
+                   that column ONLY, so on a wider terminal anything already painted past column 120 - the tail
+                   of a wrapped CLI error, a severed ANSI reset - survives the repaint and scrolls into history
+                   as garbage tacked onto unrelated lines. Widening the pane makes the erase cover the whole row.
+                   Deliberately a process-wide $PSStyle mutation: the AWS/GCP scripts call Write-Progress
+                   directly in their runspace-polling loops, bypassing the wrappers below.
+    #>
+    [CmdletBinding()] param()
+    if (-not $PSStyle) { return }
+    try {
+        $w = $Host.UI.RawUI.WindowSize.Width
+        if ($w -ge 18) { $PSStyle.Progress.MaxWidth = $w }   # <18 throws (PS validation range)
+    } catch {
+        # No raw UI (redirected host, some remoting sessions) - leave the default in place.
+    }
+}
+
 function Resolve-CVProgressIntId {
     param([string]$Id)
     if (-not $script:CVConsole) { return 1 }
@@ -429,6 +532,7 @@ function Start-CVProgress {
         Write-CVLog -Message "$Activity (starting$([string]($Total ? ", $Total items" : '')))" -Level Debug -Source 'Progress'
         return
     }
+    Set-CVProgressWidth   # re-check per bar, so a mid-run terminal resize is picked up
     $intId = Resolve-CVProgressIntId -Id $Id
     $script:CVConsole.ProgressState[$Id].Total = $Total
     $script:CVConsole.ProgressState[$Id].Count = 0
@@ -802,16 +906,60 @@ function Assert-CVPreflight {
         $fmsg = "Required dependencies missing: $($parts -join ', ')."
 
         # Build copy-pasteable, actionable install instructions. Lines starting with 4 spaces are commands.
+        #
+        # The hint MUST be provider-aware. AWS.Tools.* and Az.* manifests declare EXACT RequiredModules versions,
+        # so a plain `Install-Module <one module> -Force` drops a new module beside a stale AWS.Tools.Common or
+        # Az.Accounts and the import then fails on the version mismatch - which neither -Force, -AllowClobber, nor
+        # a fresh session can repair, because the old version directory is still on disk. That is precisely the
+        # "hard-coded module versions that won't update" trap users have hit. Point them at the remedy that works.
         $instructions = [System.Collections.Generic.List[string]]::new()
         if ($missingModules.Count) {
-            $instructions.Add("To install the missing PowerShell module(s), run:")
-            $instructions.Add("    Install-Module $($missingModules -join ',') -Scope CurrentUser -Force")
+            $awsMods   = @($missingModules | Where-Object { $_ -like 'AWS.Tools.*' })
+            $azMods    = @($missingModules | Where-Object { $_ -like 'Az.*' })
+            $graphMods = @($missingModules | Where-Object { $_ -like 'Microsoft.Graph.*' })
+            $otherMods = @($missingModules | Where-Object { $_ -notlike 'AWS.Tools.*' -and $_ -notlike 'Az.*' -and $_ -notlike 'Microsoft.Graph.*' })
+
+            if ($awsMods.Count) {
+                $instructions.Add("AWS modules - install them TOGETHER with -CleanUp so side-by-side versions cannot conflict:")
+                $instructions.Add("    Install-Module AWS.Tools.Installer -Scope CurrentUser -Force")
+                $instructions.Add("    Install-AWSToolsModule $($awsMods -join ',') -Scope CurrentUser -CleanUp -Force")
+                $instructions.Add("(A plain Install-Module of a single AWS.Tools.* module leaves an older AWS.Tools.Common in place; the exact-version requirement then fails at import and -Force will not fix it.)")
+            }
+            if ($azMods.Count) {
+                $instructions.Add("Azure modules - install all of them in one call, then align Az.Accounts:")
+                $instructions.Add("    Install-Module $($azMods -join ',') -Scope CurrentUser -Force -AllowClobber")
+                $instructions.Add("    Update-Module Az.Accounts")
+                $instructions.Add("(Each Az.<Service> pins an exact Az.Accounts version. If imports still fail, run: Uninstall-Module Az.Accounts -AllVersions, then reinstall.)")
+            }
+            if ($graphMods.Count) {
+                $instructions.Add("Microsoft Graph modules - one call, so they share a matching Authentication version:")
+                $instructions.Add("    Install-Module $($graphMods -join ',') -Scope CurrentUser -Force")
+            }
+            if ($otherMods.Count) {
+                $instructions.Add("To install the remaining PowerShell module(s), run:")
+                $instructions.Add("    Install-Module $($otherMods -join ',') -Scope CurrentUser -Force")
+            }
         }
         if ($missingCommands.Count) {
             $instructions.Add("To install the missing command-line tool(s):")
             foreach ($c in $missingCommands) { $instructions.Add("    $c  ->  $(Get-CVCommandInstallHint $c)") }
         }
         $instructions.Add("Then re-run this script.")
+
+        # Diagnostics for the "I installed it and it still says missing" case: almost always a wrong scope, a
+        # Windows PowerShell 5.1 install, or a sudo/other-user install - none of which were visible before.
+        if ($missingModules.Count) {
+            $instructions.Add("If you believe these are already installed, check WHERE PowerShell is looking:")
+            $instructions.Add("    pwsh $($PSVersionTable.PSVersion) / $($PSVersionTable.PSEdition)")
+            foreach ($mp in @($env:PSModulePath -split [IO.Path]::PathSeparator | Where-Object { $_ })) {
+                $instructions.Add("    PSModulePath: $mp")
+            }
+            foreach ($mm in $missingModules) {
+                $found = @(Get-Module -ListAvailable -Name $mm -ErrorAction SilentlyContinue |
+                            Select-Object -First 3 | ForEach-Object { "$($_.Version) at $($_.ModuleBase)" })
+                if ($found.Count) { $instructions.Add("    $mm found but not usable: $($found -join '; ')") }
+            }
+        }
 
         # Plain output on purpose (a fatal miss may be PwshSpectreConsole itself).
         Write-Host ""

@@ -137,5 +137,100 @@ Assert-CV 'spectre fallback: no throw' $threw $false
 Remove-Item $log -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------
+Write-Host "`n[8] Export-CVCsv never silently drops a column"
+# Export-Csv builds its header from the FIRST object only. Our rows are heterogeneous (Tag_* is flattened per
+# resource; error paths emit a short object), so one untagged first row erased every Tag_ column in the file -
+# which reads as "the tool doesn't collect tags".
+$csv  = [IO.Path]::Combine([IO.Path]::GetTempPath(), "cv-csv-$([guid]::NewGuid().ToString('N').Substring(0,8)).csv")
+$few  = [pscustomobject]@{ Name = 'a'; Type = 'x' }
+$many = [pscustomobject]@{ Name = 'b'; Type = 'x'; Tag_env = 'prod'; StorageGB = 10 }
+$mid  = [pscustomobject]@{ Name = 'c'; Type = 'y' }
+
+@($few, $many) | Export-CVCsv -Path $csv
+$hdr = (Get-Content $csv)[0]
+Assert-CV 'first row with FEWER props keeps later columns' $hdr '"Name","Type","Tag_env","StorageGB"'
+Assert-CV 'all rows written' ((Get-Content $csv).Count) 3
+
+@($few, $many, $mid) | Export-CVCsv -Path $csv
+Assert-CV 'extra property on a MIDDLE row is kept' ((Get-Content $csv)[0]) '"Name","Type","Tag_env","StorageGB"'
+
+@($few, $many) | Export-CVCsv -Path $csv -PreferredOrder @('Type','Name')
+Assert-CV '-PreferredOrder fixes leading column order' ((Get-Content $csv)[0]) '"Type","Name","Tag_env","StorageGB"'
+
+@($few, $many) | Export-CVCsv -Path $csv -PreferredOrder @('Type','NeverPresent','Name')
+Assert-CV 'preferred names absent from all rows are dropped' ((Get-Content $csv)[0]) '"Type","Name","Tag_env","StorageGB"'
+
+@() | Export-CVCsv -Path $csv -PreferredOrder @('Name','Type')
+Assert-CV 'empty input writes a header-only file' ((Get-Content $csv) -join '|') '"Name","Type"'
+
+# Round-trip the values, not just the header.
+@($few, $many) | Export-CVCsv -Path $csv
+$back = Import-Csv $csv
+Assert-CV 'row 1 Tag_env is empty, not missing' ($null -ne $back[0].PSObject.Properties['Tag_env']) $true
+Assert-CV 'row 2 Tag_env survived'              $back[1].Tag_env 'prod'
+Assert-CV 'row 2 StorageGB survived'            $back[1].StorageGB '10'
+Remove-Item $csv -ErrorAction SilentlyContinue
+
+# ---------------------------------------------------------------------------
+Write-Host "`n[9] Runspace workers can log without the parent's functions"
+# The GCP bucket-sizing worker called the parent's Write-Log, which is NOT in scope inside a runspace built from
+# [InitialSessionState]::CreateDefault() - so every bucket whose gsutil du failed threw CommandNotFoundException
+# instead of warning. The fix passes a ConcurrentQueue by argument; this proves that pattern works end to end.
+$log = New-TmpLog
+Initialize-CVConsole -Cloud GCP -LogPath $log -NonInteractive | Out-Null
+$q = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+$worker = {
+    param($queue)
+    function Write-Log { param([string]$Message, [string]$Level = 'INFO') if ($queue) { $queue.Enqueue("[$Level] $Message") } }
+    Write-Log -Level WARN -Message 'gsutil du failed for bucket-a'
+    Write-Log -Level WARN -Message 'gsutil du failed for bucket-b'
+    'done'
+}
+$iss  = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+$pool = [RunspaceFactory]::CreateRunspacePool(1, 1, $iss, $Host); $pool.Open()
+$ps   = [PowerShell]::Create().AddScript($worker).AddArgument($q); $ps.RunspacePool = $pool
+$res  = Get-CVRunspaceResult $ps.EndInvoke($ps.BeginInvoke())
+$ps.Dispose(); $pool.Close(); $pool.Dispose()
+Assert-CV 'worker completed'            $res 'done'
+Assert-CV 'worker enqueued both lines'  $q.Count 2
+$threw = $false
+$drained = 0; $line = $null
+try {
+    while ($q.TryDequeue([ref]$line)) { $drained++; Receive-CVWorkerRecords $line }
+} catch { $threw = $true }
+Assert-CV 'parent drained the queue'    $drained 2
+Assert-CV 'raw strings replay without throwing' $threw $false
+Remove-Item $log -ErrorAction SilentlyContinue
+
+# ---------------------------------------------------------------------------
+Write-Host "`n[10] Multi-line CLI stderr does not garble the terminal"
+# gcloud hard-wraps its PERMISSION_DENIED text, and workers hand that raw string straight to Write-CVLog. A
+# multi-line Write-Host paints several full-width rows; the native progress pane repaints over them but erases
+# only $PSStyle.Progress.MaxWidth (default 120) columns, so the tail of every wrapped row survived on screen and
+# scrolled into history glued onto unrelated lines. Console render must flatten; the log file must not.
+$log = New-TmpLog
+Initialize-CVConsole -Cloud GCP -LogPath $log -NonInteractive | Out-Null
+$gcloudErr = "ERROR: (gcloud.filestore.instances.list) PERMISSION_DENIED: Cloud Filestore API has not been used`n" +
+             "in project pm-ai-agents-customer-demo before or it is disabled.`r`n" +
+             "  Enable it by visiting https://console.developers.google.com/apis/api/file.googleapis.com then retry."
+$out = & { Write-CVLog $gcloudErr -Level Warning -Source 'FS' -Scope @{ Project = 'demo' } } 6>&1 | Out-String
+$rendered = @($out -split "`r?`n" | Where-Object { $_ -match '\[FS\]' })
+Assert-CV 'console: 3-line stderr renders as 1 row' $rendered.Count 1
+Assert-True 'console: head of message kept'   ($rendered[0] -match 'PERMISSION_DENIED')
+Assert-True 'console: tail of message kept'   ($rendered[0] -match 'then retry\.$')
+Assert-True 'console: no interior newline'    ($rendered[0] -notmatch "`r|`n")
+Assert-True 'log: full untruncated text kept' (@(Get-Content $log | Where-Object { $_ -match 'file\.googleapis\.com' }).Count -eq 1)
+Remove-Item $log -ErrorAction SilentlyContinue
+
+# The other half of the fix: the progress pane must erase the full terminal row, not 120 columns of it.
+$before = $PSStyle.Progress.MaxWidth
+$PSStyle.Progress.MaxWidth = 120
+Set-CVProgressWidth
+$want = try { $Host.UI.RawUI.WindowSize.Width } catch { 120 }
+if ($want -ge 18) { Assert-CV 'progress pane erases the full terminal width' $PSStyle.Progress.MaxWidth $want }
+else              { Assert-CV 'narrow/absent RawUI leaves the default alone'  $PSStyle.Progress.MaxWidth 120 }
+$PSStyle.Progress.MaxWidth = $before
+
+# ---------------------------------------------------------------------------
 Write-Host ("`n{0}  {1} passed, {2} failed  {0}" -f ('=' * 6), $script:Pass, $script:Fail) -ForegroundColor ($script:Fail ? 'Red' : 'Green')
 exit ($script:Fail -gt 0 ? 1 : 0)

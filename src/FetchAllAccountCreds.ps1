@@ -69,14 +69,22 @@ if (-not (Test-Path $SizingScript)) {
 
 # Check AWS CLI is available
 if (-not (Get-Command aws -ErrorAction SilentlyContinue)) {
-    Write-Error "AWS CLI not found. Install with: winget install Amazon.AWSCLI"
+    Write-Error "AWS CLI not found. Install it: macOS 'brew install awscli', Linux see https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html, Windows 'winget install Amazon.AWSCLI'."
     exit 1
 }
 
 Write-Host "`n=== Step 1: Get SSO access token ===" -ForegroundColor Cyan
 
-# Find the cached SSO token on disk (aws sso login stores it here)
-$SsoCacheDir = Join-Path $env:USERPROFILE ".aws\sso\cache"
+# Find the cached SSO token on disk (aws sso login stores it here).
+# $env:USERPROFILE is null on macOS/Linux, which made Join-Path throw on a mandatory parameter - and with
+# Set-StrictMode -Version Latest plus $ErrorActionPreference='Stop' above, that killed the script outright, so
+# this file could not run at all off Windows. The literal "\" separator was Windows-only too.
+$UserHome = if ($env:HOME) { $env:HOME } elseif ($env:USERPROFILE) { $env:USERPROFILE } else { $null }
+if (-not $UserHome) {
+    Write-Error "Could not determine the user's home directory (neither HOME nor USERPROFILE is set)."
+    exit 1
+}
+$SsoCacheDir = Join-Path (Join-Path (Join-Path $UserHome '.aws') 'sso') 'cache'
 $SsoToken = $null
 
 if (Test-Path $SsoCacheDir) {
@@ -102,8 +110,9 @@ if (Test-Path $SsoCacheDir) {
 if (-not $SsoToken) {
     Write-Host "No cached SSO token found. Running 'aws sso login'..." -ForegroundColor Yellow
     aws sso login --sso-session default 2>&1
-    # Retry after login — pick the most recently written token file
-    $tokenFiles = Get-ChildItem $SsoCacheDir -Filter "*.json" | Sort-Object LastWriteTime -Descending
+    # Retry after login — pick the most recently written token file. Guarded: if the login failed the cache
+    # directory may still not exist, and an unguarded Get-ChildItem throws under $ErrorActionPreference='Stop'.
+    $tokenFiles = if (Test-Path $SsoCacheDir) { Get-ChildItem $SsoCacheDir -Filter "*.json" | Sort-Object LastWriteTime -Descending } else { @() }
     foreach ($f in $tokenFiles) {
         try {
             $content = Get-Content $f.FullName -Raw | ConvertFrom-Json
@@ -267,25 +276,25 @@ if (-not (Test-Path $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir
 
 # The sizing script relies on uninitialized variables being treated as $null.
 # Disable strict mode for the duration of the call so it runs correctly.
-# Push to OutputDir so the sizing script (which uses Get-Location) writes there.
+# Output location is passed explicitly. The old Push-Location trick relied on the sizing script deriving its
+# output root from Get-Location; it now resolves from its own location or -OutputDirectory, so pushing had
+# stopped working - the CSVs went to the repo Output/ while the search below still looked in $OutputDir and
+# warned "no combined JSON found" on every run.
 Set-StrictMode -Off
-Push-Location $OutputDir
-try {
-    & $SizingScript `
-        -AllLocalProfiles `
-        -ProfileLocation $CredsFile `
-        -Regions $Regions `
-        -OutputFormat $OutputFormat
-} finally {
-    Pop-Location
-}
+& $SizingScript `
+    -AllLocalProfiles `
+    -ProfileLocation $CredsFile `
+    -Regions $Regions `
+    -OutputFormat $OutputFormat `
+    -OutputDirectory $OutputDir
 Set-StrictMode -Version Latest
 
 Write-Host "`n=== Done ===" -ForegroundColor Green
 Write-Host "Output files are in: $OutputDir" -ForegroundColor Green
 
 # Find and display the combined JSON file
-$jsonFiles = Get-ChildItem -Path $OutputDir -Filter "aws_sizing_*.json" -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
+# Recurse: the sizing script writes into <OutputDir>/Output/aws_<timestamp>/, not directly into $OutputDir.
+$jsonFiles = Get-ChildItem -Path $OutputDir -Filter "aws_sizing_*.json" -Recurse -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending
 if ($jsonFiles) {
     Write-Host "Combined JSON report: $($jsonFiles[0].FullName)" -ForegroundColor Cyan
 } else {

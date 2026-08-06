@@ -224,7 +224,8 @@ param(
     [string[]]$Tags,               # limit BOTH passes to resources carrying any of these 'Key=Value' tags. Omitted = all.
     [switch]$SkipCloudRewind,      # skip the Cloud Rewind billable-resource sizing pass
     [ValidateSet('Graph','Arm')][string]$CloudRewindDiscovery = 'Graph', # CR discovery backend; Graph (Resource Graph) auto-falls-back to Arm (Get-AzResource)
-    [switch]$SkipDataProtection    # skip the Data Protection inventory + resilience pass (run Cloud Rewind only)
+    [switch]$SkipDataProtection,   # skip the Data Protection inventory + resilience pass (run Cloud Rewind only)
+    [string]$OutputDirectory       # write Output/ and Logs/ under this root instead of the repo/script location
 )
 
 # Guard: at least one discovery pass must run.
@@ -234,11 +235,29 @@ if ($SkipCloudRewind -and $SkipDataProtection) {
 }
 
 # Load the shared console / diagnostics + resilience + Cloud Rewind layers (src/common/).
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.Console.ps1')
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.Resilience.ps1')
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.Resilience.Azure.ps1')   # Azure control definitions
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.CloudRewind.ps1')        # provider-neutral Cloud Rewind engine
-. (Join-Path $PSScriptRoot 'common' 'CVSizing.CloudRewind.Azure.ps1')  # Azure billable taxonomy + inclusion rules
+# Dot-sourcing a MISSING file is non-terminating, so an incomplete copy used to march on through ~10 cascading
+# CommandNotFoundExceptions, silently skip Assert-CVPreflight, and die mid-inventory with no output. Check first
+# and say exactly what is missing. This block must stay inline - it is the thing that guards dot-sourcing.
+$cvCommonDir = Join-Path $PSScriptRoot 'common'
+$cvRequired  = @(
+    'CVSizing.Console.ps1'            # console / diagnostics / run paths
+    'CVSizing.Resilience.ps1'         # provider-neutral scoring engine
+    'CVSizing.Resilience.Azure.ps1'   # Azure control definitions
+    'CVSizing.Backup.Azure.ps1'       # Azure backup attribution
+    'CVSizing.Metrics.Azure.ps1'      # Azure Monitor metric wrapper
+    'CVSizing.CloudRewind.ps1'        # provider-neutral Cloud Rewind engine
+    'CVSizing.CloudRewind.Azure.ps1'  # Azure billable taxonomy + inclusion rules
+)
+$cvMissing = @($cvRequired | Where-Object { -not (Test-Path -LiteralPath (Join-Path $cvCommonDir $_) -PathType Leaf) })
+if ($cvMissing.Count) {
+    Write-Host "FATAL: the shared layer this script depends on was not found." -ForegroundColor Red
+    Write-Host "Expected under: $cvCommonDir" -ForegroundColor Red
+    $cvMissing | ForEach-Object { Write-Host "  missing: $_" -ForegroundColor Red }
+    Write-Host "This script cannot run standalone. Copy the whole src/ directory (the script AND src/common/)," -ForegroundColor Yellow
+    Write-Host "or clone the repository, and run it from there." -ForegroundColor Yellow
+    exit 1
+}
+foreach ($cvFile in $cvRequired) { . (Join-Path $cvCommonDir $cvFile) }
 
 # AKS Helper Functions
 function Test-KubectlAvailable {
@@ -270,47 +289,19 @@ function Install-Kubectl {
         }
     }
     
-    # Fallback to direct download for non-Cloud Shell environments
-    try {
-        # Get the latest stable version, fallback to v1.28.0 if unavailable
-        $kubectlVersion = "v1.28.0"  # Default fallback
-        try {
-            $latestVersion = Invoke-RestMethod -Uri "https://dl.k8s.io/release/stable.txt" -UseBasicParsing -TimeoutSec 10
-            if ($latestVersion) {
-                $kubectlVersion = $latestVersion.Trim()
-            }
-        } catch {
-            Write-Verbose "Could not get latest version, using fallback: $kubectlVersion"
-        }
-        
-        Write-Host "Installing kubectl via direct download..." -ForegroundColor Cyan
-        if ($IsWindows -or $env:OS -eq 'Windows_NT') {
-            # Windows installation
-            $kubectlUrl = "https://dl.k8s.io/release/$kubectlVersion/bin/windows/amd64/kubectl.exe"
-            $kubectlPath = Join-Path $env:TEMP "kubectl.exe"
-            Invoke-WebRequest -Uri $kubectlUrl -OutFile $kubectlPath -UseBasicParsing -TimeoutSec 30
-            
-            # Add to PATH for current session
-            $env:PATH = "$env:TEMP;$env:PATH"
-            Write-Host "kubectl $kubectlVersion installed to $kubectlPath" -ForegroundColor Green
-            return $true
-        } else {
-            # Linux/macOS installation
-            $kubectlPath = "/tmp/kubectl"
-            $kubectlUrl = "https://dl.k8s.io/release/$kubectlVersion/bin/linux/amd64/kubectl"
-            Invoke-WebRequest -Uri $kubectlUrl -OutFile $kubectlPath -UseBasicParsing -TimeoutSec 30
-            chmod +x $kubectlPath
-            
-            # Add to PATH for current session
-            $env:PATH = "/tmp:$env:PATH"
-            Write-Host "kubectl $kubectlVersion installed to $kubectlPath" -ForegroundColor Green
-            return $true
-        }
-    } catch {
-        Write-Warning "Failed to install kubectl: $($_.Exception.Message)"
-        Write-Host "In Azure Cloud Shell, kubectl should be pre-installed. Try running: az aks install-cli" -ForegroundColor Yellow
-        return $false
+    # Fallback to direct download. Delegated to common/CVSizing.Kubectl.ps1, which resolves BOTH the OS and the
+    # architecture at runtime. The previous code here always fetched bin/linux/amd64/kubectl into a hardcoded
+    # /tmp/kubectl for every non-Windows host, so on macOS it wrote a Linux ELF binary, chmod +x succeeded, and
+    # every later kubectl call failed with an exec-format error. It was also wrong on any arm64 host.
+    Write-Host "Installing kubectl via direct download..." -ForegroundColor Cyan
+    $k = Install-CVKubectl
+    if ($k.Installed) {
+        Write-Host "kubectl ready at $($k.Path) [$($k.Platform), $($k.Source)]" -ForegroundColor Green
+        return $true
     }
+    Write-Warning "Failed to install kubectl for $($k.Platform): $($k.Error)"
+    Write-Host "In Azure Cloud Shell, kubectl should be pre-installed. Try running: az aks install-cli" -ForegroundColor Yellow
+    return $false
 }
 
 function Convert-KubernetesQuantity {
@@ -523,9 +514,21 @@ $ResourceTypeMap = @{
     "COSMOS"         = "CosmosDBs"
     "AKS"            = "AKSClusters"
     "BACKUP"         = "BackupItems"
-    "UNMANAGEDISKS"  = "UnmanagedDisks"
+    "UNMANAGEDDISKS" = "UnmanagedDisks"
     "AVS"            = "AVSClusters"
-}  
+}
+
+# Back-compat: the canonical key was misspelled "UNMANAGEDISKS" (one D), so the documented `-Types UnmanagedDisks`
+# was rejected and the error message named the very spelling that failed - only the typo worked. Both are accepted
+# now and normalized to the canonical key below.
+$TypeAliases = @{
+    "UNMANAGEDISKS"   = "UNMANAGEDDISKS"
+    "UNMANAGEDDISK"   = "UNMANAGEDDISKS"
+    "DISKS"           = "UNMANAGEDDISKS"
+    "RECOVERYSERVICES" = "BACKUP"
+    "FILESHARES"      = "FILESHARE"
+    "VMS"             = "VM"
+}
 
 # Environment tag filter helper — returns $true if resource should be included
 function Test-EnvTagMatch {
@@ -539,23 +542,26 @@ function Test-EnvTagMatch {
   
 # Normalize types  
 if ($Types) {  
-    $Types = $Types | ForEach-Object { $_.Trim().ToUpper() }  
-    $Selected = @{}  
+    $Types = $Types | ForEach-Object { $_.Trim().ToUpper() }
+    $Selected = @{}
     $invalidTypes = @()
-    foreach ($t in $Types) {  
-        if ($ResourceTypeMap.ContainsKey($t)) { 
-            $Selected[$t] = $true 
+    foreach ($t in $Types) {
+        $key = if ($TypeAliases.ContainsKey($t)) { $TypeAliases[$t] } else { $t }
+        if ($ResourceTypeMap.ContainsKey($key)) {
+            $Selected[$key] = $true
         } else {
             $invalidTypes += $t
         }
-    }  
-    if ($invalidTypes.Count -gt 0) {
-        Write-Host "Invalid type(s) specified: $($invalidTypes -join ', '). Valid types are: VM, Storage, FileShare, NetApp, SQL, Cosmos, AKS, Backup, UnmanagedDisks, AVS" -ForegroundColor Red
     }
-    if ($Selected.Count -eq 0) {  
-        Write-Host "No valid -Types specified. Use: VM, Storage, FileShare, NetApp, SQL, Cosmos, AKS, Backup, UnmanagedDisks, AVS" -ForegroundColor Red
-        exit 1  
-    }  
+    # The valid-values text is generated from the map so it can never again advertise a spelling the code rejects.
+    $validTypeList = ($ResourceTypeMap.Keys | Sort-Object) -join ', '
+    if ($invalidTypes.Count -gt 0) {
+        Write-Host "Invalid type(s) specified: $($invalidTypes -join ', '). Valid types are: $validTypeList" -ForegroundColor Red
+    }
+    if ($Selected.Count -eq 0) {
+        Write-Host "No valid -Types specified. Use: $validTypeList" -ForegroundColor Red
+        exit 1
+    }
 } else {  
     $Selected = @{}  
     $ResourceTypeMap.Keys | ForEach-Object { $Selected[$_] = $true }  
@@ -592,7 +598,7 @@ if ($Selected.AKS) {
 # Output Directory and Logging
 $dateStr = Get-Date -Format "yyyy-MM-dd_HHmmss"  
 # Resolve this run's Output/ and Logs/ directories at the repo top level (or CWD when run outside the repo).
-$runPaths = Initialize-CVRunPaths -Cloud 'Azure' -TimeStamp $dateStr -StartPath $PSScriptRoot
+$runPaths = Initialize-CVRunPaths -Cloud 'Azure' -TimeStamp $dateStr -StartPath $PSScriptRoot -OutputRoot $OutputDirectory
 $outdir = $runPaths.OutputDir  
 New-Item -ItemType Directory -Force -Path $outdir | Out-Null
 
@@ -626,6 +632,11 @@ Initialize-CVConsole -Cloud Azure -Title 'Azure Resource Inventory' `
                      -NonInteractive:$NonInteractive -Quiet:$Quiet | Out-Null
 if ($Types)         { Write-CVLog "Types: $($Types -join ', ')" -Level Info -Source 'Init' }
 if ($Subscriptions) { Write-CVLog "Subscriptions: $($Subscriptions -join ', ')" -Level Info -Source 'Init' }
+
+# Everything below runs inside a top-level handler. Without one, an unhandled terminating error produced no run
+# summary, no diagnostics and no Stop-Transcript - the user saw a raw stack trace and no indication of what had
+# already been collected. (AWS has had this; Azure and GCP did not.)
+try {
 
 # Helper function to determine if a storage account supports Azure Files
 function Get-AzureFileSAs {
@@ -753,14 +764,24 @@ $subIdx = 0
 # coverage) so only the Cloud Rewind pass below runs. DP arrays stay empty; downstream DP CSV/summary/JSON
 # exports are guarded by $Selected/.Count and no-op. (Cloud Rewind has its own subscription loop.)
 if (-not $SkipDataProtection) {
-$savedEAP = $ErrorActionPreference   # restored after the loop so the per-iteration "Stop" below does not leak to post-loop code
+$savedEAP = $ErrorActionPreference   # restored in the finally below so the per-iteration "Stop" cannot leak out
+try {
 foreach ($sub in $subs) {
     $subIdx++
     Write-Progress -Id 1 -Activity "Processing Azure Subscriptions" -Status "Subscription $subIdx of $($subs.Count): $($sub.Name)" -PercentComplete (($subIdx / $subs.Count) * 100)
 
     $ErrorActionPreference = "Stop"
-    Set-AzContext -SubscriptionId $sub.Id | Out-Null
-  
+    # Unguarded under "Stop", one inaccessible subscription aborted the ENTIRE loop - skipping every remaining
+    # subscription and, because the abort escaped past the export section, producing no CSVs, no JSON, no ZIP and
+    # no Stop-Transcript. Mark this subscription's signals uncollected and move to the next one.
+    try {
+        Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop | Out-Null
+    } catch {
+        foreach ($sig in @('BACKUP','SNAPSHOT')) { Set-CVCollectionStatus -Scope $sub.Name -Signal $sig -Status Failed }
+        Write-CVLog "Could not select subscription - skipping it: $($_.Exception.Message)" -Level Error -Source 'Auth' -Scope @{ Subscription = $sub.Name; Category = 'ContextFailed' }
+        continue
+    }
+
     # VMs  
     # ---------------------------------------------------------------
     # ENVIRONMENT TAG FILTER: log filter status once per subscription
@@ -842,23 +863,28 @@ foreach ($sub in $subs) {
                     PowerState     = ($vm.Statuses | Where-Object Code -like 'PowerState/*' | Select-Object -First 1 -ExpandProperty DisplayStatus)
                     DiskCount      = $diskCount
                     VMDiskSizeGB   = $totalDiskSizeGB
-                    # Protection coverage - defaults here so every row has the same columns;
-                    # populated by the enrichment pass once all subscriptions are processed.
-                    BackupEnabled    = $false
-                    BackupCount      = 0
-                    LastBackupTime   = ''
+                    # Protection coverage - $null, NOT $false. These are placeholders until the enrichment pass
+                    # runs, and $false is a scored Gap: initializing to it meant any failure to collect backup
+                    # data was reported as an affirmative "this VM is not protected".
+                    BackupEnabled    = $null
+                    BackupCount      = $null
+                    LastBackupTimeUtc = ''
                     BackupPolicy     = ''
-                    SnapshotsEnabled = $false
-                    SnapshotCount    = 0
-                    SnapshotSizeTB   = 0   # TB only - the sizing spreadsheet takes TB; mixed units invite copy/paste errors
+                    SnapshotsEnabled = $null
+                    SnapshotCount    = $null
+                    SnapshotSourceDiskTB = $null   # TB only - the sizing spreadsheet takes TB; mixed units invite copy/paste errors
                 }
-                # Remember this VM's managed-disk IDs so snapshots can be attributed back to it.
+                # Remember this VM's managed-disk IDs so snapshots can be attributed back to it. Keyed WITH the
+                # resource group: two VMs may share a name across resource groups, and the previous key omitted
+                # it, so the second VM overwrote the first and the first lost all its snapshots.
                 $vmDiskIds = @()
                 if ($vm.StorageProfile.OsDisk.ManagedDisk.Id) { $vmDiskIds += $vm.StorageProfile.OsDisk.ManagedDisk.Id }
                 foreach ($dd in $vm.StorageProfile.DataDisks) {
                     if ($dd.ManagedDisk.Id) { $vmDiskIds += $dd.ManagedDisk.Id }
                 }
-                $VMDiskIdMap["$($sub.Name)|$($vm.Name)".ToLower()] = $vmDiskIds
+                $vmDiskKey = Get-CVAzureBackupKey -Subscription $sub.Name -ResourceGroup $vm.ResourceGroupName -Name $vm.Name
+                if ($VMDiskIdMap.ContainsKey($vmDiskKey)) { $VMDiskIdMap[$vmDiskKey] = @($VMDiskIdMap[$vmDiskKey]) + $vmDiskIds }
+                else                                      { $VMDiskIdMap[$vmDiskKey] = $vmDiskIds }
                 if ($vm.Tags) { $vm.Tags.GetEnumerator() | ForEach-Object { $vmObj["Tag_$($_.Key)"] = $_.Value } }
                 $VMs += [PSCustomObject]$vmObj
             }
@@ -869,19 +895,31 @@ foreach ($sub in $subs) {
         }  
     }  
     # Managed-disk snapshots: listed once per subscription, attributed to VMs after the loop.
-    if ($Selected.VM) {
+    if (-not $Selected.VM) {
+        Set-CVCollectionStatus -Scope $sub.Name -Signal SNAPSHOT -Status Skipped
+    } else {
         try {
             foreach ($snap in @(Get-AzSnapshot -ErrorAction Stop)) {
                 if (-not $snap) { continue }
                 $AzSnapshots += [PSCustomObject]@{
-                    Subscription = $sub.Name
-                    SourceDiskId = $snap.CreationData.SourceResourceId
-                    DiskSizeGB   = [double]$snap.DiskSizeGB
-                    TimeCreated  = $snap.TimeCreated
+                    Subscription     = $sub.Name
+                    SnapshotName     = $snap.Name
+                    ResourceGroup    = $snap.ResourceGroupName
+                    Region           = $snap.Location
+                    SourceDiskId     = $snap.CreationData.SourceResourceId
+                    # The PROVISIONED size of the source disk, not the snapshot's own consumed bytes - Azure
+                    # exposes no consumed-bytes property for incremental snapshots. Named accordingly so the
+                    # column cannot be mistaken for billable snapshot capacity.
+                    SourceDiskSizeGB = [double]$snap.DiskSizeGB
+                    Incremental      = [bool]$snap.Incremental
+                    TimeCreated      = $snap.TimeCreated
                 }
             }
+            Set-CVCollectionStatus -Scope $sub.Name -Signal SNAPSHOT -Status Ok
         } catch {
-            Write-CVLog "Could not list managed-disk snapshots: $($_.Exception.Message)" -Level Warning -Source 'Snapshot' -Scope @{ Subscription = $sub.Name }
+            # A failed listing is not "no snapshots" - leave it Unknown so no disk is scored as uncovered.
+            Set-CVCollectionStatus -Scope $sub.Name -Signal SNAPSHOT -Status Failed
+            Write-CVLog "Could not list managed-disk snapshots - snapshot coverage will report Unknown, not zero: $($_.Exception.Message)" -Level Warning -Source 'Snapshot' -Scope @{ Subscription = $sub.Name }
         }
     }
 
@@ -900,43 +938,67 @@ foreach ($sub in $subs) {
                         $saPercentComplete = [math]::Round(($saCount / $accounts.Count) * 100, 1)
                         Write-Progress -Id 3 -ParentId 1 -Activity "Processing Storage Account Metrics" -Status "Processing Storage Account $saCount of $($accounts.Count) - $saPercentComplete% complete" -PercentComplete $saPercentComplete
                         try {
-                            # Use Get-AzMetric to get detailed storage account metrics
+                        # Storage capacity metrics. BlobCapacity/BlobCount/ContainerCount are DAILY metrics with
+                        # ingestion lag, and this used to request a ONE HOUR window - so the query usually returned
+                        # no datapoints and the resulting 0 was reported as a measured empty account. Every
+                        # capacity column read 0. Get-CVAzMetricValue widens the window and, critically,
+                        # distinguishes "no datapoint" ($null) from a measured zero.
                         $resourceId = $sa.Id
-                        $metrics = @("BlobCapacity", "ContainerCount", "BlobCount")
-                        $containerCount = 0
-                        $blobCount = 0
-                        $blobCapacity = 0
-                        
-                        try {
-                            $blobMetrics = Get-AzMetric -ResourceId "$resourceId/blobServices/default" -MetricName $metrics -AggregationType Maximum -StartTime (Get-Date).AddHours(-1) -WarningAction SilentlyContinue
-                            $containerCount = ($blobMetrics | Where-Object { $_.id -like "*ContainerCount" }).Data.Maximum | Select-Object -Last 1
-                            $blobCount = ($blobMetrics | Where-Object { $_.id -like "*BlobCount" }).Data.Maximum | Select-Object -Last 1
-                            $blobCapacity = ($blobMetrics | Where-Object { $_.id -like "*BlobCapacity" }).Data.Maximum | Select-Object -Last 1
-                        } catch {
-                            Write-CVLog "Error getting blob metrics: $($_.Exception.Message)" -Level Warning -Source 'Storage' -Scope @{ Subscription = $sub.Name; StorageAccount = $sa.StorageAccountName }
+                        $blobRes = Get-CVAzMetricValueSet -ResourceId "$resourceId/blobServices/default" `
+                                        -MetricName @('BlobCapacity','ContainerCount','BlobCount')
+                        $acctRes = Get-CVAzMetricValueSet -ResourceId $resourceId `
+                                        -MetricName @('UsedCapacity')
+
+                        $blobCapacity   = $blobRes['BlobCapacity'].Value
+                        $containerCount = $blobRes['ContainerCount'].Value
+                        $blobCount      = $blobRes['BlobCount'].Value
+                        # Account-level UsedCapacity spans blob+file+table+queue. The old code assigned the BLOB
+                        # figure to both UsedCapacity* and UsedBlobCapacity*, so ten columns carried two numbers.
+                        $usedCapacity   = $acctRes['UsedCapacity'].Value
+                        if ($null -eq $usedCapacity) { $usedCapacity = $blobCapacity }   # fall back, still may be $null
+
+                        foreach ($m in @('BlobCapacity','ContainerCount','BlobCount')) {
+                            if ($blobRes[$m].Status -eq 'Error') {
+                                Write-CVLog "Storage metric $m unavailable: reported as Unknown, not zero." -Level Warning -Source 'Storage' `
+                                            -Scope @{ Subscription = $sub.Name; StorageAccount = $sa.StorageAccountName; Category = 'MetricError' }
+                            }
                         }
-                        
+
+                        # Null-safe scaling: $null in must stay $null out, so an unmeasured account never
+                        # contributes a fabricated 0 to the sizing totals.
+                        $scale = { param($bytes, $divisor, $round) if ($null -eq $bytes) { $null } else { [math]::Round(($bytes / $divisor), $round) } }
+
                         $azSAObj = [ordered] @{}
                         $azSAObj.Add("StorageAccount",$sa.StorageAccountName)
                         $azSAObj.Add("StorageAccountType",$sa.Kind)
                         $azSAObj.Add("HNSEnabled(ADLSGen2)",$sa.EnableHierarchicalNamespace)
                         $azSAObj.Add("StorageAccountSkuName",$sa.Sku.Name)
+                        $azSAObj.Add("StorageAccountSkuTier",$sa.Sku.Tier)
                         $azSAObj.Add("StorageAccountAccessTier",$sa.AccessTier)
                         $azSAObj.Add("Subscription",$sub.Name)
                         $azSAObj.Add("Region",$sa.PrimaryLocation)
+                        $azSAObj.Add("SecondaryRegion",$sa.SecondaryLocation)
                         $azSAObj.Add("ResourceGroup",$sa.ResourceGroupName)
-                        $azSAObj.Add("UsedCapacityBytes",$blobCapacity)
-                        $azSAObj.Add("UsedCapacityGiB",[math]::round(($blobCapacity / 1073741824), 0))
-                        $azSAObj.Add("UsedCapacityTiB",[math]::round(($blobCapacity / 1073741824 / 1024), 4))
-                        $azSAObj.Add("UsedCapacityGB",[math]::round(($blobCapacity / 1000000000), 3))
-                        $azSAObj.Add("UsedCapacityTB",[math]::round(($blobCapacity / 1000000000000), 4))
+                        $azSAObj.Add("CreationTime",$sa.CreationTime)
+                        $azSAObj.Add("MinimumTlsVersion",$sa.MinimumTlsVersion)
+                        $azSAObj.Add("AllowSharedKeyAccess",$sa.AllowSharedKeyAccess)
+                        $azSAObj.Add("ImmutableStorageWithVersioning",$sa.ImmutableStorageWithVersioning.Enabled)
+                        $azSAObj.Add("UsedCapacityBytes",$usedCapacity)
+                        $azSAObj.Add("UsedCapacityGiB",(& $scale $usedCapacity 1073741824 0))
+                        $azSAObj.Add("UsedCapacityTiB",(& $scale $usedCapacity 1099511627776 4))
+                        $azSAObj.Add("UsedCapacityGB",(& $scale $usedCapacity 1000000000 3))
+                        $azSAObj.Add("UsedCapacityTB",(& $scale $usedCapacity 1000000000000 4))
                         $azSAObj.Add("UsedBlobCapacityBytes",$blobCapacity)
-                        $azSAObj.Add("UsedBlobCapacityGiB",[math]::round(($blobCapacity / 1073741824), 0))
-                        $azSAObj.Add("UsedBlobCapacityTiB",[math]::round(($blobCapacity / 1073741824 / 1024), 4))
-                        $azSAObj.Add("UsedBlobCapacityGB",[math]::round(($blobCapacity / 1000000000), 3))
-                        $azSAObj.Add("UsedBlobCapacityTB",[math]::round(($blobCapacity / 1000000000000), 4))
+                        $azSAObj.Add("UsedBlobCapacityGiB",(& $scale $blobCapacity 1073741824 0))
+                        $azSAObj.Add("UsedBlobCapacityTiB",(& $scale $blobCapacity 1099511627776 4))
+                        $azSAObj.Add("UsedBlobCapacityGB",(& $scale $blobCapacity 1000000000 3))
+                        $azSAObj.Add("UsedBlobCapacityTB",(& $scale $blobCapacity 1000000000000 4))
                         $azSAObj.Add("BlobContainerCount",$containerCount)
                         $azSAObj.Add("BlobCount",$blobCount)
+                        $azSAObj.Add("CapacityMetricStatus",$blobRes['BlobCapacity'].Status)
+                        # Storage was the only collection with no tag flattening, so -Tags/reporting by tag never
+                        # worked for it. Matches the VM and disk idiom.
+                        if ($sa.Tags) { $sa.Tags.GetEnumerator() | ForEach-Object { $azSAObj["Tag_$($_.Key)"] = $_.Value } }
                         $StorageAccounts += New-Object -TypeName PSObject -Property $azSAObj
                     } catch {
                         Write-CVLog "Error getting storage metrics: $($_.Exception.Message)" -Level Warning -Source 'Storage' -Scope @{ Subscription = $sub.Name; StorageAccount = $sa.StorageAccountName }
@@ -1092,8 +1154,9 @@ foreach ($sub in $subs) {
                                     # Get usage metric (LogicalSize)
                                     $usedBytes = 0
                                     try {
-                                        # Use ResourceId approach
-                                        $metric = Get-AzMetric -ResourceId $vol.Id -StartTime (Get-Date).AddHours(-1) -MetricName "VolumeLogicalSize" -AggregationType Average -WarningAction SilentlyContinue
+                                        # 48h window, not 1h: a quiet volume can easily have no datapoint in the
+                                        # last hour, and the 0 that produced was reported as measured usage.
+                                        $metric = Get-AzMetric -ResourceId $vol.Id -StartTime (Get-Date).ToUniversalTime().AddHours(-(Get-CVAzMetricWindowHours 'VolumeLogicalSize')) -MetricName "VolumeLogicalSize" -AggregationType Average -WarningAction SilentlyContinue
                                         
                                         if ($metric.Data -and $metric.Data.Count -gt 0) {
                                             $usedBytes = $metric.Data[-1].Average
@@ -1170,8 +1233,9 @@ foreach ($sub in $subs) {
                         $storageAllocatedTiBBinary = 0
                         
                         try {
-                            # Get storage usage metrics from Azure Monitor - using shorter time window for efficiency
-                            $storageMetrics = Get-AzMetric -ResourceId $sqlMI.Id -StartTime (Get-Date).AddHours(-1) -MetricNames @("storage_space_used_mb") -AggregationType Maximum -WarningAction SilentlyContinue
+                            # 48h window: a 1h window returned no datapoints often enough that used-storage
+                            # reported 0 for instances that were simply idle.
+                            $storageMetrics = Get-AzMetric -ResourceId $sqlMI.Id -StartTime (Get-Date).ToUniversalTime().AddHours(-(Get-CVAzMetricWindowHours 'storage_space_used_mb')) -MetricNames @("storage_space_used_mb") -AggregationType Maximum -WarningAction SilentlyContinue
                             
                             if ($storageMetrics) {
                                 foreach ($metric in $storageMetrics) {
@@ -1328,6 +1392,14 @@ foreach ($sub in $subs) {
                         $sqlObj.Add("InstanceType", $sqlDB.SkuName)
                         $sqlObj.Add("MaxSizeGiB", [math]::Round(($sqlDB.MaxSizeBytes / 1073741824), 0))
                         $sqlObj.Add("MaxSizeGB", [math]::Round(($sqlDB.MaxSizeBytes / 1000000000), 3))
+                        # Elastic pools: a pooled database reports the POOL's max size, so summing MaxSizeGB across
+                        # databases counted the same pool once per database. ElasticPoolName lets the summaries
+                        # exclude pooled DBs from size totals instead of multiplying them.
+                        $sqlObj.Add("ElasticPoolName", $sqlDB.ElasticPoolName)
+                        $sqlObj.Add("IsPooled", [bool]$sqlDB.ElasticPoolName)
+                        $sqlObj.Add("ZoneRedundant", $sqlDB.ZoneRedundant)
+                        $sqlObj.Add("BackupStorageRedundancy", $sqlDB.CurrentBackupStorageRedundancy)
+                        $sqlObj.Add("SkuCapacity", $sqlDB.Capacity)
                         $sqlObj.Add("Region", $sqlDB.Location)
                         $sqlObj.Add("DatabaseId", $sqlDB.DatabaseId)
                         $sqlObj.Add("Status", $sqlDB.Status)
@@ -1336,8 +1408,9 @@ foreach ($sub in $subs) {
                         $allocatedVal = $null
                         $usedVal = $null
                         try {
-                            # Single call for both metrics reduces API calls and keeps timing/aggregation identical
-                            $metrics = Get-AzMetric -ResourceId $sqlDB.ResourceId -MetricNames @("allocated_data_storage","storage") -AggregationType Maximum -StartTime (Get-Date).AddHours(-1) -WarningAction SilentlyContinue
+                            # Single call for both metrics reduces API calls and keeps timing/aggregation identical.
+                            # 48h window - the comment below used to claim 24h while the code asked for 1h.
+                            $metrics = Get-AzMetric -ResourceId $sqlDB.ResourceId -MetricNames @("allocated_data_storage","storage") -AggregationType Maximum -StartTime (Get-Date).ToUniversalTime().AddHours(-(Get-CVAzMetricWindowHours 'storage')) -WarningAction SilentlyContinue
 
                             # Map returned metrics back to the named variables for compatibility with existing logic
                             $allocatedMetric = $null
@@ -1377,6 +1450,17 @@ foreach ($sub in $subs) {
                             $percentUsed = [math]::Round((($usedBytes / [double]$sqlDB.MaxSizeBytes) * 100), 2)
                         }
                         $sqlObj.Add("PercentUsed", $percentUsed)
+
+                        # SizingGB is what the summaries total. Prefer what the database ACTUALLY uses; fall back
+                        # to allocated, then provisioned max. SizeBasis states which was used so the spreadsheet
+                        # never silently mixes "consumed" with "provisioned ceiling" - the summaries used to sum
+                        # MaxSizeGB even though Utilized_GB was collected right here.
+                        $sizingGB = $null; $sizeBasis = 'None'
+                        if ($null -ne $usedBytes)                       { $sizingGB = [math]::Round($usedBytes / 1000000000, 3);      $sizeBasis = 'Utilized' }
+                        elseif ($null -ne $allocatedBytes)              { $sizingGB = [math]::Round($allocatedBytes / 1000000000, 3); $sizeBasis = 'Allocated' }
+                        elseif ($null -ne $sqlDB.MaxSizeBytes)          { $sizingGB = [math]::Round($sqlDB.MaxSizeBytes / 1000000000, 3); $sizeBasis = 'ProvisionedMax' }
+                        $sqlObj.Add("SizingGB", $sizingGB)
+                        $sqlObj.Add("SizeBasis", $sizeBasis)
 
                         # STR / LTR policies (best-effort; master & some instance types may not support)
                         try {
@@ -1509,7 +1593,7 @@ foreach ($sub in $subs) {
                             
                             # Storage Used
                             try {
-                                $storageUsedMetric = (Get-AzMetric -WarningAction SilentlyContinue -ResourceId $id -MetricName storage_used -AggregationType Maximum -StartTime (Get-Date).AddHours(-1)).Data.Maximum | Select-Object -Last 1
+                                $storageUsedMetric = (Get-CVAzMetricValue -ResourceId $id -MetricName storage_used -AggregationType Maximum).Value
                                 if ($storageUsedMetric) {
                                     $storageUsedMB = [math]::Round($storageUsedMetric / (1024 * 1024), 2)  # Convert bytes to MB
                                     $storageUsedGB = [math]::Round($storageUsedMetric / (1024 * 1024 * 1024), 4)  # Convert bytes to GB
@@ -1528,7 +1612,7 @@ foreach ($sub in $subs) {
                             
                             # Storage Percent
                             try {
-                                $storagePercentMetric = (Get-AzMetric -WarningAction SilentlyContinue -ResourceId $id -MetricName storage_percent -AggregationType Maximum -StartTime (Get-Date).AddHours(-1)).Data.Maximum | Select-Object -Last 1
+                                $storagePercentMetric = (Get-CVAzMetricValue -ResourceId $id -MetricName storage_percent -AggregationType Maximum).Value
                                 $mysqlObj.Add("StoragePercent", $storagePercentMetric)
                             } catch {
                                 $mysqlObj.Add("StoragePercent", $null)
@@ -1655,7 +1739,7 @@ foreach ($sub in $subs) {
                             
                             # Storage Used
                             try {
-                                $storageUsedMetric = (Get-AzMetric -WarningAction SilentlyContinue -ResourceId $id -MetricName storage_used -AggregationType Maximum -StartTime (Get-Date).AddHours(-1)).Data.Maximum | Select-Object -Last 1
+                                $storageUsedMetric = (Get-CVAzMetricValue -ResourceId $id -MetricName storage_used -AggregationType Maximum).Value
                                 $storageUsedGB = if ($storageUsedMetric -ne $null) { [math]::Round($storageUsedMetric / 1000000000, 4) } else { $null }
                                 $postgresObj.Add("StorageUsedGB", $storageUsedGB)
                             } catch {
@@ -1664,7 +1748,7 @@ foreach ($sub in $subs) {
                             
                             # Storage Percent
                             try {
-                                $storagePercentMetric = (Get-AzMetric -WarningAction SilentlyContinue -ResourceId $id -MetricName storage_percent -AggregationType Maximum -StartTime (Get-Date).AddHours(-1)).Data.Maximum | Select-Object -Last 1
+                                $storagePercentMetric = (Get-CVAzMetricValue -ResourceId $id -MetricName storage_percent -AggregationType Maximum).Value
                                 $postgresObj.Add("StoragePercent", $storagePercentMetric)
                             } catch {
                                 $postgresObj.Add("StoragePercent", $null)
@@ -1759,7 +1843,7 @@ foreach ($sub in $subs) {
                         
                         # Document Count
                         try {
-                            $documentCountMetric = (Get-AzMetric -WarningAction SilentlyContinue -ResourceId $id -MetricName DocumentCount -AggregationType Maximum -StartTime (Get-Date).AddHours(-1)).Data.Maximum | Select-Object -Last 1
+                            $documentCountMetric = (Get-CVAzMetricValue -ResourceId $id -MetricName DocumentCount -AggregationType Maximum).Value
                             $cosmosObj.Add("DocumentCount", $documentCountMetric)
                         } catch {
                             $cosmosObj.Add("DocumentCount", $null)
@@ -1767,7 +1851,7 @@ foreach ($sub in $subs) {
                         
                         # Data Usage
                         try {
-                            $dataUsageMetric = (Get-AzMetric -WarningAction SilentlyContinue -ResourceId $id -MetricName DataUsage -AggregationType Maximum -StartTime (Get-Date).AddHours(-1)).Data.Maximum | Select-Object -Last 1
+                            $dataUsageMetric = (Get-CVAzMetricValue -ResourceId $id -MetricName DataUsage -AggregationType Maximum).Value
                             $cosmosObj.Add("DataUsage", $dataUsageMetric)
                             # Convert DataUsage from bytes to GB
                             $dataUsageGB = if ($dataUsageMetric -ne $null -and $dataUsageMetric -ne '') { [math]::Round($dataUsageMetric / 1000000000, 4) } else { $null }
@@ -1779,7 +1863,7 @@ foreach ($sub in $subs) {
                         
                         # Physical Partition Size Info
                         try {
-                            $partitionSizeMetric = (Get-AzMetric -WarningAction SilentlyContinue -ResourceId $id -MetricName PhysicalPartitionSizeInfo -AggregationType Maximum -StartTime (Get-Date).AddHours(-1)).Data.Maximum | Select-Object -Last 1
+                            $partitionSizeMetric = (Get-CVAzMetricValue -ResourceId $id -MetricName PhysicalPartitionSizeInfo -AggregationType Maximum).Value
                             $cosmosObj.Add("PhysicalPartitionSizeInfo", $partitionSizeMetric)
                         } catch {
                             $cosmosObj.Add("PhysicalPartitionSizeInfo", $null)
@@ -1787,7 +1871,7 @@ foreach ($sub in $subs) {
                         
                         # Physical Partition Count
                         try {
-                            $partitionCountMetric = (Get-AzMetric -WarningAction SilentlyContinue -ResourceId $id -MetricName PhysicalPartitionCount -AggregationType Maximum -StartTime (Get-Date).AddHours(-1)).Data.Maximum | Select-Object -Last 1
+                            $partitionCountMetric = (Get-CVAzMetricValue -ResourceId $id -MetricName PhysicalPartitionCount -AggregationType Maximum).Value
                             $cosmosObj.Add("PhysicalPartitionCount", $partitionCountMetric)
                         } catch {
                             $cosmosObj.Add("PhysicalPartitionCount", $null)
@@ -1795,7 +1879,7 @@ foreach ($sub in $subs) {
                         
                         # Index Usage
                         try {
-                            $indexUsageMetric = (Get-AzMetric -WarningAction SilentlyContinue -ResourceId $id -MetricName IndexUsage -AggregationType Maximum -StartTime (Get-Date).AddHours(-1)).Data.Maximum | Select-Object -Last 1
+                            $indexUsageMetric = (Get-CVAzMetricValue -ResourceId $id -MetricName IndexUsage -AggregationType Maximum).Value
                             $cosmosObj.Add("IndexUsage", $indexUsageMetric)
                         } catch {
                             $cosmosObj.Add("IndexUsage", $null)
@@ -1925,44 +2009,103 @@ foreach ($sub in $subs) {
     # ---------------------------------------------------------------
     # BACKUP COVERAGE (Azure Backup / Recovery Services Vaults)
     # ---------------------------------------------------------------
-    if ($Selected.BACKUP) {
+    if (-not $Selected.BACKUP) {
+        # Not requested. Recorded so VM rows report backup coverage as Unknown rather than a scored gap.
+        Set-CVCollectionStatus -Scope $sub.Name -Signal BACKUP -Status Skipped
+    } else {
+        # Get-AzRecoveryServicesBackupItem has three parameter sets, and the DEFAULT (GetItemsForContainer)
+        # requires -Container. Passing only -WorkloadType therefore bound to that default with a mandatory
+        # parameter missing: non-interactively it threw, interactively it PROMPTED and hung. The vault-wide set
+        # needs BOTH -BackupManagementType and -WorkloadType, so these pairs are mandatory, not optional extras.
+        # Verified against Az.RecoveryServices 7.13.0 ValidateSets:
+        #   WorkloadType         : AzureVM, AzureFiles, MSSQL, FileFolder, SAPHanaDatabase, AzureSQLDatabase
+        #   BackupManagementType : AzureVM, MAB, AzureStorage, AzureWorkload, AzureSQL
+        # 'AzureStorage' used to be passed as a WorkloadType, which is not valid - it is a BackupManagementType,
+        # and the matching workload is AzureFiles. Azure Files backups were never collected at all.
+        $backupWorkloads = @(
+            @{ Mgmt = 'AzureVM';       Workload = 'AzureVM' }
+            @{ Mgmt = 'AzureStorage';  Workload = 'AzureFiles' }
+            @{ Mgmt = 'AzureWorkload'; Workload = 'MSSQL' }
+            @{ Mgmt = 'AzureWorkload'; Workload = 'SAPHanaDatabase' }
+            @{ Mgmt = 'MAB';           Workload = 'FileFolder' }
+            @{ Mgmt = 'AzureSQL';      Workload = 'AzureSQLDatabase' }
+        )
         try {
             Write-Host "Processing Azure Backup coverage in subscription $($sub.Name)" -ForegroundColor Green
-            $vaults = Get-AzRecoveryServicesVault -ErrorAction SilentlyContinue
-            if ($vaults) {
-                foreach ($vault in $vaults) {
+
+            # Vault discovery. A subscription-scope list needs read at subscription scope; under resource-group
+            # scoped RBAC it returns 403, which used to be swallowed by -ErrorAction SilentlyContinue and then
+            # reported as the confident "No Recovery Services vaults found". Distinguish the two, and fall back
+            # to per-resource-group enumeration so a scoped caller still gets their data.
+            $vaults = @()
+            $vaultListOk = $false
+            try {
+                $vaults = @(Get-AzRecoveryServicesVault -ErrorAction Stop)
+                $vaultListOk = $true
+            } catch {
+                Write-CVLog "Subscription-scope vault listing failed; retrying per resource group. Grant Microsoft.RecoveryServices/vaults/read at subscription scope to avoid this: $($_.Exception.Message)" `
+                            -Level Warning -Source 'Backup' -Scope @{ Subscription = $sub.Name; Category = 'VaultListScope' }
+                foreach ($rg in @(Get-AzResourceGroup -ErrorAction SilentlyContinue)) {
                     try {
-                        Set-AzRecoveryServicesVaultContext -Vault $vault | Out-Null
-                        # Fetch all backup items across common workload types
-                        $itemTypes = @('AzureVM','AzureStorage','MSSQL','SAPHanaDatabase')
-                        foreach ($wl in $itemTypes) {
-                            try {
-                                $items = Get-AzRecoveryServicesBackupItem -WorkloadType $wl -ErrorAction SilentlyContinue
-                                foreach ($item in $items) {
-                                    $BackupItems += [PSCustomObject]@{
-                                        Subscription        = $sub.Name
-                                        VaultName           = $vault.Name
-                                        VaultResourceGroup  = $vault.ResourceGroupName
-                                        VaultRegion         = $vault.Location
-                                        WorkloadType        = $wl
-                                        ItemName            = $item.Name
-                                        ContainerName       = $item.ContainerName
-                                        ProtectionStatus    = $item.ProtectionStatus
-                                        ProtectionState     = $item.ProtectionState
-                                        LastBackupStatus    = $item.LastBackupStatus
-                                        LastBackupTime      = $item.LastBackupTime
-                                        PolicyName          = $item.ProtectionPolicyName
-                                        DiskSizeGB          = if ($item.DiskSizeGB) { $item.DiskSizeGB } else { 'N/A' }
-                                    }
-                                }
-                            } catch { Write-Verbose "Workload $wl not available in vault $($vault.Name): $_" }
-                        }
-                    } catch { Write-CVLog "Error processing Backup vault: $($_.Exception.Message)" -Level Warning -Source 'Backup' -Scope @{ Subscription = $sub.Name; Vault = $vault.Name } }
+                        $vaults += @(Get-AzRecoveryServicesVault -ResourceGroupName $rg.ResourceGroupName -ErrorAction Stop)
+                        $vaultListOk = $true    # at least one RG answered
+                    } catch { }
                 }
-            } else {
+            }
+
+            if (-not $vaultListOk) {
+                # We never got an authoritative answer, so we cannot claim there are no vaults.
+                Set-CVCollectionStatus -Scope $sub.Name -Signal BACKUP -Status Failed
+                Write-CVLog "Could not enumerate Recovery Services vaults - backup coverage will report Unknown, not zero. Check Microsoft.RecoveryServices/vaults/read." `
+                            -Level Warning -Source 'Backup' -Scope @{ Subscription = $sub.Name; Category = 'VaultListDenied' }
+            } elseif (-not $vaults.Count) {
+                # Enumeration genuinely succeeded and there are none. This IS a measured zero.
+                Set-CVCollectionStatus -Scope $sub.Name -Signal BACKUP -Status Ok
                 Write-Host "No Recovery Services vaults found in subscription $($sub.Name)" -ForegroundColor Yellow
+            } else {
+                $anyVaultQueried = $false
+                foreach ($vault in $vaults) {
+                    $vaultOk = $true
+                    foreach ($pair in $backupWorkloads) {
+                        try {
+                            # -VaultId instead of the deprecated ambient Set-AzRecoveryServicesVaultContext, which
+                            # is process-wide state that fights the per-subscription Set-AzContext above.
+                            $items = @(Get-AzRecoveryServicesBackupItem -VaultId $vault.ID `
+                                        -BackupManagementType $pair.Mgmt -WorkloadType $pair.Workload -ErrorAction Stop)
+                            foreach ($item in $items) {
+                                $BackupItems += [PSCustomObject]@{
+                                    Subscription         = $sub.Name
+                                    VaultName            = $vault.Name
+                                    VaultResourceGroup   = $vault.ResourceGroupName
+                                    VaultRegion          = $vault.Location
+                                    BackupManagementType = $pair.Mgmt
+                                    WorkloadType         = $pair.Workload
+                                    ItemName             = $item.Name
+                                    ContainerName        = $item.ContainerName
+                                    ProtectionStatus     = $item.ProtectionStatus
+                                    ProtectionState      = $item.ProtectionState
+                                    LastBackupStatus     = $item.LastBackupStatus
+                                    LastBackupTime       = $item.LastBackupTime
+                                    PolicyName           = $item.ProtectionPolicyName
+                                    DiskSizeGB           = if ($item.DiskSizeGB) { $item.DiskSizeGB } else { 'N/A' }
+                                }
+                            }
+                        } catch {
+                            # Was Write-Verbose with $VerbosePreference never set, i.e. invisible everywhere -
+                            # which is how a total collection failure produced a clean-looking run. Write-CVLog
+                            # routes through Add-CVDiagnostic, so N vaults x M workloads dedupe to one summary line.
+                            $vaultOk = $false
+                            Write-CVLog "Backup item query failed ($($pair.Mgmt)/$($pair.Workload)): $($_.Exception.Message)" `
+                                        -Level Warning -Source 'Backup' `
+                                        -Scope @{ Subscription = $sub.Name; Vault = $vault.Name; Workload = $pair.Workload }
+                        }
+                    }
+                    if ($vaultOk) { $anyVaultQueried = $true }
+                }
+                Set-CVCollectionStatus -Scope $sub.Name -Signal BACKUP -Status $(if ($anyVaultQueried) { 'Ok' } else { 'Failed' })
             }
         } catch {
+            Set-CVCollectionStatus -Scope $sub.Name -Signal BACKUP -Status Failed
             Write-CVLog "Error processing Azure Backup: $($_.Exception.Message)" -Level Warning -Source 'Backup' -Scope @{ Subscription = $sub.Name }
         }
     }
@@ -1970,7 +2113,7 @@ foreach ($sub in $subs) {
     # ---------------------------------------------------------------
     # UNMANAGED DISKS (Orphaned / unattached managed disks)
     # ---------------------------------------------------------------
-    if ($Selected.UNMANAGEDISKS) {
+    if ($Selected.UNMANAGEDDISKS) {
         try {
             Write-Host "Processing Unmanaged/Unattached Disks in subscription $($sub.Name)" -ForegroundColor Green
             $allDisks = Get-AzDisk -ErrorAction SilentlyContinue
@@ -2034,9 +2177,13 @@ foreach ($sub in $subs) {
             Write-CVLog "Error processing AVS: $($_.Exception.Message)" -Level Warning -Source 'AVS' -Scope @{ Subscription = $sub.Name }
         }
     }
-}  
-
-$ErrorActionPreference = $savedEAP   # restore (the loop set it to "Stop"); prevents post-loop code aborting on minor errors
+}
+}
+finally {
+    # In a finally so an unhandled throw inside the loop cannot leave "Stop" in force for the export section -
+    # which is what turned one bad subscription into a run with zero output files.
+    $ErrorActionPreference = $savedEAP
+}
 
 # Complete subscription progress
 Write-Progress -Id 1 -Activity "Processing Azure Subscriptions" -Completed
@@ -2058,7 +2205,14 @@ if (-not $SkipDataProtection -and $rgFilter.Count) {
     $keepRg = {
         param($obj)
         if (-not $obj) { return $false }
-        $rg = $obj.ResourceGroup
+        # Collections do not agree on the property name: most use ResourceGroup, but MySQL/PostgreSQL/Cosmos use
+        # ResourceGroupName and BackupItems only carry VaultResourceGroup. Probing only ResourceGroup meant the
+        # filter silently did not apply to any of those - they all fell through the escape hatch below.
+        $rg = $null
+        foreach ($prop in @('ResourceGroup','ResourceGroupName','VaultResourceGroup')) {
+            $p = $obj.PSObject.Properties[$prop]
+            if ($p -and -not [string]::IsNullOrWhiteSpace("$($p.Value)")) { $rg = $p.Value; break }
+        }
         if ([string]::IsNullOrWhiteSpace("$rg")) { return $true }   # unknown resource group -> keep
         return [bool](@($rgFilter | Where-Object { $_.Trim() -ieq "$rg".Trim() }).Count)
     }
@@ -2073,61 +2227,25 @@ if (-not $SkipDataProtection -and $rgFilter.Count) {
 # Protection enrichment: attribute Recovery Services backup items and managed-disk
 # snapshots back onto each VM row, so every resource carries its own coverage.
 # ---------------------------------------------------------------------------
-# Backup items -> VM. Item/container names look like "<type>;<container>;<resourceGroup>;<vmName>".
-$backupByVm = @{}
-foreach ($b in @($BackupItems)) {
-    if (-not $b) { continue }
-    $nameSource = if ($b.ContainerName) { $b.ContainerName } else { $b.ItemName }
-    if (-not $nameSource) { continue }
-    $vmName = ([string]$nameSource -split ';')[-1]
-    if (-not $vmName) { continue }
-    $k = "$($b.Subscription)|$vmName".ToLower()
-    if (-not $backupByVm.ContainsKey($k)) { $backupByVm[$k] = @{ Count = 0; Latest = $null; Policy = ''; Protected = $false } }
-    $e = $backupByVm[$k]
-    $e.Count++
-    if ($b.PolicyName -and -not $e.Policy) { $e.Policy = [string]$b.PolicyName }
-    if ("$($b.ProtectionState)$($b.ProtectionStatus)" -match 'Protected|Healthy') { $e.Protected = $true }
-    $t = [datetime]::MinValue
-    if ($b.LastBackupTime -and [datetime]::TryParse([string]$b.LastBackupTime, [ref]$t)) {
-        if ($null -eq $e.Latest -or $t -gt $e.Latest) { $e.Latest = $t }
-    }
+# Attribution lives in common/CVSizing.Backup.Azure.ps1 so it is unit-testable without Azure
+# (tests/Invoke-CVAzureBackupTests.ps1). It keys on subscription|resourceGroup|name so same-named VMs in
+# different resource groups cannot inherit each other's backup, filters in-guest DB workloads out of VM-level
+# protection, judges protection on ProtectionState alone, and leaves every field $null for any subscription
+# whose collection did not actually succeed.
+$protectionSummary = Resolve-CVAzureBackupAttribution -BackupItems $BackupItems -VMs $VMs `
+                        -DiskIdMap $VMDiskIdMap -Snapshots $AzSnapshots -Status (Get-CVCollectionStatusMap)
+
+$protectedVmCount = @($VMs | Where-Object { $_.BackupEnabled -eq $true -or $_.SnapshotsEnabled -eq $true }).Count
+Write-CVLog ("Protection coverage: {0}/{1} VMs have a backup item or snapshot" -f $protectedVmCount, $protectionSummary.VmCount) -Level Info -Source 'Protection'
+if ($protectionSummary.UnknownBackupCount -gt 0) {
+    # Say this out loud. Silently reporting these as unprotected is the defect this replaced.
+    Write-CVLog ("{0} VM(s) have UNKNOWN backup coverage - their subscription's Recovery Services data could not be collected, so they are excluded from scoring rather than counted as unprotected." -f $protectionSummary.UnknownBackupCount) `
+                -Level Warning -Source 'Protection' -Scope @{ Category = 'CoverageUnknown' }
 }
-
-# Snapshots -> source disk id
-$snapByDiskId = @{}
-foreach ($s in @($AzSnapshots)) {
-    if (-not $s -or -not $s.SourceDiskId) { continue }
-    $k = ([string]$s.SourceDiskId).ToLower()
-    if (-not $snapByDiskId.ContainsKey($k)) { $snapByDiskId[$k] = @{ Count = 0; GB = 0.0 } }
-    $snapByDiskId[$k].Count++
-    $snapByDiskId[$k].GB += [double]$s.DiskSizeGB
+if ($protectionSummary.AmbiguousCount -gt 0) {
+    Write-CVLog ("{0} VM(s) matched a backup item only by name (no resource group in the item name) while sharing that name with another VM - see AmbiguousNameMatch." -f $protectionSummary.AmbiguousCount) `
+                -Level Warning -Source 'Protection' -Scope @{ Category = 'AmbiguousMatch' }
 }
-
-foreach ($v in @($VMs)) {
-    if (-not $v) { continue }
-    $vk = "$($v.Subscription)|$($v.VMName)".ToLower()
-
-    $b = $backupByVm[$vk]
-    if ($b) {
-        $v.BackupEnabled = ($b.Protected -or $b.Count -gt 0)
-        $v.BackupCount   = $b.Count
-        $v.BackupPolicy  = $b.Policy
-        if ($b.Latest) { $v.LastBackupTime = $b.Latest.ToString('yyyy-MM-dd HH:mm') }
-    }
-
-    $sc = 0; $sgb = 0.0
-    foreach ($id in @($VMDiskIdMap[$vk])) {
-        if (-not $id) { continue }
-        $agg = $snapByDiskId[([string]$id).ToLower()]
-        if ($agg) { $sc += $agg.Count; $sgb += $agg.GB }
-    }
-    $v.SnapshotsEnabled = ($sc -gt 0)
-    $v.SnapshotCount    = $sc
-    $v.SnapshotSizeTB   = [math]::Round($sgb / 1000, 4)
-}
-
-$protectedVmCount = @($VMs | Where-Object { $_.BackupEnabled -or $_.SnapshotsEnabled }).Count
-Write-CVLog ("Protection coverage: {0}/{1} VMs have a backup item or snapshot" -f $protectedVmCount, @($VMs).Count) -Level Info -Source 'Protection'
 if ($Selected.VM) { Write-Host "Total VMs found: $($VMs.Count)" -ForegroundColor Cyan }
 if ($Selected.STORAGE) { Write-Host "Total Storage Accounts found: $($StorageAccounts.Count)" -ForegroundColor Cyan }
 if ($Selected.FILESHARE) { Write-Host "Total File Shares found: $($FileShares.Count)" -ForegroundColor Cyan }
@@ -2211,9 +2329,9 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
     if ($null -ne $resilSummary.OverallScore) {
         Write-CVLog ("Overall native resilience score: {0}/100  ({1} controls assessed, {2} not assessed)" -f $resilSummary.OverallScore, $resilSummary.Assessed, $resilSummary.Excluded) -Level Success -Source 'Resilience'
         foreach ($cat in $resilSummary.ByCategory) { Write-CVLog ("  {0,-14} {1,3}% met ({2}/{3})" -f $cat.Category, $cat.PercentMet, $cat.ControlsMet, $cat.ControlsTotal) -Level Info -Source 'Resilience' }
-        $resilSummary.ByCategory | Export-Csv (Join-Path $outdir ("azure_resilience_category_$dateStr.csv")) -NoTypeInformation
-        if ($resilSummary.TopGaps.Count) { $resilSummary.TopGaps | Select-Object Id,Title,Category,Severity,Count | Export-Csv (Join-Path $outdir ("azure_resilience_gaps_$dateStr.csv")) -NoTypeInformation }
-        $resilCatalog | Export-Csv (Join-Path $outdir ("azure_resilience_controls_$dateStr.csv")) -NoTypeInformation
+        $resilSummary.ByCategory | Export-CVCsv -Path (Join-Path $outdir ("azure_resilience_category_$dateStr.csv"))
+        if ($resilSummary.TopGaps.Count) { $resilSummary.TopGaps | Select-Object Id,Title,Category,Severity,Count | Export-CVCsv -Path (Join-Path $outdir ("azure_resilience_gaps_$dateStr.csv"))}
+        $resilCatalog | Export-CVCsv -Path (Join-Path $outdir ("azure_resilience_controls_$dateStr.csv"))
         Write-Host "azure_resilience_*_$dateStr.csv (category, gaps, controls) written to $outdir" -ForegroundColor Cyan
     } else {
         Write-CVLog "No resilience controls could be assessed (no eligible resources or signals)." -Level Warning -Source 'Resilience'
@@ -2273,7 +2391,7 @@ if (-not $SkipCloudRewind) {
 
     $crCsv = Join-Path $outdir ("azure_cloudrewind_$dateStr.csv")
     if ($crRows.Count) {
-        $crRows | Export-Csv $crCsv -NoTypeInformation
+        $crRows | Export-CVCsv -Path $crCsv
         Write-Host "azure_cloudrewind_$dateStr.csv ($($crRows.Count) billable resources) written to $outdir" -ForegroundColor Cyan
     } else {
         Write-CVLog 'Cloud Rewind: no billable resources found for the current scope.' -Level Warning -Source 'CloudRewind'
@@ -2281,7 +2399,7 @@ if (-not $SkipCloudRewind) {
 
     $crSummary = Get-CVCloudRewindSummary -Classified $crClassified
     if (@($crSummary).Count) {
-        $crSummary | Export-Csv (Join-Path $outdir ("azure_cloudrewind_summary_$dateStr.csv")) -NoTypeInformation
+        $crSummary | Export-CVCsv -Path (Join-Path $outdir ("azure_cloudrewind_summary_$dateStr.csv"))
         $crTB  = (@($crSummary) | Measure-Object TotalBillableResources -Sum).Sum
         $crTNB = (@($crSummary) | Measure-Object TotalNonBillableResources -Sum).Sum
         Write-CVLog ("Cloud Rewind: {0} billable, {1} non-billable resources across {2} subscription(s)" -f $crTB, $crTNB, @($crSummary).Count) -Level Success -Source 'CloudRewind'
@@ -2298,84 +2416,119 @@ Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing CSV fi
 
 if ($Selected.VM -and $VMs.Count) { 
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing VMs CSV..." -PercentComplete 25
-    $VMs | Export-Csv (Join-Path $outdir "azure_vm_info_$dateStr.csv") -NoTypeInformation
+    $VMs | Export-CVCsv -Path (Join-Path $outdir "azure_vm_info_$dateStr.csv")
     Write-Host "azure_vm_info_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.STORAGE -and $StorageAccounts.Count) { 
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing Storage Accounts CSV..." -PercentComplete 50
-    $StorageAccounts | Export-Csv (Join-Path $outdir "azure_storage_accounts_info_$dateStr.csv") -NoTypeInformation 
+    $StorageAccounts | Export-CVCsv -Path (Join-Path $outdir "azure_storage_accounts_info_$dateStr.csv")
     Write-Host "azure_storage_accounts_info_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.FILESHARE -and $FileShares.Count) { 
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing File Shares CSV..." -PercentComplete 60
-    $FileShares | Export-Csv (Join-Path $outdir "azure_file_shares_info_$dateStr.csv") -NoTypeInformation 
+    $FileShares | Export-CVCsv -Path (Join-Path $outdir "azure_file_shares_info_$dateStr.csv")
     Write-Host "azure_file_shares_info_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.NETAPP -and $NetAppVolumes.Count) { 
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing NetApp Files CSV..." -PercentComplete 70
-    $NetAppVolumes | Export-Csv (Join-Path $outdir "azure_netapp_volumes_info_$dateStr.csv") -NoTypeInformation 
+    $NetAppVolumes | Export-CVCsv -Path (Join-Path $outdir "azure_netapp_volumes_info_$dateStr.csv")
     Write-Host "azure_netapp_volumes_info_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.SQL -and $SqlInstancesInventory.Count) { 
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing SQL Instances CSV..." -PercentComplete 75
-    $SqlInstancesInventory | Export-Csv (Join-Path $outdir "azure_sql_managed_instances_$dateStr.csv") -NoTypeInformation 
+    $SqlInstancesInventory | Export-CVCsv -Path (Join-Path $outdir "azure_sql_managed_instances_$dateStr.csv")
     Write-Host "azure_sql_managed_instances_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.SQL -and $SqlDbInventory.Count) {
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing SQL Databases CSV..." -PercentComplete 80
-    $SqlDbInventory | Export-Csv (Join-Path $outdir "azure_sql_databases_inventory_$dateStr.csv") -NoTypeInformation
+    $SqlDbInventory | Export-CVCsv -Path (Join-Path $outdir "azure_sql_databases_inventory_$dateStr.csv")
     Write-Host "azure_sql_databases_inventory_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.SQL -and $SqlMIDbInventory.Count) {
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing SQL MI Databases CSV..." -PercentComplete 82
-    $SqlMIDbInventory | Export-Csv (Join-Path $outdir "azure_sql_mi_databases_$dateStr.csv") -NoTypeInformation
+    $SqlMIDbInventory | Export-CVCsv -Path (Join-Path $outdir "azure_sql_mi_databases_$dateStr.csv")
     Write-Host "azure_sql_mi_databases_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.COSMOS -and $CosmosDBs.Count) {
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing CosmosDB CSV..." -PercentComplete 85
-    $CosmosDBs | Export-Csv (Join-Path $outdir "azure_cosmosdb_accounts_$dateStr.csv") -NoTypeInformation
+    $CosmosDBs | Export-CVCsv -Path (Join-Path $outdir "azure_cosmosdb_accounts_$dateStr.csv")
     Write-Host "azure_cosmosdb_accounts_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.SQL -and $MySQLServers.Count) {
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing MySQL CSV..." -PercentComplete 90
-    $MySQLServers | Export-Csv (Join-Path $outdir "azure_mysql_servers_$dateStr.csv") -NoTypeInformation
+    $MySQLServers | Export-CVCsv -Path (Join-Path $outdir "azure_mysql_servers_$dateStr.csv")
     Write-Host "azure_mysql_servers_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.SQL -and $PostgreSQLServers.Count) {
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing PostgreSQL CSV..." -PercentComplete 92
-    $PostgreSQLServers | Export-Csv (Join-Path $outdir "azure_postgresql_servers_$dateStr.csv") -NoTypeInformation
+    $PostgreSQLServers | Export-CVCsv -Path (Join-Path $outdir "azure_postgresql_servers_$dateStr.csv")
     Write-Host "azure_postgresql_servers_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.AKS -and $AKSClusters.Count) {
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing AKS Clusters CSV..." -PercentComplete 94
-    $AKSClusters | Export-Csv (Join-Path $outdir "azure_aks_clusters_$dateStr.csv") -NoTypeInformation
+    $AKSClusters | Export-CVCsv -Path (Join-Path $outdir "azure_aks_clusters_$dateStr.csv")
     Write-Host "azure_aks_clusters_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.AKS -and $AKSPersistentVolumes.Count) {
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing AKS Persistent Volumes CSV..." -PercentComplete 96
-    $AKSPersistentVolumes | Export-Csv (Join-Path $outdir "azure_aks_persistent_volumes_$dateStr.csv") -NoTypeInformation
+    $AKSPersistentVolumes | Export-CVCsv -Path (Join-Path $outdir "azure_aks_persistent_volumes_$dateStr.csv")
     Write-Host "azure_aks_persistent_volumes_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.AKS -and $AKSPersistentVolumeClaims.Count) {
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing AKS Persistent Volume Claims CSV..." -PercentComplete 98
-    $AKSPersistentVolumeClaims | Export-Csv (Join-Path $outdir "azure_aks_persistent_volume_claims_$dateStr.csv") -NoTypeInformation
+    $AKSPersistentVolumeClaims | Export-CVCsv -Path (Join-Path $outdir "azure_aks_persistent_volume_claims_$dateStr.csv")
     Write-Host "azure_aks_persistent_volume_claims_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.BACKUP -and $BackupItems.Count) {
-    $BackupItems | Export-Csv (Join-Path $outdir "azure_backup_items_$dateStr.csv") -NoTypeInformation
+    $BackupItems | Export-CVCsv -Path (Join-Path $outdir "azure_backup_items_$dateStr.csv")
     Write-Host "azure_backup_items_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
-if ($Selected.UNMANAGEDISKS -and $UnmanagedDiskItems.Count) {
-    $UnmanagedDiskItems | Export-Csv (Join-Path $outdir "azure_disks_inventory_$dateStr.csv") -NoTypeInformation
+# Managed-disk snapshots. These drive the SnapshotCount/SnapshotSourceDiskTB columns on every VM row but were
+# never exported, so there was no way to audit those numbers or see which snapshots the tool actually found.
+if ($AzSnapshots.Count) {
+    $AzSnapshots | Export-CVCsv -Path (Join-Path $outdir "azure_snapshots_$dateStr.csv") `
+        -PreferredOrder @('Subscription','ResourceGroup','SnapshotName','Region','Incremental','SourceDiskSizeGB','TimeCreated','SourceDiskId')
+    Write-Host "azure_snapshots_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
+}
+if ($Selected.UNMANAGEDDISKS -and $UnmanagedDiskItems.Count) {
+    $UnmanagedDiskItems | Export-CVCsv -Path (Join-Path $outdir "azure_disks_inventory_$dateStr.csv")
     Write-Host "azure_disks_inventory_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.AVS -and $AVSClusters.Count) {
-    $AVSClusters | Export-Csv (Join-Path $outdir "azure_avs_clusters_$dateStr.csv") -NoTypeInformation
+    $AVSClusters | Export-CVCsv -Path (Join-Path $outdir "azure_avs_clusters_$dateStr.csv")
     Write-Host "azure_avs_clusters_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 
-# Create comprehensive summary CSV  
-$summaryRows = @()  
+function Get-CVSqlDbSizeTotal {
+    <#
+      .SYNOPSIS  Total SQL Database size for a summary row, using consumed size and counting each pool once.
+      .DESCRIPTION Two defects this replaces:
+                     1. The summaries summed MaxSizeGB - the PROVISIONED ceiling - even though the utilized figure
+                        was already collected on the same row. For a sizing spreadsheet that is the wrong number.
+                     2. Every database in an elastic pool reports the POOL's max size, so summing across databases
+                        counted one pool once per database in it and inflated the total by the pool's DB count.
+                   SizingGB already prefers Utilized -> Allocated -> ProvisionedMax, so only ProvisionedMax rows
+                   need pool de-duplication; utilized figures are genuinely per-database and must all be summed.
+    #>
+    param($Rows)
+    $total = 0.0
+    $seenPools = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($r in @($Rows)) {
+        if (-not $r) { continue }
+        $v = $r.SizingGB
+        if ($null -eq $v) { $v = $r.MaxSizeGB }          # rows from an older shape
+        if ($null -eq $v) { continue }
+        if ($r.IsPooled -eq $true -and "$($r.SizeBasis)" -eq 'ProvisionedMax') {
+            $pk = "$($r.Subscription)|$($r.ResourceGroup)|$($r.ElasticPoolName)"
+            if (-not $seenPools.Add($pk)) { continue }   # this pool's capacity is already counted
+        }
+        $total += [double]$v
+    }
+    return [math]::Round($total, 3)
+}
+
+# Create comprehensive summary CSV
+$summaryRows = @()
 
 # Add overall resource type counts first
 foreach ($k in $ResourceTypeMap.Keys) { 
@@ -2450,7 +2603,7 @@ foreach ($k in $ResourceTypeMap.Keys) {
             if ($SqlDbInventory.Count -gt 0) {
                 $ResourceType = "SQL Databases"
                 $count = $SqlDbInventory.Count
-                $totalDbMaxSize = ($SqlDbInventory | Measure-Object -Property MaxSizeGB -Sum).Sum
+                $totalDbMaxSize = Get-CVSqlDbSizeTotal -Rows $SqlDbInventory
                 if ($totalDbMaxSize -eq $null) { $totalDbMaxSize = 0 }
                 $totalSize = [math]::Round($totalDbMaxSize, 2)
                 $totalSizeTB = [math]::Round($totalSize / 1000, 4)
@@ -2709,7 +2862,7 @@ if ($SqlInstancesInventory.Count -and $Selected.SQL) {
 # Add SQL Databases regional breakdown if selected
 if ($SqlDbInventory.Count -and $Selected.SQL) {
     $sqlDBRegionalSummary = $SqlDbInventory | Group-Object Region | ForEach-Object {
-        $totalMaxSize = ($_.Group | Measure-Object -Property MaxSizeGB -Sum).Sum
+        $totalMaxSize = Get-CVSqlDbSizeTotal -Rows $_.Group
         if ($totalMaxSize -eq $null) { $totalMaxSize = 0 }
         $totalSizeTB = [math]::Round($totalMaxSize / 1000, 4)
         $totalSizeTiB = [math]::Round($totalMaxSize / 1024, 4)
@@ -3090,7 +3243,7 @@ foreach ($sub in $subs) {
         $subscriptionSqlDB = $SqlDbInventory | Where-Object { $_.Subscription -eq $subscriptionName }
         if ($subscriptionSqlDB.Count -gt 0) {
             # Add SQL Databases resource type total for this subscription
-            $totalDBMaxSize = ($subscriptionSqlDB | Measure-Object -Property MaxSizeGB -Sum).Sum
+            $totalDBMaxSize = Get-CVSqlDbSizeTotal -Rows $subscriptionSqlDB
             if ($totalDBMaxSize -eq $null) { $totalDBMaxSize = 0 }
             $totalDBSizeTB = [math]::Round($totalDBMaxSize / 1000, 4)
             $totalDBSizeTiB = [math]::Round($totalDBMaxSize / 1024, 4)
@@ -3107,7 +3260,7 @@ foreach ($sub in $subs) {
             
             # Add regional breakdown for SQL Databases in this subscription
             $sqlDBRegionalBreakdown = $subscriptionSqlDB | Group-Object Region | ForEach-Object {
-                $totalMaxSize = ($_.Group | Measure-Object -Property MaxSizeGB -Sum).Sum
+                $totalMaxSize = Get-CVSqlDbSizeTotal -Rows $_.Group
                 if ($totalMaxSize -eq $null) { $totalMaxSize = 0 }
                 $totalSizeTB = [math]::Round($totalMaxSize / 1000, 4)
                 $totalSizeTiB = [math]::Round($totalMaxSize / 1024, 4)
@@ -3362,7 +3515,7 @@ foreach ($sub in $subs) {
     }
 
     # Unmanaged disks per-subscription summary
-    if ($Selected.UNMANAGEDISKS -and $UnmanagedDiskItems.Count -gt 0) {
+    if ($Selected.UNMANAGEDDISKS -and $UnmanagedDiskItems.Count -gt 0) {
         $subDisks = $UnmanagedDiskItems | Where-Object { $_.Subscription -eq $subscriptionName }
         if ($subDisks.Count -gt 0) {
             $unattached = ($subDisks | Where-Object { $_.AttachedToVM -eq 'Unattached' }).Count
@@ -3412,7 +3565,7 @@ foreach ($sub in $subs) {
 # Export summary if we have any rows (Data Protection artifact - skip entirely in a Cloud-Rewind-only run).
 if ($summaryRows.Count -and -not $SkipDataProtection) {
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing comprehensive summary..." -PercentComplete 75
-    $summaryRows | Export-Csv (Join-Path $outdir "azure_inventory_summary_$dateStr.csv") -NoTypeInformation
+    $summaryRows | Export-CVCsv -Path (Join-Path $outdir "azure_inventory_summary_$dateStr.csv")
     Write-Host "azure_inventory_summary_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 
@@ -3491,3 +3644,16 @@ if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
     Write-Host "JSON sizing report (azure_sizing_$dateStr.json) is included in the ZIP for Sales AI Hub upload." -ForegroundColor Cyan
 }
 Write-Host "All output files have been compressed into the ZIP archive. Please provide to Commvault representative." -ForegroundColor Cyan
+
+}
+catch {
+    # Test-CVConsoleReady exists precisely for this: only use the console layer if it actually initialized.
+    if ((Get-Command Test-CVConsoleReady -ErrorAction SilentlyContinue) -and (Test-CVConsoleReady)) {
+        Write-CVLog "Critical error in main execution" -Level Error -Source 'Main' -Exception $_
+        Write-CVSummary -Title 'Azure Sizing Run Summary (aborted)'
+    } else {
+        Write-Host "Critical error in main execution: $_" -ForegroundColor Red
+    }
+    try { Stop-Transcript | Out-Null } catch { }
+    exit 1
+}

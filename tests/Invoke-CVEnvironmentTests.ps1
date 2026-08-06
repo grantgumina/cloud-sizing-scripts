@@ -91,6 +91,85 @@ $srcHits = @(Select-String -Path (Join-Path $srcRoot '*.ps1'),(Join-Path $srcRoo
                            -Pattern '^\s*\$isWindows\s*=' -ErrorAction SilentlyContinue)
 Assert-CV 'no script assigns to $isWindows' $srcHits.Count 0
 
+Write-Host "`n[7] Portability guards over src/"
+$allSrc = @((Join-Path $srcRoot '*.ps1'), (Join-Path $srcRoot 'common' '*.ps1'))
+# A literal /tmp or C:\ path breaks on the other platform. Temp must come from [IO.Path]::GetTempPath().
+$tmpHits = @(Select-String -Path $allSrc -Pattern "(?<!GetTempPath\(\)[^\r\n]{0,40})['`"](/tmp/|C:\\\\)" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Line -notmatch '^\s*#' })
+Assert-CV 'no hardcoded /tmp or C:\ paths in src/' $tmpHits.Count 0
+if ($tmpHits.Count) { $tmpHits | ForEach-Object { Write-Host ("        {0}:{1}" -f (Split-Path $_.Path -Leaf), $_.LineNumber) -ForegroundColor DarkYellow } }
+# $env:USERPROFILE is null off Windows. Checked per FILE, not per line: the fallback is legitimately written
+# across lines (`} elseif ($env:HOME) {` / `elseif ($env:USERPROFILE) {`). Comments are excluded so a note
+# explaining the hazard does not fail the check.
+$upOffenders = @()
+foreach ($f in (Get-ChildItem -Path $allSrc -ErrorAction SilentlyContinue)) {
+    $code = @(Get-Content $f.FullName | Where-Object { $_ -notmatch '^\s*#' })
+    if (($code -match '\$env:USERPROFILE') -and -not ($code -match '\$env:HOME')) { $upOffenders += $f.Name }
+}
+Assert-CV 'every file using $env:USERPROFILE also handles $env:HOME' $upOffenders.Count 0
+if ($upOffenders.Count) { $upOffenders | ForEach-Object { Write-Host "        $_" -ForegroundColor DarkYellow } }
+# Every cloud script must guard its dot-sources, or a missing common/ cascades instead of failing clearly.
+foreach ($f in @('CVAzureCloudSizingScript.ps1','CVAWSCloudSizingScript.ps1','CVGoogleCloudSizingScript.ps1','CVM365SizingScript.ps1')) {
+    $body = Get-Content -Raw (Join-Path $srcRoot $f)
+    Assert-CV "$f guards its dot-sources" ([bool]($body -match '\$cvMissing\s*=' -and $body -match 'Test-Path -LiteralPath \(Join-Path \$cvCommonDir')) $true
+}
+
+Write-Host "`n[8] Output root is deterministic, not CWD-derived"
+. (Join-Path $PSScriptRoot '..' 'src' 'common' 'CVSizing.Console.ps1')
+$noRepo = Join-Path ([IO.Path]::GetTempPath()) ("cv-norepo-" + [guid]::NewGuid().ToString('N').Substring(0,8))
+New-Item -ItemType Directory -Path $noRepo -Force | Out-Null
+try {
+    Push-Location ([IO.Path]::GetTempPath())
+    # The defect: this used to return the CWD and discard $StartPath entirely.
+    Assert-CV 'Get-CVBaseRoot honors -StartPath outside a repo' (Get-CVBaseRoot -StartPath $noRepo) $noRepo
+    Pop-Location
+    $rp = Initialize-CVRunPaths -Cloud 'Test' -TimeStamp '20260806_000000' -StartPath $noRepo -OutputRoot $noRepo
+    Assert-CV '-OutputRoot wins'          $rp.Root $noRepo
+    Assert-CV 'run dir under Output/'     ([bool]($rp.OutputDir -like (Join-Path (Join-Path $noRepo 'Output') '*'))) $true
+} finally { Remove-Item -LiteralPath $noRepo -Recurse -Force -ErrorAction SilentlyContinue }
+
+Write-Host "`n[9] kubectl provisioning resolves os/arch instead of assuming linux-amd64"
+. (Join-Path $PSScriptRoot '..' 'src' 'common' 'CVSizing.Kubectl.ps1')
+$p1 = Get-CVKubectlPlatform -OS windows -Architecture amd64
+Assert-CV 'windows-amd64 url'  $p1.UrlPath 'bin/windows/amd64/kubectl.exe'
+$p2 = Get-CVKubectlPlatform -OS linux -Architecture amd64
+Assert-CV 'linux-amd64 url'    $p2.UrlPath 'bin/linux/amd64/kubectl'
+# The old code shipped this host a Linux amd64 binary regardless.
+$p3 = Get-CVKubectlPlatform -OS darwin -Architecture arm64
+Assert-CV 'darwin-arm64 url'   $p3.UrlPath 'bin/darwin/arm64/kubectl'
+Assert-CV 'temp dir is not literal /tmp' ([bool]((Get-CVKubectlInstallDir) -notmatch '^/tmp/')) $true
+$live = Get-CVKubectlPlatform
+Assert-CV 'live platform detected' ([bool]($live.OS -in @('windows','darwin','linux'))) $true
+
+Write-Host "`n[10] Module lists agree across script, README, docs and Dockerfile"
+# These have drifted three times: docs/Azure.md and Dockerfile.azure both omitted Az.Network (fatal), and
+# docs/AWS.md omitted AWS.Tools.ResourceGroupsTaggingAPI (fatal). A stale list is an unrunnable script.
+$repoRoot = Split-Path -Parent $srcRoot
+function Get-CVFatalModuleNames {
+    param([string]$ScriptPath, [string]$Pattern)
+    $body = Get-Content -Raw $ScriptPath
+    $names = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($m in [regex]::Matches($body, $Pattern)) { [void]$names.Add($m.Groups[1].Value) }
+    return @($names)
+}
+$azNeeded  = Get-CVFatalModuleNames (Join-Path $srcRoot 'CVAzureCloudSizingScript.ps1')  "'(Az\.[A-Za-z]+)'"
+$awsNeeded = Get-CVFatalModuleNames (Join-Path $srcRoot 'CVAWSCloudSizingScript.ps1')    "'(AWS\.Tools\.[A-Za-z0-9]+)'"
+$azDoc     = Get-Content -Raw (Join-Path $repoRoot 'docs' 'Azure.md')
+$awsDoc    = Get-Content -Raw (Join-Path $repoRoot 'docs' 'AWS.md')
+$azDocker  = Get-Content -Raw (Join-Path $repoRoot 'k8s' 'Dockerfile.azure')
+$readme    = Get-Content -Raw (Join-Path $repoRoot 'README.md')
+$azMissDoc    = @($azNeeded  | Where-Object { $azDoc    -notmatch [regex]::Escape($_) })
+$azMissDocker = @($azNeeded  | Where-Object { $azDocker -notmatch [regex]::Escape($_) })
+$awsMissDoc   = @($awsNeeded | Where-Object { $awsDoc   -notmatch [regex]::Escape($_) })
+$azMissReadme = @($azNeeded  | Where-Object { $readme   -notmatch [regex]::Escape($_) })
+Assert-CV 'docs/Azure.md lists every fatal Az module'      $azMissDoc.Count 0
+Assert-CV 'Dockerfile.azure installs every fatal Az module' $azMissDocker.Count 0
+Assert-CV 'docs/AWS.md lists every fatal AWS.Tools module'  $awsMissDoc.Count 0
+Assert-CV 'README.md lists every fatal Az module'           $azMissReadme.Count 0
+foreach ($pair in @(@{n='docs/Azure.md';v=$azMissDoc}, @{n='Dockerfile.azure';v=$azMissDocker}, @{n='docs/AWS.md';v=$awsMissDoc}, @{n='README.md';v=$azMissReadme})) {
+    if ($pair.v.Count) { Write-Host ("        {0} missing: {1}" -f $pair.n, ($pair.v -join ', ')) -ForegroundColor DarkYellow }
+}
+
 Write-Host ("`n======  {0} passed, {1} failed  ======`n" -f $script:Pass, $script:Fail) `
            -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 if ($script:Fail) { exit 1 }

@@ -1317,6 +1317,8 @@ if __name__ == "__main__":
     for pkg in packages:
         install_and_import(pkg)
 
+    output_dir = None   # --output-dir; falls back to this file's own directory, never the CWD
+
     args = sys.argv[1:]
     for arg in args:
         if arg.startswith("--profile="):
@@ -1332,6 +1334,8 @@ if __name__ == "__main__":
             if output_format not in ("csv", "json", "both"):
                 print(f"Invalid --output-format '{output_format}'. Valid values: csv, json, both")
                 sys.exit(1)
+        elif arg.startswith("--output-dir="):
+            output_dir = arg.split("=", 1)[1]
         elif arg == "--include-sensitive":
             include_sensitive = True
         elif arg == "--help":
@@ -1339,7 +1343,7 @@ if __name__ == "__main__":
                 "Usage: python CVOracleCloudSizingScript.py "
                 "[--workload=<instances|object_storage|db_systems|oke_clusters|autonomous_db|mysql_heatwave|nosql|file_storage|all>] "
                 "[--profile=<profilename>] [--region=<region1>,<region2>] [--compartment=<comp1>,<comp2>] "
-                "[--output-format=<csv|json|both>] [--include-sensitive] [--help]\n"
+                "[--output-format=<csv|json|both>] [--output-dir=<path>] [--include-sensitive] [--help]\n"
                 "\n"
                 "  --include-sensitive  Include potentially private data: namespace names, PVC names,\n"
                 "                       node names, and StatefulSet names in the report.\n"
@@ -1371,7 +1375,12 @@ if __name__ == "__main__":
 
     config = oci.config.from_file(profile_name=profile_name)
     timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-    log_dir = "Logs"
+    # Resolve output relative to THIS FILE, not the current working directory. The bare "Logs"/"Metrics" paths
+    # only worked because the container image sets WORKDIR /scripts; any other invocation (kubectl exec, a CronJob
+    # with a workingDir, or simply running from another directory) scattered output elsewhere and the entrypoint's
+    # `find Metrics ...` then exited 1. --output-dir overrides.
+    base_dir = output_dir if output_dir else os.path.dirname(os.path.abspath(__file__))
+    log_dir = os.path.join(base_dir, "Logs")
     os.makedirs(log_dir, exist_ok=True)
     log_filename = os.path.join(log_dir, f"{profile_name}_{workload}_{timestamp}.log")
     handlers=[
@@ -1383,7 +1392,7 @@ if __name__ == "__main__":
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s'
     )
-    metrics_dir = "Metrics"
+    metrics_dir = os.path.join(base_dir, "Metrics")
     os.makedirs(metrics_dir, exist_ok=True)
     filename = os.path.join(metrics_dir, f"{profile_name}_{workload}_{timestamp}.xlsx")
 

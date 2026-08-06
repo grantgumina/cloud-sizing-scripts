@@ -19,12 +19,17 @@ sed -i "s|key_file=.*|key_file=/root/.oci/key.pem|g" ~/.oci/config
 
 WORKLOAD="${OCI_WORKLOAD:-all}"
 
-echo "Running OCI sizing script (workload=$WORKLOAD)..."
+# Explicit output root instead of relying on the container's WORKDIR happening to match the script directory -
+# the find below silently returned nothing (and exited 1) whenever the two diverged.
+OUTPUT_DIR="${OCI_OUTPUT_DIR:-/scripts}"
+
+echo "Running OCI sizing script (workload=$WORKLOAD, output=$OUTPUT_DIR)..."
 python3 /scripts/CVOracleCloudSizingScript.py \
     --workload="${WORKLOAD}" \
-    --output-format=both
+    --output-format=both \
+    --output-dir="${OUTPUT_DIR}"
 
-JSON_FILE=$(find Metrics -name 'oci_sizing_*.json' 2>/dev/null | sort | tail -n1)
+JSON_FILE=$(find "${OUTPUT_DIR}/Metrics" -name 'oci_sizing_*.json' 2>/dev/null | sort | tail -n1)
 if [ -z "$JSON_FILE" ]; then
     echo "ERROR: No JSON output file found"
     exit 1

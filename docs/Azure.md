@@ -28,7 +28,7 @@ This PowerShell script inventories Azure resources across subscriptions to assis
 
 2. Install required Azure PowerShell modules (plus `PwshSpectreConsole` for the polished console UI):
    ```powershell
-   Install-Module Az.Accounts,Az.Compute,Az.Storage,Az.Monitor,Az.Resources,Az.NetAppFiles,Az.CosmosDB,Az.Sql,Az.MySql,Az.PostgreSql,Az.Aks,Az.RecoveryServices,Az.VMware,PwshSpectreConsole -Force
+   Install-Module Az.Accounts,Az.Compute,Az.Storage,Az.Monitor,Az.Resources,Az.NetAppFiles,Az.CosmosDB,Az.Sql,Az.MySql,Az.PostgreSql,Az.Aks,Az.RecoveryServices,Az.VMware,Az.Network,Az.ResourceGraph,PwshSpectreConsole -Force
    ```
    All of the Az modules above are **required** — the script is deliberately opinionated so every run inventories
    every supported resource type. If any module is missing, the preflight fails fast and names exactly what to

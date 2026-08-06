@@ -42,7 +42,10 @@ Results are exported as timestamped Excel workbooks, consolidated ZIP archives, 
   - AWS.Tools.FSx  
   - AWS.Tools.ElasticFileSystem  
   - AWS.Tools.EKS  
-  - AWS.Tools.DocDB
+  - AWS.Tools.DocDB  
+  - AWS.Tools.ElastiCache  
+  - AWS.Tools.Backup  
+  - AWS.Tools.ResourceGroupsTaggingAPI  (Cloud Rewind resource sweep; required unless you pass -SkipCloudRewind)
   
 Execution Instructions
 ----------------------
@@ -61,7 +64,7 @@ Method 1 — Run in AWS CloudShell
    ```
    Note: most AWS.Tools modules are pre-installed in CloudShell, but `AWS.Tools.ElastiCache` and `AWS.Tools.Backup`
    may not be — the script now **requires all** of them, so install any the preflight reports missing with
-   `Install-AWSToolsModule -Name <module> -Force`. `PwshSpectreConsole` powers the polished console UI (progress,
+   `Install-AWSToolsModule -Name <module> -CleanUp -Force` (always pass **-CleanUp**: installing one AWS.Tools.* module without it leaves an older AWS.Tools.Common on disk, and the exact-version requirement then fails at import in a way neither `-Force` nor a new session repairs). `PwshSpectreConsole` powers the polished console UI (progress,
    tables, colored end-of-run summary) and is required for interactive runs; headless / automation runs started
    with `-NonInteractive` fall back to plain, pipe-safe text and do not need it.
 
@@ -95,7 +98,7 @@ Method 2 — Run locally
    Install-Module -Name ImportExcel,PwshSpectreConsole -Scope CurrentUser -Force -Confirm:$false
    Install-Module -Name AWS.Tools.Installer -Scope CurrentUser -Force -Confirm:$false
 
-   Install-AWSToolsModule -Name AWS.Tools.Common,AWS.Tools.EC2,AWS.Tools.S3,AWS.Tools.SecurityToken,AWS.Tools.IdentityManagement,AWS.Tools.CloudWatch,AWS.Tools.RDS,AWS.Tools.DynamoDBv2,AWS.Tools.Redshift,AWS.Tools.FSx,AWS.Tools.ElasticFileSystem,AWS.Tools.EKS,AWS.Tools.DocDB,AWS.Tools.ElastiCache,AWS.Tools.Backup -Scope CurrentUser -CleanUp -Force -Confirm:$false
+   Install-AWSToolsModule -Name AWS.Tools.Common,AWS.Tools.EC2,AWS.Tools.S3,AWS.Tools.SecurityToken,AWS.Tools.IdentityManagement,AWS.Tools.CloudWatch,AWS.Tools.RDS,AWS.Tools.DynamoDBv2,AWS.Tools.Redshift,AWS.Tools.FSx,AWS.Tools.ElasticFileSystem,AWS.Tools.EKS,AWS.Tools.DocDB,AWS.Tools.ElastiCache,AWS.Tools.Backup,AWS.Tools.ResourceGroupsTaggingAPI -Scope CurrentUser -CleanUp -Force -Confirm:$false
    ```
 4. Verify required modules are installed:
    ```powershell
