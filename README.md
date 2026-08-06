@@ -153,6 +153,17 @@ Filters are `Key=Value` (union: a resource matches if it is in **any** listed re
 
 **Extra prerequisites for the Cloud Rewind pass:** AWS needs `AWS.Tools.ResourceGroupsTaggingAPI`; Azure needs `Az.Resources` + `Az.Network`; GCP needs the **Cloud Asset API** (`cloudasset.googleapis.com`) enabled. Add `-SkipCloudRewind` to run without them.
 
+## Cyber resilience gap report
+
+Alongside the inventory, every run scores each discovered resource against the Cloud Resilience Control Catalog
+and writes `Output/<cloud>_<timestamp>/<cloud>_resilience_gaps_<timestamp>.csv` — one row per resource that has
+at least one gap, or that could not be fully assessed. It measures the customer's **current native cloud configuration, as-is** — it is not a Commvault plan state.
+
+See **[CYBER_RESILIENCE_REPORT.md](CYBER_RESILIENCE_REPORT.md)** for how to read the file, how scoring works,
+and the full catalog of all 79 controls across the three clouds.
+
+Skip the pass entirely with `-SkipResilienceReport`.
+
 ## Repository layout
 
 ```
@@ -165,6 +176,7 @@ src/                 All sizing scripts (run these directly)
   common/CVSizing.Console.ps1       Shared console/diagnostics layer (loaded by the scripts)
   OCI/                              Oracle Cloud sizing (Python subproject)
 docs/                Per-cloud setup & run instructions (AWS.md, Azure.md, GoogleCloud.md)
+CYBER_RESILIENCE_REPORT.md   How the resilience gap report is scored + the full control catalog
 tests/               Dependency-free test suite for the shared console layer
 tools/               Show-CVConsoleDemo.ps1 - visual demo of the console layer
 k8s/                 Dockerfiles, entrypoints and Job manifests for containerized runs

@@ -1,3 +1,11 @@
+#requires -Version 7.2
+# Windows PowerShell 5.1 is NOT supported: the shared console layer needs $PSStyle (7.2+), and Az.Accounts 5.x
+# no longer ships the lib\netfx assemblies its Desktop-edition preload path still asks for - importing it under
+# 5.1 yields a wall of Add-Type "cannot find path ...\lib\netfx\*.dll" errors, then an assembly-load conflict.
+# A #requires directive is evaluated BEFORE the script is parsed, so it fires ahead of any syntax or module
+# error that would otherwise mask the real cause.
+# Keep the blank line below - without it PowerShell stops treating the next block as comment-based help.
+
 <#  
 .SYNOPSIS  
     Azure Cloud Sizing Script - Comprehensive inventory and sizing analysis
@@ -669,6 +677,14 @@ $ResourceTypeModules = @{
 
 # Every required Az module was verified present by the preflight above (the script is opinionated: all-or-nothing).
 # Import Az.Accounts (needed immediately for subscription discovery) then the modules the selected -Types need.
+#
+# This ORDER is load-bearing, not stylistic. Each Az.<Service>.psm1 imports Az.Accounts for itself only when none
+# is loaded yet ("elseif ($module -eq $null) { Import-Module Az.Accounts -MinimumVersion x.y.z -Scope Global }").
+# On a machine with Az.Accounts installed in more than one scope, letting several service modules each resolve it
+# independently can pull in two different copies - and because Az.Accounts declares its DLLs in RequiredAssemblies,
+# the second load dies with "Assembly with same name is already loaded", unrecoverably, mid-run. Loading it once
+# here first means every module below takes the already-loaded branch. Assert-CVPreflight backstops the cases this
+# ordering cannot fix (see Test-CVAzModuleConflict).
 Import-Module Az.Accounts -ErrorAction Stop
 foreach ($svc in @($Selected.Keys)) {
     foreach ($m in ($ResourceTypeModules[$svc] | Select-Object -Unique)) {
@@ -857,6 +873,7 @@ foreach ($sub in $subs) {
                     Subscription   = $sub.Name  
                     ResourceGroup  = $vm.ResourceGroupName  
                     VMName         = $vm.Name  
+                    ResourceId     = $vm.Id                 # ARM id - the stable key for joins / portal lookup
                     VMSize         = $vm.HardwareProfile.VmSize  
                     OS             = $vm.StorageProfile.OsDisk.OsType  
                     Region         = $vm.Location
@@ -970,6 +987,7 @@ foreach ($sub in $subs) {
 
                         $azSAObj = [ordered] @{}
                         $azSAObj.Add("StorageAccount",$sa.StorageAccountName)
+                        $azSAObj.Add("ResourceId",$sa.Id)
                         $azSAObj.Add("StorageAccountType",$sa.Kind)
                         $azSAObj.Add("HNSEnabled(ADLSGen2)",$sa.EnableHierarchicalNamespace)
                         $azSAObj.Add("StorageAccountSkuName",$sa.Sku.Name)
@@ -996,6 +1014,44 @@ foreach ($sub in $subs) {
                         $azSAObj.Add("BlobContainerCount",$containerCount)
                         $azSAObj.Add("BlobCount",$blobCount)
                         $azSAObj.Add("CapacityMetricStatus",$blobRes['BlobCapacity'].Status)
+
+                        # ── Resilience posture signals ──────────────────────────────────────────────────────
+                        # Collected HERE, inside the subscription loop, because Set-AzContext currently points at
+                        # this account's subscription. The previous code did this in a post-loop pass with no
+                        # -SubscriptionId, so every lookup ran against whichever subscription the loop happened to
+                        # finish on: in a multi-subscription run only the LAST subscription's accounts were
+                        # enriched, and the rest silently reported versioning/CMK/public-access/soft-delete as
+                        # Unknown. $sa already carries the account-level properties, so this is also one fewer
+                        # API call per account than the re-fetch it replaces.
+                        $azSAObj.Add("PublicAccessBlocked", $(if ($null -eq $sa.AllowBlobPublicAccess) { $null } else { $sa.AllowBlobPublicAccess -eq $false }))
+                        $azSAObj.Add("CmkEncrypted",        $(if (-not $sa.Encryption) { $null } else { "$($sa.Encryption.KeySource)" -eq 'Microsoft.Keyvault' }))
+
+                        # st-immutable used to read a field nothing ever set, so it was permanently Unknown on
+                        # every account. "Locked" is the meaningful state: an unlocked policy can be removed, so
+                        # it is not WORM protection. When the state is not reported, fall back to Enabled.
+                        $immLocked = $null
+                        if ($null -ne $sa.ImmutableStorageWithVersioning) {
+                            $imm = $sa.ImmutableStorageWithVersioning
+                            if ($imm.Enabled -ne $true) { $immLocked = $false }
+                            elseif ($imm.ImmutabilityPolicy -and -not [string]::IsNullOrWhiteSpace("$($imm.ImmutabilityPolicy.State)")) {
+                                $immLocked = ("$($imm.ImmutabilityPolicy.State)" -eq 'Locked')
+                            } else { $immLocked = $true }
+                        }
+                        $azSAObj.Add("ImmutabilityLocked", $immLocked)
+
+                        # Blob service properties need their own call - they are not on the account object.
+                        try {
+                            $bsp = Get-AzStorageBlobServiceProperty -ResourceGroupName $sa.ResourceGroupName -StorageAccountName $sa.StorageAccountName -ErrorAction Stop
+                            $azSAObj.Add("BlobVersioning",    [bool]$bsp.IsVersioningEnabled)
+                            $azSAObj.Add("SoftDeleteEnabled", [bool]$bsp.DeleteRetentionPolicy.Enabled)
+                        } catch {
+                            # Was a bare catch{}. Leaving the fields absent is correct (they score Unknown, not a
+                            # fabricated gap) but the reason has to be visible or the Unknown is unactionable.
+                            Write-CVLog "Blob service properties unavailable - versioning/soft-delete will report Unknown: $($_.Exception.Message)" `
+                                        -Level Warning -Source 'Storage' `
+                                        -Scope @{ Subscription = $sub.Name; StorageAccount = $sa.StorageAccountName; Category = 'BlobPropsUnavailable' }
+                        }
+
                         # Storage was the only collection with no tag flattening, so -Tags/reporting by tag never
                         # worked for it. Matches the VM and disk idiom.
                         if ($sa.Tags) { $sa.Tags.GetEnumerator() | ForEach-Object { $azSAObj["Tag_$($_.Key)"] = $_.Value } }
@@ -1030,6 +1086,7 @@ foreach ($sub in $subs) {
                                 foreach ($fileShareInfo in $currentFileShareDetails) {
                                     $fileShareObj = [ordered] @{}
                                     $fileShareObj.Add("Name", $fileShareInfo.Name)
+                                    $fileShareObj.Add("ResourceId", $fileShareInfo.Id)
                                     $fileShareObj.Add("StorageAccount", $sa.StorageAccountName)
                                     $fileShareObj.Add("StorageAccountType", $sa.Kind)
                                     $fileShareObj.Add("StorageAccountSkuName", $sa.Sku.Name)
@@ -1388,6 +1445,7 @@ foreach ($sub in $subs) {
                         $sqlObj.Add("ResourceGroup", $sqlServer.ResourceGroupName)
                         $sqlObj.Add("Server", $sqlServer.ServerName)
                         $sqlObj.Add("Database", $sqlDB.DatabaseName)
+                        $sqlObj.Add("ResourceId", $sqlDB.ResourceId)
                         $sqlObj.Add("Edition", $sqlDB.Edition)
                         $sqlObj.Add("InstanceType", $sqlDB.SkuName)
                         $sqlObj.Add("MaxSizeGiB", [math]::Round(($sqlDB.MaxSizeBytes / 1073741824), 0))
@@ -1961,6 +2019,7 @@ foreach ($sub in $subs) {
                         
                         $AKSCluster = [PSCustomObject]@{
                             ClusterName = $cluster.Name
+                            ResourceId = $cluster.Id
                             Region = $cluster.Location
                             Subscription = $sub.Name
                             ResourceGroup = $resourceGroupName
@@ -1988,6 +2047,7 @@ foreach ($sub in $subs) {
                         
                         # Create minimal object on error
                         $AKSCluster = [PSCustomObject]@{
+                            ResourceId = $cluster.Id
                             Subscription = $sub.Name
                             ResourceGroup = $resourceGroupName
                             ClusterName = $cluster.Name
@@ -2124,6 +2184,7 @@ foreach ($sub in $subs) {
                         Subscription    = $sub.Name
                         ResourceGroup   = $disk.ResourceGroupName
                         DiskName        = $disk.Name
+                        ResourceId      = $disk.Id
                         Region          = $disk.Location
                         DiskSizeGB      = $disk.DiskSizeGB
                         DiskSizeTB      = [math]::Round($disk.DiskSizeGB / 1000, 4)
@@ -2272,20 +2333,10 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
     $azControls   = Get-CVAzureResilienceControls
     $resilResults = New-Object System.Collections.Generic.List[psobject]
 
-    # Full-reach enrichment for storage accounts (defensive: any failure leaves the field absent -> Unknown).
-    foreach ($sa in @($StorageAccounts)) {
-        if (-not $sa) { continue }
-        try {
-            $acct = Get-AzStorageAccount -ResourceGroupName $sa.ResourceGroup -Name $sa.StorageAccount -ErrorAction Stop
-            Add-Member -InputObject $sa -NotePropertyName PublicAccessBlocked -NotePropertyValue ($acct.AllowBlobPublicAccess -eq $false) -Force
-            Add-Member -InputObject $sa -NotePropertyName CmkEncrypted        -NotePropertyValue ("$($acct.Encryption.KeySource)" -eq 'Microsoft.Keyvault') -Force
-            try {
-                $bsp = Get-AzStorageBlobServiceProperty -ResourceGroupName $sa.ResourceGroup -StorageAccountName $sa.StorageAccount -ErrorAction Stop
-                Add-Member -InputObject $sa -NotePropertyName BlobVersioning    -NotePropertyValue ([bool]$bsp.IsVersioningEnabled) -Force
-                Add-Member -InputObject $sa -NotePropertyName SoftDeleteEnabled -NotePropertyValue ([bool]$bsp.DeleteRetentionPolicy.Enabled) -Force
-            } catch {}
-        } catch {}
-    }
+    # Storage posture signals are collected inside the subscription loop now (see the storage block above), where
+    # the Az context already points at the right subscription. The post-loop pass that used to live here re-fetched
+    # each account with no -SubscriptionId, so it only ever worked for the last subscription processed.
+
     # Azure Files is SSE-encrypted at rest by default.
     foreach ($fsh in @($FileShares)) { if ($fsh) { Add-Member -InputObject $fsh -NotePropertyName EncryptedAtRest -NotePropertyValue $true -Force } }
 
@@ -2300,11 +2351,22 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         @{ Type='FileShare'; Set=$azControls.FileShare; Rows=@($FileShares) }
         @{ Type='AKS';       Set=$azControls.AKS;       Rows=@($AKSClusters) }
     )
-    $resilCatalog = New-Object System.Collections.Generic.List[psobject]
+    # Name and size are the only fields that differ meaningfully per type; resource group, region and resource id
+    # are probed from candidate lists inside New-CVGapRow.
+    $azGapFields = @{
+        VM        = @{ Name = 'VMName';         SizeGB = 'VMDiskSizeGB' }
+        Disk      = @{ Name = 'DiskName';       SizeGB = 'DiskSizeGB' }
+        Storage   = @{ Name = 'StorageAccount'; SizeGB = 'UsedCapacityGB' }
+        SQL       = @{ Name = 'Database';       SizeGB = 'SizingGB';   Parent = 'Server' }
+        FlexDB    = @{ Name = 'Name';           SizeGB = 'StorageGB' }
+        Cosmos    = @{ Name = 'Name';           SizeGB = 'DataUsageGB' }
+        FileShare = @{ Name = 'Name';           SizeGB = 'UsedCapacityGB'; Parent = 'StorageAccount' }
+        AKS       = @{ Name = 'ClusterName';    SizeGB = 'PersistentVolumeCapacityGB' }
+    }
+    $gapRows = New-Object System.Collections.Generic.List[psobject]
     $resilShownErr = $false
     foreach ($c in $collections) {
         if (-not $c.Set) { continue }
-        foreach ($m in (Get-CVControlCatalog -Controls $c.Set -ResourceType $c.Type)) { $resilCatalog.Add($m) }
         foreach ($row in $c.Rows) {
             if (-not $row) { continue }
             try {
@@ -2316,6 +2378,8 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
                     Add-Member -InputObject $res -NotePropertyName ResourceType -NotePropertyValue $c.Type -Force
                     $resilResults.Add($res)
                 }
+                $gr = New-CVGapRow -Resource $row -ResourceType $c.Type -Evaluation $ev -FieldMap $azGapFields[$c.Type]
+                if ($gr) { $gapRows.Add($gr) }
             } catch {
                 if (-not $resilShownErr) {
                     $resilShownErr = $true
@@ -2329,12 +2393,25 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
     if ($null -ne $resilSummary.OverallScore) {
         Write-CVLog ("Overall native resilience score: {0}/100  ({1} controls assessed, {2} not assessed)" -f $resilSummary.OverallScore, $resilSummary.Assessed, $resilSummary.Excluded) -Level Success -Source 'Resilience'
         foreach ($cat in $resilSummary.ByCategory) { Write-CVLog ("  {0,-14} {1,3}% met ({2}/{3})" -f $cat.Category, $cat.PercentMet, $cat.ControlsMet, $cat.ControlsTotal) -Level Info -Source 'Resilience' }
-        $resilSummary.ByCategory | Export-CVCsv -Path (Join-Path $outdir ("azure_resilience_category_$dateStr.csv"))
-        if ($resilSummary.TopGaps.Count) { $resilSummary.TopGaps | Select-Object Id,Title,Category,Severity,Count | Export-CVCsv -Path (Join-Path $outdir ("azure_resilience_gaps_$dateStr.csv"))}
-        $resilCatalog | Export-CVCsv -Path (Join-Path $outdir ("azure_resilience_controls_$dateStr.csv"))
-        Write-Host "azure_resilience_*_$dateStr.csv (category, gaps, controls) written to $outdir" -ForegroundColor Cyan
     } else {
         Write-CVLog "No resilience controls could be assessed (no eligible resources or signals)." -Level Warning -Source 'Resilience'
+    }
+
+    # One file: every resource with a gap or an incomplete assessment, ranked. The control catalog (a static
+    # legend) and the per-category rollup are no longer written - the catalog said nothing about the estate, and
+    # the category percentages are in the console summary above and derivable from GapCategories here.
+    if ($gapRows.Count) {
+        Sort-CVGapRows -Rows $gapRows | Export-CVCsv -Path (Join-Path $outdir ("azure_resilience_gaps_$dateStr.csv")) `
+            -PreferredOrder (Get-CVGapReportColumns -ControlSets $azControls)
+        $withGaps    = @($gapRows | Where-Object { $_.Status -eq 'Gap' }).Count
+        $noneAssessed = @($gapRows | Where-Object { $_.Status -eq 'NotAssessed' }).Count
+$partial      = @($gapRows | Where-Object { $_.Status -eq 'Gap' -and -not $_.AssessmentComplete }).Count
+        $tbAtRisk    = [math]::Round((@($gapRows | Where-Object { $_.Status -eq 'Gap' -and $null -ne $_.SizeGB } |
+                            Measure-Object -Property SizeGB -Sum).Sum / 1000), 3)
+        Write-CVLog ("Resilience gaps: {0} resource(s) with at least one gap ({1} TB of sized data); {2} could not be assessed at all; {3} of the flagged resources were only partially assessed." -f $withGaps, $tbAtRisk, $noneAssessed, $partial) -Level Info -Source 'Resilience'
+        Write-Host "azure_resilience_gaps_$dateStr.csv written to $outdir" -ForegroundColor Cyan
+    } else {
+        Write-CVLog "No resilience gaps found (and nothing left unassessed) - no gap CSV written." -Level Info -Source 'Resilience'
     }
   } catch {
     Write-CVLog "Resilience report failed: $($_.Exception.Message)" -Level Warning -Source 'Resilience'

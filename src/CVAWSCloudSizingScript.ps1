@@ -1,4 +1,8 @@
-#requires -Version 7.0
+#requires -Version 7.2
+# Windows PowerShell 5.1 is NOT supported: the shared console layer needs $PSStyle (7.2+), and this script uses
+# the null-coalescing operator (??), which 5.1 cannot even parse. A #requires directive is evaluated BEFORE the
+# script is parsed, so it fires ahead of the parse error that would otherwise be all a 5.1 user saw.
+# Keep the blank line below - without it PowerShell stops treating the next block as comment-based help.
 
 <#
 .SYNOPSIS
@@ -607,7 +611,18 @@ function Invoke-ServiceInventory {
 # is excluded from the score; it never fails the run.
 # ============================================================
 $script:ResilienceResults = New-Object System.Collections.Generic.List[psobject]
-$script:ResilienceCatalog = New-Object System.Collections.Generic.List[psobject]
+$script:ResilienceGapRows = New-Object System.Collections.Generic.List[psobject]
+
+# Name and size are the only genuinely per-type fields; resource group/region/id are probed by New-CVGapRow.
+$script:AwsGapFields = @{
+    EC2      = @{ Name = 'InstanceId';           SizeGB = 'SizeGB' }
+    EBS      = @{ Name = 'VolumeId';             SizeGB = 'SizeGB' }
+    RDS      = @{ Name = 'DBInstanceIdentifier'; SizeGB = 'SizeGB' }
+    S3       = @{ Name = 'BucketName';           SizeGB = 'SizeGB' }
+    EFS      = @{ Name = 'FileSystemId';         SizeGB = 'SizeGB' }
+    DynamoDB = @{ Name = 'TableName';            SizeGB = 'SizeGB' }
+    Redshift = @{ Name = 'ClusterIdentifier';    SizeGB = 'SizeGB' }
+}
 $script:ResilienceErrShown = $false
 
 # Inventory service name -> control set in Get-CVAwsResilienceControls. Services absent here simply are not scored.
@@ -640,11 +655,6 @@ function Invoke-AWSResiliencePass {
             $rows = @($script:ServiceDataByAccount[$AccountId][$serviceName])
             if (-not $rows.Count) { continue }
 
-            # Catalog rows are per resource type, emitted once for the whole run.
-            if (-not ($script:ResilienceCatalog | Where-Object { $_.ResourceType -eq $setName })) {
-                foreach ($m in (Get-CVControlCatalog -Controls $set -ResourceType $setName)) { $script:ResilienceCatalog.Add($m) }
-            }
-
             foreach ($row in $rows) {
                 if (-not $row) { continue }
                 # Isolate per-row failures so one problematic resource cannot sink the whole report.
@@ -657,6 +667,8 @@ function Invoke-AWSResiliencePass {
                         Add-Member -InputObject $res -NotePropertyName ResourceType -NotePropertyValue $setName -Force
                         $script:ResilienceResults.Add($res)
                     }
+                    $gr = New-CVGapRow -Resource $row -ResourceType $setName -Evaluation $ev -FieldMap $script:AwsGapFields[$setName]
+                    if ($gr) { $script:ResilienceGapRows.Add($gr) }
                 } catch {
                     if (-not $script:ResilienceErrShown) {
                         $script:ResilienceErrShown = $true
@@ -671,7 +683,7 @@ function Invoke-AWSResiliencePass {
 }
 
 function Write-AWSResilienceReport {
-    <# .SYNOPSIS  Write the run-wide resilience summary / gaps / catalog CSVs. #>
+    <# .SYNOPSIS  Write the run-wide resilience posture summary and the per-resource gap report. #>
     param([Parameter(Mandatory)][string]$OutputPath, [Parameter(Mandatory)][string]$DateString)
 
     if ($SkipResilienceReport) { return }
@@ -686,13 +698,22 @@ function Write-AWSResilienceReport {
         foreach ($cat in $summary.ByCategory) {
             Write-CVLog ("  {0,-14} {1,3}% met ({2}/{3})" -f $cat.Category, $cat.PercentMet, $cat.ControlsMet, $cat.ControlsTotal) -Level Info -Source 'Resilience'
         }
-        $summary.ByCategory | Export-Csv -Path (Join-Path $OutputPath ("aws_resilience_category_" + $DateString + ".csv")) -NoTypeInformation
-        if ($summary.TopGaps.Count) {
-            $summary.TopGaps | Select-Object Id,Title,Category,Severity,Count |
-                Export-Csv -Path (Join-Path $OutputPath ("aws_resilience_gaps_" + $DateString + ".csv")) -NoTypeInformation
+        # One file: every resource with a gap or an incomplete assessment, ranked. The static control catalog and
+        # the per-category rollup are no longer written - neither named the resources to go look at.
+        if ($script:ResilienceGapRows.Count) {
+            Sort-CVGapRows -Rows $script:ResilienceGapRows |
+                Export-CVCsv -Path (Join-Path $OutputPath ("aws_resilience_gaps_" + $DateString + ".csv")) `
+                             -PreferredOrder (Get-CVGapReportColumns -ControlSets (Get-CVAwsResilienceControls))
+            $withGaps    = @($script:ResilienceGapRows | Where-Object { $_.Status -eq 'Gap' }).Count
+            $noneAssessed = @($script:ResilienceGapRows | Where-Object { $_.Status -eq 'NotAssessed' }).Count
+$partial      = @($script:ResilienceGapRows | Where-Object { $_.Status -eq 'Gap' -and -not $_.AssessmentComplete }).Count
+            $tbAtRisk    = [math]::Round((@($script:ResilienceGapRows | Where-Object { $_.Status -eq 'Gap' -and $null -ne $_.SizeGB } |
+                                Measure-Object -Property SizeGB -Sum).Sum / 1000), 3)
+            Write-CVLog ("Resilience gaps: {0} resource(s) with at least one gap ({1} TB of sized data); {2} could not be assessed at all; {3} of the flagged resources were only partially assessed." -f $withGaps, $tbAtRisk, $noneAssessed, $partial) -Level Info -Source 'Resilience'
+            Write-ScriptOutput "aws_resilience_gaps_$DateString.csv written to $OutputPath" -Level Success
+        } else {
+            Write-CVLog "No resilience gaps found (and nothing left unassessed) - no gap CSV written." -Level Info -Source 'Resilience'
         }
-        $script:ResilienceCatalog | Export-Csv -Path (Join-Path $OutputPath ("aws_resilience_controls_" + $DateString + ".csv")) -NoTypeInformation
-        Write-ScriptOutput "aws_resilience_*_$DateString.csv (category, gaps, controls) written to $OutputPath" -Level Success
     } catch {
         Write-CVLog "Resilience report failed: $($_.Exception.Message)" -Level Warning -Source 'Resilience'
     }
@@ -890,6 +911,8 @@ function Process-EC2Instance {
         VolumeDetails         = ($ebsVolumes | ForEach-Object { "$($_.VolumeId):$($_.Size)GB:$($_.VolumeType)" }) -join ";"
         AllVolumesEncrypted   = $allEncrypted
         EncryptedVolumeCount  = $encryptedVolumeCount
+        # EC2 does not return an ARN, so build the canonical one rather than leave the row unjoinable.
+        ResourceId            = "arn:aws:ec2:${Region}:$($AccountInfo.Account):instance/$($Item.InstanceId)"
         AWSBackupProtected    = $awsBackupProtected
         EBSSnapshotCount      = $snapshotCount
         # Reported in TB only (decimal) - the sizing spreadsheet takes TB, and mixed units invite copy/paste errors.

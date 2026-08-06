@@ -232,5 +232,104 @@ else              { Assert-CV 'narrow/absent RawUI leaves the default alone'  $P
 $PSStyle.Progress.MaxWidth = $before
 
 # ---------------------------------------------------------------------------
+Write-Host "`n[11] Az.Accounts conflict detection (the 'Assembly with same name is already loaded' trap)"
+# Hermetic: PSModulePath is REPLACED with a fake tree, so results do not depend on what Az happens to be
+# installed on the machine running the tests. Restored in the finally block.
+$fakeRoot = Join-Path ([System.IO.Path]::GetTempPath()) "cvmod_$([Guid]::NewGuid().ToString('N'))"
+$savedPSModulePath = $env:PSModulePath
+function New-FakeModule {
+    param([string]$Name, [string]$Version, [string]$AccountsMinimum)
+    $dir = Join-Path $fakeRoot (Join-Path $Name $Version)
+    New-Item -ItemType Directory -Force -Path $dir | Out-Null
+    $list = if ($AccountsMinimum) { "ModuleList = @(@{ModuleName = 'Az.Accounts'; ModuleVersion = '$AccountsMinimum'; })" } else { '' }
+    @"
+@{
+    ModuleVersion = '$Version'
+    GUID = '$([Guid]::NewGuid())'
+    Author = 'test'
+    Description = 'fake module for CV console tests'
+    FunctionsToExport = @()
+    CmdletsToExport = @()
+    RequiredModules = @()
+    $list
+}
+"@ | Set-Content -Path (Join-Path $dir "$Name.psd1") -Encoding utf8
+    return $dir
+}
+try {
+    New-FakeModule -Name 'Az.Accounts' -Version '5.5.2' | Out-Null
+    New-FakeModule -Name 'Az.Network'  -Version '8.1.0' -AccountsMinimum '5.5.2' | Out-Null
+    New-FakeModule -Name 'Az.Sql'      -Version '7.0.0' -AccountsMinimum '5.5.0' | Out-Null
+    $env:PSModulePath = $fakeRoot
+
+    # The floor is the MAX of the declared minimums, and it names which module set it.
+    $floor = Get-CVAzAccountsFloor -Name @('Az.Accounts','Az.Network','Az.Sql')
+    Assert-CV 'floor: max of declared minimums' $floor.Version '5.5.2'
+    Assert-CV 'floor: attributed to the demanding module' $floor.By 'Az.Network'
+
+    # Satisfied floor, single copy -> completely silent.
+    $clean = Test-CVAzModuleConflict -Name @('Az.Accounts','Az.Network','Az.Sql')
+    Assert-CV 'clean install: no fatal' $clean.Fatal.Count 0
+    Assert-CV 'clean install: no warning' $clean.Warning.Count 0
+
+    # Non-Az runs (AWS/GCP) must not pay for this check at all.
+    $awsOnly = Test-CVAzModuleConflict -Name @('AWS.Tools.EC2','AWS.Tools.S3')
+    Assert-CV 'non-Az module set: no-op' ($awsOnly.Fatal.Count + $awsOnly.Warning.Count) 0
+
+    # A second copy on PSModulePath is a WARNING, not fatal: importing Az.Accounts first (as the scripts do)
+    # makes it harmless, so blocking here would fail machines that work today.
+    # Sibling, NOT a child of $fakeRoot: a second scope nested inside the first stays discoverable after
+    # $env:PSModulePath is narrowed back, which silently defeats the below-floor cases that follow.
+    $second = "${fakeRoot}_scope2"
+    New-Item -ItemType Directory -Force -Path (Join-Path $second 'Az.Accounts/5.5.2') | Out-Null
+    Copy-Item (Join-Path $fakeRoot 'Az.Accounts/5.5.2/Az.Accounts.psd1') (Join-Path $second 'Az.Accounts/5.5.2/') -Force
+    $env:PSModulePath = "$fakeRoot$([IO.Path]::PathSeparator)$second"
+    $dupe = Test-CVAzModuleConflict -Name @('Az.Accounts','Az.Network')
+    Assert-CV 'duplicate copies: warns' $dupe.Warning.Count 1
+    Assert-CV 'duplicate copies: not fatal' $dupe.Fatal.Count 0
+    Assert-True 'duplicate warning names the real error' ($dupe.Warning[0] -match 'Assembly with same name is already loaded')
+    $env:PSModulePath = $fakeRoot
+
+    # Newest installed below the floor -> fatal, because no import order can rescue it.
+    Remove-Item (Join-Path $fakeRoot 'Az.Accounts/5.5.2') -Recurse -Force
+    New-FakeModule -Name 'Az.Accounts' -Version '5.0.0' | Out-Null
+    $tooOld = Test-CVAzModuleConflict -Name @('Az.Accounts','Az.Network')
+    Assert-CV 'installed below floor: fatal' $tooOld.Fatal.Count 1
+    Assert-True 'below-floor message names both versions' ($tooOld.Fatal[0] -match '5\.0\.0' -and $tooOld.Fatal[0] -match '5\.5\.2')
+
+    # ...and Assert-CVPreflight refuses the run rather than letting it die inside Import-Module.
+    $log = New-TmpLog
+    Initialize-CVConsole -Cloud Azure -LogPath $log -NonInteractive | Out-Null
+    $blocked = Assert-CVPreflight -FatalModules @('Az.Accounts','Az.Network') -ExitOnFatal:$false
+    Assert-CV 'preflight blocks the conflicting run' $blocked $false
+    Remove-Item $log -ErrorAction SilentlyContinue
+
+    # Poisoned session: a too-old Az.Accounts already IMPORTED. This is the case with no in-process repair, and
+    # the one that previously surfaced as an unreadable wall of loader errors.
+    #
+    # Runs in a CHILD process on purpose. This session cannot host the case: Initialize-CVConsole -Cloud Azure
+    # (section [7] above) probes `Get-Command Update-AzConfig`, and that command discovery auto-imports the real
+    # Az.Accounts off the machine. With a newer real copy loaded alongside the fake, the check correctly sees a
+    # satisfied floor and the assertion would be testing the wrong branch.
+    $childScript = Join-Path $fakeRoot 'poisoned.ps1'
+    @"
+. '$helperPath'
+`$env:PSModulePath = '$fakeRoot'
+Import-Module '$(Join-Path $fakeRoot 'Az.Accounts/5.0.0/Az.Accounts.psd1')' -Force
+if (@(Get-Module -Name Az.Accounts).Count -ne 1) { 'SETUP-DIRTY'; exit 1 }
+(Test-CVAzModuleConflict -Name @('Az.Accounts','Az.Network')).Fatal -join ' | '
+"@ | Set-Content -Path $childScript -Encoding utf8
+    $childOut = (& pwsh -NoProfile -File $childScript 2>&1 | Out-String)
+    Assert-True 'poisoned-session setup: only the fake Az.Accounts is loaded' ($childOut -notmatch 'SETUP-DIRTY')
+    Assert-True 'loaded-too-old says the session cannot be repaired' ($childOut -match 'already loaded in this session')
+    Assert-True 'loaded-too-old names the version actually loaded'   ($childOut -match '5\.0\.0')
+}
+finally {
+    $env:PSModulePath = $savedPSModulePath
+    Remove-Item $fakeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item "${fakeRoot}_scope2" -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# ---------------------------------------------------------------------------
 Write-Host ("`n{0}  {1} passed, {2} failed  {0}" -f ('=' * 6), $script:Pass, $script:Fail) -ForegroundColor ($script:Fail ? 'Red' : 'Green')
 exit ($script:Fail -gt 0 ? 1 : 0)

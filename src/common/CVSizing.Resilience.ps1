@@ -254,3 +254,183 @@ function Get-CVControlCatalog {
 }
 
 #endregion
+
+#region ------------------------------------------------------------- Per-resource gap report
+
+<#
+    The gap report answers "WHICH resources are exposed, how badly, and how much data is at risk" - one row per
+    resource. It replaces two files that could not answer that:
+      - the control catalog, which was a static legend identical on every run
+      - the gaps rollup, which was one row PER CONTROL with a count, so it told you the estate's worst control
+        but never which machines to go look at.
+
+    Resources whose signals could not be collected are included with Status = 'NotAssessed' and GapCount 0. They
+    are a finding in their own right - "we could not check 40 VMs" is something a reader of this file alone must
+    be able to see - and keeping them out of the gap counts preserves the Unknown-is-not-a-Gap rule.
+#>
+
+function Get-CVFirstProperty {
+    <# .SYNOPSIS  First non-empty value among candidate property names. Collections disagree on field naming. #>
+    [CmdletBinding()]
+    param($Resource, [string[]]$Name)
+    foreach ($n in $Name) {
+        if (-not $n) { continue }
+        $p = $Resource.PSObject.Properties[$n]
+        if ($p -and -not [string]::IsNullOrWhiteSpace("$($p.Value)")) { return $p.Value }
+    }
+    return $null
+}
+
+function New-CVGapRow {
+    <#
+      .SYNOPSIS  Build one gap-report row for a resource from its evaluation.
+      .PARAMETER FieldMap  Per-type field names that genuinely differ: @{ Name; Parent; SizeGB }.
+                           Identity fields (resource group, region, id, scope) are probed from candidate lists
+                           because their variation is mechanical rather than meaningful.
+      .OUTPUTS   pscustomobject row, or $null when the resource is fully Met (nothing to report).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Resource,
+        [Parameter(Mandatory)][string]$ResourceType,
+        [Parameter(Mandatory)]$Evaluation,
+        [hashtable]$FieldMap = @{},
+        [string[]]$ScopeCandidates = @('Subscription','Project','AwsAccountId','Account')
+    )
+
+    $gaps = @($Evaluation.Results | Where-Object { $_.Outcome -eq 'Gap' })
+    $unknownCount = [int]$Evaluation.UnknownCount
+    # Fully compliant and fully assessed -> not a finding, no row.
+    if (-not $gaps.Count -and -not $unknownCount) { return $null }
+
+    $status = if ($gaps.Count) { 'Gap' } elseif ($Evaluation.MetCount -eq 0) { 'NotAssessed' } else { 'PartiallyAssessed' }
+
+    $sizeVal = if ($FieldMap.SizeGB) { Get-CVFirstProperty -Resource $Resource -Name @($FieldMap.SizeGB) } else { $null }
+    $sizeGB  = if ($null -ne $sizeVal -and "$sizeVal" -match '^\s*-?[\d\.]+\s*$') { [double]$sizeVal } else { $null }
+
+    # Severity counts only. No weight and no score are emitted: scoring is decided (and re-tuned) on the backend,
+    # and publishing our numbers here would put two competing answers in circulation - ours going stale the moment
+    # the backend's model changed. Everything needed to recompute them is in the row: the per-control Gap_<id>
+    # results plus the severity counts below. Sort-CVGapRows derives an ordering weight from these at write time.
+    $bySeverity = @{ Critical = 0; High = 0; Medium = 0 }
+    foreach ($g in $gaps) {
+        if ($bySeverity.ContainsKey($g.Severity)) { $bySeverity[$g.Severity]++ }
+    }
+    $worst = if ($bySeverity.Critical) { 'Critical' } elseif ($bySeverity.High) { 'High' } elseif ($bySeverity.Medium) { 'Medium' } else { '' }
+
+    # One column per control: Gap_<id>. THREE states, not two - $true = gap found, $false = checked and clean,
+    # $null (blank in the CSV) = not assessed, or the control does not apply to this resource type.
+    # Unknown must NOT collapse to $false: that would assert "no gap here" about a control we never evaluated,
+    # which is the exact failure this whole subsystem was corrected to avoid. Blank and FALSE filter separately.
+    $gapCols = [ordered]@{}
+    foreach ($res in $Evaluation.Results) {
+        $gapCols["Gap_$($res.Id)"] = switch ($res.Outcome) {
+            'Gap' { $true }
+            'Met' { $false }
+            default { $null }      # Unknown / NA
+        }
+    }
+
+    $row = [pscustomobject]@{
+        # --- identity -------------------------------------------------------------------------------------
+        Scope             = Get-CVFirstProperty -Resource $Resource -Name $ScopeCandidates
+        ResourceGroup     = Get-CVFirstProperty -Resource $Resource -Name @('ResourceGroup','ResourceGroupName','VaultResourceGroup')
+        ResourceType      = $ResourceType
+        ResourceName      = Get-CVFirstProperty -Resource $Resource -Name @($FieldMap.Name)
+        ParentResource    = if ($FieldMap.Parent) { Get-CVFirstProperty -Resource $Resource -Name @($FieldMap.Parent) } else { $null }
+        Region            = Get-CVFirstProperty -Resource $Resource -Name @('Region','Location','VaultRegion')
+        # ARM id / ARN / self-link depending on cloud. Blank when the row genuinely has none - never fabricated.
+        ResourceId        = Get-CVFirstProperty -Resource $Resource -Name @('ResourceId','Id','Arn','SelfLink','DiskSelfLink')
+        # --- materiality ----------------------------------------------------------------------------------
+        # $null, not 0, when unmeasured: a resource we could not size is not a small resource.
+        SizeGB            = $sizeGB
+        SizeTB            = if ($null -eq $sizeGB) { $null } else { [math]::Round($sizeGB / 1000, 4) }
+        # --- findings -------------------------------------------------------------------------------------
+        # Observations only. No RiskWeight and no ResilienceScore: those are scoring decisions, and scoring is
+        # owned by the backend so it can be adjusted without reissuing reports. The counts below are raw facts
+        # about what failed, which the backend combines with its own severity model.
+        Status            = $status
+        WorstSeverity     = $worst
+        GapCount          = $gaps.Count
+        CriticalGaps      = $bySeverity.Critical
+        HighGaps          = $bySeverity.High
+        MediumGaps        = $bySeverity.Medium
+        # --- what is wrong --------------------------------------------------------------------------------
+        # GapIds is gone - the Gap_<id> columns below ARE the ids. GapTitles stays because the column headers
+        # are terse control ids and this is the sentence you can paste into a report.
+        GapCategories     = (@($gaps | Select-Object -ExpandProperty Category -Unique | Sort-Object) -join '; ')
+        GapTitles         = (@($gaps | Select-Object -ExpandProperty Title) -join '; ')
+        # --- confidence -----------------------------------------------------------------------------------
+        # How much of the check actually ran on this resource. Without these, GapCount reads as a complete audit:
+        # "1 gap of 3 controls checked" and "1 gap, 2 controls we could not evaluate" are very different claims.
+        # AssessedControls   = non-blank Gap_* cells (a real verdict, gap or clean)
+        # UnassessedControls = blank Gap_* cells (no verdict: missing permission, disabled API, or -Types omission)
+        AssessedControls   = [int]$Evaluation.MetCount + $gaps.Count
+        UnassessedControls = $unknownCount
+        AssessmentComplete = ($unknownCount -eq 0)
+    }
+
+    foreach ($k in $gapCols.Keys) { Add-Member -InputObject $row -NotePropertyName $k -NotePropertyValue $gapCols[$k] -Force }
+    return $row
+}
+
+# Column order for the gap CSV. Export-CVCsv appends anything not listed, so adding a field to New-CVGapRow
+# cannot silently drop it - it just lands at the end until it is named here.
+$script:CVGapReportColumns = @(
+    'Scope','ResourceGroup','ResourceType','ResourceName','ParentResource','Region','ResourceId',
+    'SizeGB','SizeTB',
+    'Status','WorstSeverity','GapCount','CriticalGaps','HighGaps','MediumGaps',
+    'GapCategories','GapTitles',
+    'AssessedControls','UnassessedControls','AssessmentComplete'
+)
+
+function Get-CVGapReportColumns {
+    <#
+      .SYNOPSIS  Gap-report column order: the fixed columns, then one Gap_<id> column per control.
+      .PARAMETER ControlSets  The cloud's ResourceType -> controls hashtable. Supplying it fixes the ORDER of the
+                              Gap_* columns to catalog order (resource type, then declaration order) instead of
+                              letting them appear in whatever order the first rows happened to introduce.
+                              Note the column SET still follows the estate: Export-CVCsv omits preferred columns
+                              that no row carries, so a run with no storage accounts has no Gap_st-* columns. That
+                              keeps the file narrow, but means two runs over different scopes are not necessarily
+                              column-for-column comparable.
+    #>
+    [CmdletBinding()]
+    param([hashtable]$ControlSets)
+
+    if (-not $ControlSets) { return $script:CVGapReportColumns }
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $gapCols = foreach ($type in @($ControlSets.Keys | Sort-Object)) {
+        foreach ($c in @($ControlSets[$type])) {
+            $name = "Gap_$($c.Id)"
+            if ($seen.Add($name)) { $name }     # a control shared by two resource types gets one column
+        }
+    }
+    return @($script:CVGapReportColumns) + @($gapCols)
+}
+
+function Sort-CVGapRows {
+    <#
+      .SYNOPSIS  Priority order: real gaps first, then severity weight, then data at risk.
+      .DESCRIPTION The weight is derived here from the severity COUNT columns rather than stored on the row.
+                   A CSV has to be in some order and severity-first is the useful one, but the ordering is a
+                   presentation choice - it is deliberately not published as a column, because scoring and
+                   weighting belong to the backend and a stale number in the file would compete with it.
+    #>
+    [CmdletBinding()]
+    param([object[]]$Rows = @())
+    $weightOf = {
+        param($r)
+        ($script:CVSeverityWeight.Critical * [int]$r.CriticalGaps) +
+        ($script:CVSeverityWeight.High     * [int]$r.HighGaps)     +
+        ($script:CVSeverityWeight.Medium   * [int]$r.MediumGaps)
+    }
+    return @($Rows | Sort-Object `
+        @{ E = { if ($_.Status -eq 'Gap') { 0 } else { 1 } } },
+        @{ E = { & $weightOf $_ }; Descending = $true },
+        @{ E = { if ($null -eq $_.SizeGB) { -1 } else { [double]$_.SizeGB } }; Descending = $true },
+        @{ E = { "$($_.ResourceType)" } },
+        @{ E = { "$($_.ResourceName)" } })
+}
+
+#endregion

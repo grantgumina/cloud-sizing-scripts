@@ -852,6 +852,128 @@ function Test-CVRuntimeCompatibility {
     return $problems
 }
 
+function Get-CVAzAccountsFloor {
+    <#
+      .SYNOPSIS  Highest Az.Accounts version demanded by the given Az.<Service> modules.
+      .DESCRIPTION Contrary to a long-standing assumption in this file, Az.<Service> modules do NOT pin an exact
+                   Az.Accounts version - every one of them ships `RequiredModules = @()`. What they declare is a
+                   MINIMUM, listed in the manifest's ModuleList and enforced by their own .psm1 at import time:
+
+                       $module = Get-Module Az.Accounts
+                       if ($module -ne $null -and $module.Version -lt [System.Version]"5.5.1") { Write-Error ... }
+                       elseif ($module -eq $null) { Import-Module Az.Accounts -MinimumVersion 5.5.1 -Scope Global }
+
+                   So the constraint for a run is the MAX of the minimums across the modules it will import.
+                   Read from the manifests rather than hard-coded, so a module upgrade cannot leave this stale.
+      .OUTPUTS   @{ Version = [version] (or $null when nothing declares one); By = 'Az.Network' }
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string[]]$Name)
+
+    $floor = $null
+    $by    = $null
+    foreach ($m in @($Name | Where-Object { $_ -like 'Az.*' -and $_ -ne 'Az.Accounts' })) {
+        $mod = Get-Module -ListAvailable -Name $m -ErrorAction SilentlyContinue |
+                    Sort-Object Version -Descending | Select-Object -First 1
+        if (-not $mod -or -not $mod.Path) { continue }
+        # A manifest we cannot read yields NO constraint rather than a guessed one - inventing a floor here
+        # would block runs on a machine that is actually fine.
+        try { $data = Import-PowerShellDataFile -Path $mod.Path -ErrorAction Stop } catch { continue }
+        foreach ($r in @($data.ModuleList | Where-Object { $_.ModuleName -eq 'Az.Accounts' })) {
+            $v = $null
+            if ([version]::TryParse("$($r.ModuleVersion)", [ref]$v) -and ($null -eq $floor -or $v -gt $floor)) {
+                $floor = $v
+                $by    = $m
+            }
+        }
+    }
+    return @{ Version = $floor; By = $by }
+}
+
+function Test-CVAzModuleConflict {
+    <#
+      .SYNOPSIS  Detect the Az.Accounts states that end in "Assembly with same name is already loaded".
+      .DESCRIPTION Az.Accounts lists its own DLLs (Microsoft.Azure.PowerShell.AssemblyLoading.dll and friends) in
+                   the manifest's RequiredAssemblies, which PowerShell loads BEFORE the .psm1 runs - and an
+                   assembly can never be unloaded from a session. Load two different Az.Accounts copies into one
+                   session (two versions, or one version reachable from two scopes) and the second throws
+                   FileLoadException: "Assembly with same name is already loaded". No retry recovers it; the
+                   session is spent.
+
+                   The sizing scripts' real defence is ORDERING - they import Az.Accounts first, so every
+                   Az.<Service> afterwards takes the "already loaded and new enough" branch and never resolves a
+                   second copy for itself. This function is the net under that: it catches the two states the
+                   ordering cannot save, and warns about the setup that makes them likely.
+      .OUTPUTS   @{ Fatal = @('...'); Warning = @('...') }
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string[]]$Name)
+
+    $fatal = [System.Collections.Generic.List[string]]::new()
+    $warn  = [System.Collections.Generic.List[string]]::new()
+
+    $azNames = @($Name | Where-Object { $_ -like 'Az.*' })
+    if (-not $azNames.Count) { return @{ Fatal = @(); Warning = @() } }      # AWS/GCP runs: nothing to check
+
+    $installed = @(Get-Module -ListAvailable -Name Az.Accounts -ErrorAction SilentlyContinue |
+                        Sort-Object Version -Descending)
+    if (-not $installed.Count) { return @{ Fatal = @(); Warning = @() } }    # not installed at all -> reported as a missing module
+
+    $floor  = Get-CVAzAccountsFloor -Name $azNames
+    $loaded = @(Get-Module -Name Az.Accounts -ErrorAction SilentlyContinue | Sort-Object Version -Descending)[0]
+
+    if ($loaded -and $floor.Version -and $loaded.Version -lt $floor.Version) {
+        # Poisoned session: too-old Az.Accounts is ALREADY loaded, so its assemblies are already pinned here.
+        # This is the case that produced an unreadable wall of loader errors instead of one clear sentence.
+        $fatal.Add(("Az.Accounts $($loaded.Version) is already loaded in this session, but $($floor.By) requires " +
+                    "$($floor.Version) or newer. PowerShell cannot unload assemblies, so this session cannot be repaired."))
+    }
+    elseif ($floor.Version -and $installed[0].Version -lt $floor.Version) {
+        # Nothing installed is new enough - ordering is irrelevant, the import fails either way.
+        $fatal.Add(("Az.Accounts $($installed[0].Version) is the newest version installed, but $($floor.By) requires " +
+                    "$($floor.Version) or newer. Run: Update-Module Az.Accounts -Scope CurrentUser"))
+    }
+
+    # Advisory, deliberately NOT fatal: side-by-side copies are harmless as long as Az.Accounts is imported
+    # first, which these scripts do. It only bites when something else (a profile, an editor extension, an
+    # earlier partial run) loaded an older copy first. Blocking here would fail machines that work today.
+    $copies = @($installed | ForEach-Object { "$($_.Version) at $($_.ModuleBase)" } | Select-Object -Unique)
+    if ($copies.Count -gt 1) {
+        $warn.Add(("Multiple Az.Accounts copies are visible on PSModulePath ($($copies -join '; ')). Loading two of " +
+                   "them in one session fails with 'Assembly with same name is already loaded'. Keep exactly one: " +
+                   "Uninstall-Module Az.Accounts -AllVersions, then reinstall into a single scope."))
+    }
+
+    return @{ Fatal = @($fatal); Warning = @($warn) }
+}
+
+function Write-CVPreflightFailure {
+    <#
+      .SYNOPSIS  Render a fatal preflight block. PLAIN output on purpose - the missing piece may be Spectre itself.
+      .OUTPUTS   $false (or exits 1 when -ExitOnFatal), so callers can `return (Write-CVPreflightFailure ...)`.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Message,
+        [string[]]$Instructions = @(),
+        [switch]$ExitOnFatal
+    )
+    Write-Host ""
+    Write-Host "  PREFLIGHT FAILED  " -ForegroundColor Red
+    Write-Host $Message -ForegroundColor Red
+    Write-Host ""
+    foreach ($line in $Instructions) {
+        if ($line.StartsWith('    ')) { Write-Host $line -ForegroundColor Cyan }
+        else { Write-Host "  $line" -ForegroundColor Yellow }
+    }
+    Write-Host ""
+    if (Test-CVConsoleReady) {
+        Write-CVFileLine -Time (Get-Date) -Level 'Fatal' -Source 'Preflight' -Message ("$Message`n" + ($Instructions -join "`n"))
+    }
+    if ($ExitOnFatal) { exit 1 }
+    return $false
+}
+
 function Assert-CVPreflight {
     <#
       .SYNOPSIS  Fail fast on missing hard dependencies; report optional ones as degraded.
@@ -880,6 +1002,30 @@ function Assert-CVPreflight {
 
     $missingModules  = if ($FatalModules)  { @(Test-CVModuleDependency  -Name $FatalModules)  } else { @() }
     $missingCommands = if ($FatalCommands) { @(Test-CVCommandDependency -Name $FatalCommands) } else { @() }
+
+    # Az.Accounts version / duplication conflicts. Checked only once the modules are known to be present - a
+    # genuinely missing module is the more fundamental problem and is reported below with install instructions.
+    # No-op for AWS and GCP runs, which pass no Az.* modules.
+    if ($FatalModules -and -not $missingModules.Count) {
+        $azConflict = Test-CVAzModuleConflict -Name $FatalModules
+        foreach ($w in $azConflict.Warning) {
+            if (Test-CVConsoleReady) { Write-CVLog -Message $w -Level Warning -Source 'Preflight' }
+            else { Write-Host "[Preflight] $w" -ForegroundColor Yellow }
+        }
+        if ($azConflict.Fatal.Count) {
+            $azInst = [System.Collections.Generic.List[string]]::new()
+            foreach ($f in $azConflict.Fatal) { $azInst.Add($f) }
+            $azInst.Add("Keep exactly ONE Az.Accounts installed, in one scope:")
+            $azInst.Add("    Uninstall-Module Az.Accounts -AllVersions -Force")
+            $azInst.Add("    Install-Module Az.Accounts -Scope CurrentUser -Force")
+            $azInst.Add("(Uninstall-Module only removes what PowerShellGet installed - a copy under Program Files must be deleted by hand.)")
+            $azInst.Add("Then re-run from a NEW session, since this one already has the old assemblies loaded:")
+            $azInst.Add("    pwsh -NoProfile")
+            $azInst.Add("(-NoProfile matters: a profile that imports Az or Microsoft.Graph loads conflicting assemblies before the script starts.)")
+            return (Write-CVPreflightFailure -Message "Az.Accounts version conflict - the run would fail at Import-Module." `
+                                             -Instructions $azInst -ExitOnFatal:$ExitOnFatal)
+        }
+    }
 
     # Optional/degraded (one line each; does not abort).
     $degraded = @()
@@ -929,7 +1075,7 @@ function Assert-CVPreflight {
                 $instructions.Add("Azure modules - install all of them in one call, then align Az.Accounts:")
                 $instructions.Add("    Install-Module $($azMods -join ',') -Scope CurrentUser -Force -AllowClobber")
                 $instructions.Add("    Update-Module Az.Accounts")
-                $instructions.Add("(Each Az.<Service> pins an exact Az.Accounts version. If imports still fail, run: Uninstall-Module Az.Accounts -AllVersions, then reinstall.)")
+                $instructions.Add("(Each Az.<Service> requires a MINIMUM Az.Accounts version, checked as it imports - not an exact pin. Keep exactly one Az.Accounts installed, in one scope: two copies loaded in the same session fail with 'Assembly with same name is already loaded', and PowerShell cannot unload the first.)")
             }
             if ($graphMods.Count) {
                 $instructions.Add("Microsoft Graph modules - one call, so they share a matching Authentication version:")
@@ -961,22 +1107,7 @@ function Assert-CVPreflight {
             }
         }
 
-        # Plain output on purpose (a fatal miss may be PwshSpectreConsole itself).
-        Write-Host ""
-        Write-Host "  PREFLIGHT FAILED  " -ForegroundColor Red
-        Write-Host $fmsg -ForegroundColor Red
-        Write-Host ""
-        foreach ($line in $instructions) {
-            if ($line.StartsWith('    ')) { Write-Host $line -ForegroundColor Cyan }
-            else { Write-Host "  $line" -ForegroundColor Yellow }
-        }
-        Write-Host ""
-
-        if (Test-CVConsoleReady) {
-            Write-CVFileLine -Time (Get-Date) -Level 'Fatal' -Source 'Preflight' -Message ("$fmsg`n" + ($instructions -join "`n"))
-        }
-        if ($ExitOnFatal) { exit 1 }
-        return $false
+        return (Write-CVPreflightFailure -Message $fmsg -Instructions $instructions -ExitOnFatal:$ExitOnFatal)
     }
     return $true
 }
@@ -999,6 +1130,10 @@ function Set-CVNativeNoiseSuppression {
             # Suppress it at the source (env var works even before Az.Accounts loads; Update-AzConfig once it's available).
             # NB: we deliberately do NOT touch $ProgressPreference - the Azure script relies on native Write-Progress.
             $env:SuppressAzurePowerShellBreakingChangeWarnings = 'true'
+            # NB: this Get-Command is not free of side effects - command discovery AUTO-IMPORTS Az.Accounts to
+            # resolve the name. That is harmless (it loads the newest copy, which is the same one the script
+            # would import moments later, and getting Az.Accounts in first is exactly the ordering we want),
+            # but it does mean Az.Accounts is usually already loaded before the script's explicit Import-Module.
             if (Get-Command Update-AzConfig -ErrorAction SilentlyContinue) {
                 try { Update-AzConfig -DisplayBreakingChangeWarning $false -Scope Process -ErrorAction Stop | Out-Null } catch { }
             }

@@ -1,3 +1,8 @@
+#requires -Version 7.2
+# Windows PowerShell 5.1 is NOT supported: the shared console layer needs $PSStyle (7.2+). A #requires directive
+# is evaluated BEFORE the script is parsed, so it fires ahead of any syntax or module error that would mask it.
+# Keep the blank line below - without it PowerShell stops treating the next block as comment-based help.
+
 <#
 .SYNOPSIS
     Microsoft 365 Sizing Script - Discover protectable M365 workloads for Commvault scoping.

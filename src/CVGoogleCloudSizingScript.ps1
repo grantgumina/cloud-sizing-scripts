@@ -1,3 +1,8 @@
+#requires -Version 7.2
+# Windows PowerShell 5.1 is NOT supported: the shared console layer needs $PSStyle (7.2+). A #requires directive
+# is evaluated BEFORE the script is parsed, so it fires ahead of any syntax or module error that would mask it.
+# Keep the blank line below - without it PowerShell stops treating the next block as comment-based help.
+
 <#
 .SYNOPSIS
     GCP Cloud Sizing Script - Fast VM and Storage inventory with correct summaries
@@ -913,6 +918,7 @@ function Get-GcpVMInventory {
                 Region       = $region
                 Zone         = $zone
                 VMId         = $vm.id
+                SelfLink     = $vm.selfLink          # GCP's stable resource id (ARM id / ARN equivalent)
                 DiskCount    = $diskCountLocal
                 VMDiskSizeGB = [int64]$vmDiskGB
             }
@@ -2867,11 +2873,19 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         @{ Type='Filestore'; Set=$gcpControls.Filestore; Rows=@($invResults.FilestoreInstances) }
         @{ Type='GKE';       Set=$gcpControls.GKE;       Rows=@($invResults.GKEClusters) }
     )
-    $resilCatalog = New-Object System.Collections.Generic.List[psobject]
+    # Name and size are the only genuinely per-type fields; resource group/region/id are probed by New-CVGapRow.
+    $gcpGapFields = @{
+        Database  = @{ Name = 'InstanceName';  SizeGB = 'StorageGB' }
+        VM        = @{ Name = 'VMName';        SizeGB = 'VMDiskSizeGB' }
+        Disk      = @{ Name = 'DiskName';      SizeGB = 'SizeGB' }
+        Storage   = @{ Name = 'StorageBucket'; SizeGB = 'UsedCapacityGB' }
+        Filestore = @{ Name = 'ShareName';     SizeGB = 'CapacityGB'; Parent = 'InstanceName' }
+        GKE       = @{ Name = 'ClusterName';   SizeGB = 'PersistentVolumeCapacityGB' }
+    }
+    $gapRows = New-Object System.Collections.Generic.List[psobject]
     $resilShownErr = $false
     foreach ($c in $collections) {
         if (-not $c.Set) { continue }
-        foreach ($m in (Get-CVControlCatalog -Controls $c.Set -ResourceType $c.Type)) { $resilCatalog.Add($m) }
         foreach ($row in $c.Rows) {
             if (-not $row) { continue }
             # Isolate per-row failures so one problematic resource can't sink the whole report.
@@ -2884,6 +2898,8 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
                     Add-Member -InputObject $res -NotePropertyName ResourceType -NotePropertyValue $c.Type -Force
                     $resilResults.Add($res)
                 }
+                $gr = New-CVGapRow -Resource $row -ResourceType $c.Type -Evaluation $ev -FieldMap $gcpGapFields[$c.Type]
+                if ($gr) { $gapRows.Add($gr) }
             } catch {
                 if (-not $resilShownErr) {
                     $resilShownErr = $true
@@ -2898,12 +2914,24 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
     if ($null -ne $resilSummary.OverallScore) {
         Write-CVLog ("Overall native resilience score: {0}/100  ({1} controls assessed, {2} not assessed)" -f $resilSummary.OverallScore, $resilSummary.Assessed, $resilSummary.Excluded) -Level Success -Source 'Resilience'
         foreach ($cat in $resilSummary.ByCategory) { Write-CVLog ("  {0,-14} {1,3}% met ({2}/{3})" -f $cat.Category, $cat.PercentMet, $cat.ControlsMet, $cat.ControlsTotal) -Level Info -Source 'Resilience' }
-        $resilSummary.ByCategory | Export-Csv -Path (Join-Path $outDir ("gcp_resilience_category_" + $dateStr + ".csv")) -NoTypeInformation
-        if ($resilSummary.TopGaps.Count) { $resilSummary.TopGaps | Select-Object Id,Title,Category,Severity,Count | Export-Csv -Path (Join-Path $outDir ("gcp_resilience_gaps_" + $dateStr + ".csv")) -NoTypeInformation }
-        $resilCatalog | Export-Csv -Path (Join-Path $outDir ("gcp_resilience_controls_" + $dateStr + ".csv")) -NoTypeInformation
-        Write-Host "gcp_resilience_*_$dateStr.csv (category, gaps, controls) written to $outDir" -ForegroundColor Cyan
     } else {
         Write-CVLog "No resilience controls could be assessed (no eligible resources or signals)." -Level Warning -Source 'Resilience'
+    }
+
+    # One file: every resource with a gap or an incomplete assessment, ranked. The static control catalog and the
+    # per-category rollup are no longer written - neither told you WHICH resources to go look at.
+    if ($gapRows.Count) {
+        Sort-CVGapRows -Rows $gapRows | Export-CVCsv -Path (Join-Path $outDir ("gcp_resilience_gaps_" + $dateStr + ".csv")) `
+            -PreferredOrder (Get-CVGapReportColumns -ControlSets $gcpControls)
+        $withGaps    = @($gapRows | Where-Object { $_.Status -eq 'Gap' }).Count
+        $noneAssessed = @($gapRows | Where-Object { $_.Status -eq 'NotAssessed' }).Count
+$partial      = @($gapRows | Where-Object { $_.Status -eq 'Gap' -and -not $_.AssessmentComplete }).Count
+        $tbAtRisk    = [math]::Round((@($gapRows | Where-Object { $_.Status -eq 'Gap' -and $null -ne $_.SizeGB } |
+                            Measure-Object -Property SizeGB -Sum).Sum / 1000), 3)
+        Write-CVLog ("Resilience gaps: {0} resource(s) with at least one gap ({1} TB of sized data); {2} could not be assessed at all; {3} of the flagged resources were only partially assessed." -f $withGaps, $tbAtRisk, $noneAssessed, $partial) -Level Info -Source 'Resilience'
+        Write-Host "gcp_resilience_gaps_$dateStr.csv written to $outDir" -ForegroundColor Cyan
+    } else {
+        Write-CVLog "No resilience gaps found (and nothing left unassessed) - no gap CSV written." -Level Info -Source 'Resilience'
     }
   } catch {
     Write-CVLog "Resilience report failed: $($_.Exception.Message)" -Level Warning -Source 'Resilience'
