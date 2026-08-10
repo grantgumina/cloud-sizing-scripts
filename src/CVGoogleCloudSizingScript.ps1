@@ -41,7 +41,7 @@
                 - gcp_disks_unattached_to_vm_instances_*.csv  (unattached disks)
                 - gcp_storage_buckets_info_*.csv              (bucket inventory)
                 - gcp_inventory_summary_*.csv                 (summary rollups)
-                - gcp_sizing_*.json                           (only with -OutputFormat json|both)
+                - gcp_sizing_*.json                           (default; omit with -OutputFormat csv)
             Output/gcp_YYYY-MM-DD_HHMMSS.zip                  (ZIP archive of the run's output)
             Logs/gcp_YYYY-MM-DD_HHMMSS.log                    (execution log / transcript)
         The per-run Output folder is kept alongside the ZIP; nothing is deleted.
@@ -147,7 +147,7 @@ param(
     [int]$BucketProjectListTimeoutSec = 300,   # 5m
     [int]$BucketSizingTimeoutSec      = 1200,  # 20m
     [int]$DbProjectTimeoutSec         = 900,   # 15m per project for DB inventory (soft)
-    [ValidateSet("csv","json","both")][string]$OutputFormat = "csv",  # Output format: csv (default), json, or both
+    [ValidateSet("csv","json","both")][string]$OutputFormat = "both",  # Output format: csv, json, or both (default - JSON feeds the cloud posture report)
     [switch]$NonInteractive,   # force plain, non-interactive output (no progress bars / rich UI) - for CI / automation
     [switch]$Quiet,            # minimal console output (still writes the full log file)
     [switch]$SkipResilienceReport, # do not compute or write the cyber resilience posture report
@@ -3779,39 +3779,28 @@ Write-Host "Inventory summary exported: $(Split-Path $summaryCsv -Leaf)" -Foregr
 if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
     Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing JSON output..." -PercentComplete 72
 
-    $jsonSummary = @{}
-    $allWorkloads = @{}
+    # workloadKey -> summary bucket (Type), resilience control set (PostureType), and GB field. Source the
+    # real, resilience-mutated collections in $invResults; snapshots have no control set (posture -> NotAssessed).
+    $gcpDisks = @(@($invResults.AttachedDisks) + @($invResults.UnattachedDisks) | Where-Object { $_ })
+    $workloads = [ordered]@{}
+    $gcpVMs = @($invResults.VMs | Where-Object { $_ })
+    if ($gcpVMs.Count)   { $workloads["gcp_vms"]       = @{ Items = $gcpVMs;                        Type = 'VM';        PostureType = 'VM';        SizeField = 'VMDiskSizeGB' } }
+    if ($gcpDisks.Count) { $workloads["gcp_disks"]     = @{ Items = $gcpDisks;                      Type = 'Disk';      PostureType = 'Disk';      SizeField = 'SizeGB' } }
+    $gcpBuckets = @($invResults.StorageBuckets | Where-Object { $_ })
+    if ($gcpBuckets.Count) { $workloads["gcp_storage"] = @{ Items = $gcpBuckets;                    Type = 'Storage';   PostureType = 'Storage';   SizeField = 'UsedCapacityGB' } }
+    $gcpFs = @($invResults.FilestoreInstances | Where-Object { $_ })
+    if ($gcpFs.Count)    { $workloads["gcp_filestore"] = @{ Items = $gcpFs;                          Type = 'Filestore'; PostureType = 'Filestore'; SizeField = 'CapacityGB' } }
+    $gcpDbs = @($invResults.Databases | Where-Object { $_ })
+    if ($gcpDbs.Count)   { $workloads["gcp_databases"] = @{ Items = $gcpDbs;                         Type = 'Database';  PostureType = 'Database';  SizeField = 'StorageGB' } }
+    $gcpGke = @($invResults.GKEClusters | Where-Object { $_ })
+    if ($gcpGke.Count)   { $workloads["gcp_gke"]       = @{ Items = $gcpGke;                         Type = 'GKE';       PostureType = 'GKE';       SizeField = 'PersistentVolumeCapacityGB' } }
+    $gcpSnaps = @($invResults.DiskSnapshots | Where-Object { $_ })
+    if ($gcpSnaps.Count) { $workloads["gcp_snapshots"] = @{ Items = $gcpSnaps;                       Type = 'Snapshot';  PostureType = $null;       SizeField = 'StorageGB' } }
 
-    if ($AllVMs -and $AllVMs.Count -gt 0) {
-        $allWorkloads["gcp_vms"]         = @($AllVMs)
-        $jsonSummary["VM"]               = @{ count = $AllVMs.Count; total_storage_gb = [double](($AllVMs | Measure-Object -Property SizeGB -Sum -ErrorAction SilentlyContinue).Sum); notes = "" }
-    }
-    if ($AllBuckets -and $AllBuckets.Count -gt 0) {
-        $allWorkloads["gcp_storage"]     = @($AllBuckets)
-        $jsonSummary["Storage"]          = @{ count = $AllBuckets.Count; total_storage_gb = [double](($AllBuckets | Measure-Object -Property SizeGB -Sum -ErrorAction SilentlyContinue).Sum); notes = "" }
-    }
-    if ($filestoreData -and $filestoreData.Count -gt 0) {
-        $allWorkloads["gcp_filestore"]   = @($filestoreData)
-        $jsonSummary["Filestore"]        = @{ count = $filestoreData.Count; total_storage_gb = [double](($filestoreData | Measure-Object -Property CapacityGB -Sum -ErrorAction SilentlyContinue).Sum); notes = "" }
-    }
-    if ($snapshotData -and $snapshotData.Count -gt 0) {
-        $allWorkloads["gcp_snapshots"]   = @($snapshotData)
-        $jsonSummary["Snapshot"]         = @{ count = $snapshotData.Count; total_storage_gb = [double](($snapshotData | Measure-Object -Property StorageGB -Sum -ErrorAction SilentlyContinue).Sum); notes = "" }
-    }
-
-    $jsonDoc = @{
-        metadata = @{
-            cloud          = "gcp"
-            projects       = @($activeProjects)
-            generated_at   = (Get-Date -Format "o")
-            script_version = "2.0"
-        }
-        summary   = $jsonSummary
-        workloads = $allWorkloads
-    }
-
-    $jsonPath = Join-Path $outDir ("gcp_sizing_" + $dateStr + ".json")
-    $jsonDoc | ConvertTo-Json -Depth 10 | Set-Content -Path $jsonPath -Encoding UTF8
+    $jsonPath = Export-CVSizingJson -Cloud 'gcp' -OutputDir $outDir -TimeStamp $dateStr `
+        -Metadata ([ordered]@{ projects = @($activeProjects); script_version = "2.0" }) `
+        -Workloads $workloads `
+        -Controls (Get-CVGcpResilienceControls)
     Write-Host "gcp_sizing_$dateStr.json written to $outDir" -ForegroundColor Cyan
 }
 

@@ -43,7 +43,8 @@ Assert-CV 'ec2-backup unknown when lookup failed' (Outcome $C.EC2 'ec2-backup'  
 Assert-CV 'ec2-encrypted unknown when unread'     (Outcome $C.EC2 'ec2-encrypted' $unk) 'Unknown'
 $ev = Invoke-CVResilience -Resource $unk -Controls $C.EC2
 Assert-CV 'snapshot gap still scored (that signal WAS read)' $ev.GapCount 1
-Assert-CV 'three signals excluded as unknown'                $ev.UnknownCount 3
+# backup, recent, encrypted, and vault-lock were all uncollected on this fixture -> excluded, not failed.
+Assert-CV 'four signals excluded as unknown'                 $ev.UnknownCount 4
 
 Write-Host "`n[4] RDS retention boundary + Multi-AZ"
 $r34 = [pscustomobject]@{ AutomatedBackupsEnabled=$true; BackupRetentionDays=34; PITREnabled=$true; MultiAZ=$false; StorageEncrypted=$true; DeletionProtection=$true }

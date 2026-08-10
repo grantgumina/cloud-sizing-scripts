@@ -1,43 +1,29 @@
 <#
-    CVSizing.Resilience.ps1 - Cloud-agnostic signal catalog and export.
+    CVSizing.Resilience.ps1 - Cloud-agnostic resilience scoring engine.
 
-    THE CONTROL CATALOG IS A FIELD DECLARATION, NOT AN EVALUATOR. This is the single most surprising thing
-    about this file, so read it before changing anything here.
+    Implements the scoring framework from the Cloud Resilience Control Catalog. It is provider-neutral:
+    each cloud script defines its OWN controls (New-CVControl with a cloud-specific Test scriptblock),
+    then calls Invoke-CVResilience per resource and Get-CVResilienceSummary at the end. The catalog's five
+    categories and Critical/High/Medium severities live here; the per-provider evaluation logic does not.
 
-    Each cloud declares its controls with New-CVControl, each carrying a Test scriptblock. Nothing executes
-    those Test blocks. Get-CVSignalFieldMap regex-extracts the `$r.<Field>` references OUT of the Test source
-    text to decide which inventory fields become columns in <cloud>_resilience_signals_*.csv. So a Test block
-    is read as data, and its pass/fail logic never runs.
+    Design decisions (confirmed):
+      - Scores the customer's CURRENT NATIVE cloud posture (as-is), not any backup-vendor target state.
+      - "Unknown" (signal not collected / API call failed) and "N/A" are EXCLUDED from the score, not counted
+        as failures - the score reflects only what was actually evaluated. They are still reported separately.
+      - Severity weights: Critical 3, High 2, Medium 1.
 
-    That is deliberate: the export is judgement-free and the backend owns scoring, weighting and thresholds so
-    they can be re-tuned without reissuing reports. Writing the Test as executable code (rather than a plain
-    field list) keeps the INTENT of each control - what "good" looks like - recorded next to the field it reads,
-    which is the contract the backend implements.
-
-    Consequences worth knowing:
-      - Adding a control automatically adds its fields as signal columns. That is the intended way to extend.
-      - A Test block can contain a logic bug and no test will catch it, because nothing runs it. Only the
-        `$r.<Field>` names it mentions are load-bearing. tests/Invoke-CVControlWiringTests.ps1 checks those
-        names against the fields each resource type's row builder actually sets.
-      - Category and Severity are metadata for the backend; nothing here consumes them.
-
-    A control's Test is written to return $true = Met, $false = Gap, $null = Unknown, 'NA' = Not Applicable.
-    The scoring engine that consumed those values (Invoke-CVResilience, Get-CVControlScore,
-    Get-CVResilienceSummary, ConvertTo-CVOutcome, ConvertTo-CVResilienceColumns, Get-CVControlCatalog) was
-    removed once all three clouds moved to the signals export; it had no production callers in any of them.
-    The eventual destination is a declarative `New-CVSignal -Fields -GoodWhen`, which would drop the pretence
-    that these are executable at all.
+    A control's Test returns: $true = Met, $false = Gap (not met), $null = Unknown, 'NA' = Not Applicable.
 #>
 
-#region ---------------------------------------------------------------- Model
+#region ---------------------------------------------------------------- Model + config
+
+$script:CVSeverityWeight = @{ Critical = 3; High = 2; Medium = 1 }
+$script:CVResilienceCategories = 'DataExposure','RecoveryReady','Availability','Immutability','CleanRecovery'
 
 function New-CVControl {
     <#
-      .SYNOPSIS  Declare one resilience control: the fields it reads, and the intent behind them.
-      .DESCRIPTION
-        $Test is NOT executed - see the file header. It is parsed for its `$r.<Field>` references, which
-        become the signal columns for this control's resource type. Write it as real code anyway: it records
-        what "good" means for the backend that does the scoring.
+      .SYNOPSIS  Define one resilience control. $Test receives a resource object and returns
+                 $true (Met) / $false (Gap) / $null (Unknown) / 'NA' (Not Applicable).
     #>
     [CmdletBinding()]
     param(
@@ -141,36 +127,285 @@ function Get-CVCollectionStatusMap {
 
 #endregion
 
-#region ------------------------------------------------------- Per-resource signal export
+#region ---------------------------------------------------------------- Evaluation
+
+function ConvertTo-CVOutcome {
+    # Normalize a Test result into an outcome label.
+    param($Value)
+    if ($Value -is [string] -and $Value -eq 'NA') { return 'NA' }
+    if ($null -eq $Value) { return 'Unknown' }
+    if ($Value -is [bool]) { return $(if ($Value) { 'Met' } else { 'Gap' }) }
+    return $(if ($Value) { 'Met' } else { 'Gap' })   # truthy fallback
+}
+
+function Get-CVControlScore {
+    <#
+      .SYNOPSIS  Weighted 0-100 score over control results. Only Met/Gap count (Unknown + NA excluded).
+                 Returns $null when nothing was actually assessed.
+    #>
+    [CmdletBinding()]
+    param([object[]]$Results = @())   # default/empty-safe: an empty environment scores $null, not an error
+    $scored = @($Results | Where-Object { $_.Outcome -in 'Met','Gap' })
+    if (-not $scored.Count) { return $null }
+    $den = ($scored | ForEach-Object { $script:CVSeverityWeight[$_.Severity] } | Measure-Object -Sum).Sum
+    if (-not $den) { return $null }
+    $num = ($scored | Where-Object { $_.Outcome -eq 'Met' } | ForEach-Object { $script:CVSeverityWeight[$_.Severity] } | Measure-Object -Sum).Sum
+    return [math]::Round(100 * ([double]$num) / $den, 0)
+}
+
+function Invoke-CVResilience {
+    <#
+      .SYNOPSIS  Evaluate a control set against one resource.
+      .OUTPUTS   pscustomobject { Score; Results[]; Gaps[]; MetCount; GapCount; UnknownCount }
+                 Each Results entry: { Id; Title; Category; Severity; Outcome; Detail }.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Resource,
+        [Parameter(Mandatory)][object[]]$Controls
+    )
+    $results = foreach ($c in $Controls) {
+        $outcome = 'Unknown'; $detail = ''
+        try   { $outcome = ConvertTo-CVOutcome (& $c.Test $Resource) }
+        catch { $outcome = 'Unknown'; $detail = $_.Exception.Message }
+        [pscustomobject]@{ Id = $c.Id; Title = $c.Title; Category = $c.Category; Severity = $c.Severity; Outcome = $outcome; Detail = $detail }
+    }
+    $gaps = @($results | Where-Object { $_.Outcome -eq 'Gap' } |
+                Sort-Object @{ E = { $script:CVSeverityWeight[$_.Severity] }; Descending = $true }, Id |
+                ForEach-Object { "$($_.Severity):$($_.Id)" })
+    [pscustomobject]@{
+        Score        = Get-CVControlScore -Results $results
+        Results      = $results
+        Gaps         = $gaps
+        MetCount     = @($results | Where-Object { $_.Outcome -eq 'Met' }).Count
+        GapCount     = @($results | Where-Object { $_.Outcome -eq 'Gap' }).Count
+        UnknownCount = @($results | Where-Object { $_.Outcome -eq 'Unknown' }).Count
+    }
+}
+
+# Flatten one resource's evaluation into columns to append to its inventory row (one column per control + rollups).
+function ConvertTo-CVResilienceColumns {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)]$Evaluation, [string]$Prefix = 'Ctl_')
+    $cols = [ordered]@{}
+    foreach ($r in $Evaluation.Results) { $cols["$Prefix$($r.Id)"] = $r.Outcome }
+    $cols['ResilienceScore'] = $Evaluation.Score
+    $cols['ResilienceGaps']  = ($Evaluation.Gaps -join '; ')
+    return $cols
+}
+
+#endregion
+
+#region ------------------------------------------------------- Protection posture (JSON headline)
 
 <#
-    The signals export is deliberately JUDGMENT-FREE: it publishes the values the controls evaluate, not our
-    verdicts about them. Scoring, weighting and pass/fail thresholds are owned by the backend so they can be
-    re-tuned without reissuing reports, and a verdict baked into the CSV would compete with that and go stale.
+    Get-CVProtectionPosture summarizes a resource's native protection into a small, consistent set of
+    status LABELS for the sizing JSON that feeds the cloud posture report. Terminology is the point:
+    every workload type and every cloud uses the SAME vocabulary, taken from CYBER_RESILIENCE_REPORT.md.
 
-    It replaced a gap report that emitted one Gap_<id> column per control holding True/False/blank. That threw
-    information away: 'Gap_st-xregion = False' discards the fact that the SKU was Standard_RAGRS, so a consumer
-    could not distinguish RA-GRS from GRS from GZRS, nor re-decide what counts as geo-redundant. Note the polarity
-    also differs - the old Gap_st-public = False is the new PublicAccessBlocked = True.
+    It is a headline view of controls that already ran - it reuses the Ctl_<id> outcomes the resilience
+    pass wrote onto the row (Met/Gap/Unknown/NA). No new signals are collected here. When those columns
+    are absent (the resilience report was skipped) it re-evaluates in-memory from the supplied control
+    set, so the single source of truth stays the New-CVControl Test blocks.
 
-    Consequences of dropping verdicts, both intentional:
-      - No Status / GapCount / severity rollups. Those are counts of verdicts; the backend derives them.
-      - EVERY resource of an assessed type gets a row, not just ones with findings. Without evaluating we cannot
-        filter to "has a gap", and comprehensiveness is the point of a normalized export.
-
-    Columns are the RAW field names the controls read. That keeps the export honest (no renaming layer to drift)
-    and handles multi-input controls naturally: Azure db-retention reads four fields, which are simply four
-    columns rather than one cell with four values crammed into it.
+    The tri-state maps straight to labels: Met -> positive, Gap -> negative, Unknown/NA/absent ->
+    'NotAssessed'. 'NotAssessed' deliberately covers both "does not apply" and "could not evaluate" -
+    a signal we did not measure is never reported as a negative (the "confident 0% coverage" failure the
+    engine exists to prevent; see the collection-status region above).
 #>
 
-# Identity and materiality. All facts, all safe to publish.
-$script:CVSignalIdentityColumns = @(
-    'Scope','ResourceGroup','ResourceType','ResourceName','ParentResource','Region','ResourceId','SizeGB','SizeTB'
-)
+# signal -> the positive (Met) and negative (Gap) word. public_exposure is phrased so the control's
+# "public access blocked" == Met reads as NotPublic; a Gap (not blocked) reads as Public.
+$script:CVPostureLabels = @{
+    backup          = @{ Met = 'Protected'; Gap = 'Unprotected'  }
+    immutability    = @{ Met = 'Immutable'; Gap = 'NotImmutable' }
+    pitr            = @{ Met = 'Enabled';   Gap = 'NotEnabled'   }
+    public_exposure = @{ Met = 'NotPublic'; Gap = 'Public'       }
+    cross_region    = @{ Met = 'Protected'; Gap = 'NotProtected' }
+}
 
-# Collection status, where a cloud script records it. These explain WHY a signal is blank - a fact about the
-# collection, not a judgement about the resource - so a blank can be read as "denied"/"skipped" vs "absent".
-$script:CVSignalStatusColumns = @('BackupDataStatus','SnapshotDataStatus')
+# Per cloud: which control id(s) feed each headline signal (first present on the row wins), which raw
+# fields carry the retention day count, and which engine types derive backup from retention (no boolean
+# backup control exists for them). Mirrors the catalogs in CVSizing.Resilience.{AWS,Azure,GCP}.ps1.
+$script:CVProtectionMap = @{
+    aws = @{
+        backup          = @('ec2-backup','rds-backup','efs-backup','ddb-vault')
+        immutability    = @('s3-objectlock','ec2-vaultlock','rds-vaultlock','ddb-vaultlock')   # S3 Object Lock / Backup Vault Lock
+        pitr            = @('rds-pitr','ddb-pitr')
+        public_exposure = @('s3-public')
+        cross_region    = @('s3-xregion')
+        retention       = @('BackupRetentionDays','BackupRetentionPeriod','AutomatedSnapshotRetentionPeriod','AutomatedSnapshotRetentionDays')
+    }
+    azure = @{
+        backup          = @('vm-backup','disk-schedule','db-backup','cos-pitr','fs-backup','aks-backup')
+        immutability    = @('vm-immutable','st-immutable')
+        pitr            = @('db-pitr','cos-pitr')
+        public_exposure = @('st-public')
+        cross_region    = @('vm-xregion','st-xregion','db-xregion','fx-xregion','cos-xregion','fs-xregion')
+        retention       = @('PITR_Days','BackupRetentionDays')   # Cosmos retention is in hours -> intentionally not mapped
+        backupFromRetention = @('FlexDB')
+    }
+    gcp = @{
+        backup          = @('vm-backup','pd-schedule','db-backup','fs-backup','gke-backup')
+        immutability    = @('vm-immutable','gcs-lock')
+        pitr            = @('db-pitr')
+        public_exposure = @('gcs-public','db-notpublic')
+        cross_region    = @('vm-xregion','pd-xregion','gcs-xregion','fs-xregion','db-xregion','gke-xregion')
+        retention       = @('RetainedBackups','TxLogRetentionDays')
+    }
+}
+
+function Get-CVProtectionPosture {
+    <#
+      .SYNOPSIS  Headline protection labels for one resource, for the sizing JSON.
+      .PARAMETER Resource      The inventory row (already carrying Ctl_<id> columns after the resilience pass).
+      .PARAMETER Cloud         aws | azure | gcp.
+      .PARAMETER ResourceType  Engine type key (EC2/RDS/... VM/SQL/FlexDB/... VM/Database/GKE/...).
+      .PARAMETER ControlSet    The type's controls; used to re-evaluate when Ctl_<id> columns are absent.
+      .OUTPUTS  [ordered] { backup; retention_days; immutability; pitr; public_exposure; cross_region; overall }
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]$Resource,
+        [Parameter(Mandatory)][ValidateSet('aws','azure','gcp')][string]$Cloud,
+        [Parameter(Mandatory)][string]$ResourceType,
+        [object[]]$ControlSet
+    )
+
+    $map = $script:CVProtectionMap[$Cloud]
+
+    # id -> outcome ('Met'/'Gap'/'Unknown'/'NA'). Prefer the Ctl_* columns already on the row; fall back
+    # to an in-memory evaluation so posture is still correct when -SkipResilienceReport skipped the CSV pass.
+    $outcomes = @{}
+    foreach ($p in $Resource.PSObject.Properties) {
+        if ($p.Name -like 'Ctl_*') { $outcomes[$p.Name.Substring(4)] = $p.Value }
+    }
+    if ($outcomes.Count -eq 0 -and $ControlSet) {
+        foreach ($r in (Invoke-CVResilience -Resource $Resource -Controls $ControlSet).Results) { $outcomes[$r.Id] = $r.Outcome }
+    }
+
+    # First candidate id present on the row decides the label; missing/Unknown/NA -> NotAssessed.
+    $labelFor = {
+        param([string]$Signal, [string[]]$Ids)
+        foreach ($id in $Ids) {
+            if ($outcomes.ContainsKey($id)) {
+                switch ("$($outcomes[$id])") {
+                    'Met' { return $script:CVPostureLabels[$Signal].Met }
+                    'Gap' { return $script:CVPostureLabels[$Signal].Gap }
+                    default { return 'NotAssessed' }
+                }
+            }
+        }
+        return 'NotAssessed'
+    }
+
+    $backup = & $labelFor 'backup'          $map.backup
+    $immut  = & $labelFor 'immutability'    $map.immutability
+    $pitr   = & $labelFor 'pitr'            $map.pitr
+    $public = & $labelFor 'public_exposure' $map.public_exposure
+    $xreg   = & $labelFor 'cross_region'    $map.cross_region
+
+    $retVal  = Get-CVFirstProperty -Resource $Resource -Name $map.retention
+    $retDays = if ($null -ne $retVal -and "$retVal" -match '^\s*-?\d+\s*$') { [int]$retVal } else { $null }
+
+    # Types with no boolean backup control (Azure FlexDB): a positive retention IS the backup evidence.
+    if ($backup -eq 'NotAssessed' -and $map.backupFromRetention -and ($map.backupFromRetention -contains $ResourceType) -and $null -ne $retDays) {
+        $backup = if ($retDays -gt 0) { 'Protected' } else { 'Unprotected' }
+    }
+
+    $signals   = @($backup, $immut, $pitr, $public, $xreg)
+    $negatives = @('Unprotected','NotImmutable','NotEnabled','Public','NotProtected')
+    $overall =
+        if (@($signals | Where-Object { $_ -ne 'NotAssessed' }).Count -eq 0) { 'NotAssessed' }
+        elseif ($backup -eq 'Unprotected') { 'Unprotected' }
+        elseif ($backup -eq 'Protected' -and @($signals | Where-Object { $negatives -contains $_ }).Count -eq 0) { 'Protected' }
+        else { 'PartiallyProtected' }
+
+    return [ordered]@{
+        backup          = $backup
+        retention_days  = $retDays
+        immutability    = $immut
+        pitr            = $pitr
+        public_exposure = $public
+        cross_region    = $xreg
+        overall         = $overall
+    }
+}
+
+#endregion
+
+#region ---------------------------------------------------------------- Aggregation / summary
+
+function Get-CVResilienceSummary {
+    <#
+      .SYNOPSIS  Roll flattened per-control results (across all resources) into category posture, an overall
+                 score, and a ranked list of the most common gaps - the report's headline numbers.
+      .PARAMETER Results  Every per-control result object (from the .Results of each Invoke-CVResilience),
+                          ideally each tagged with a ResourceType note property.
+    #>
+    [CmdletBinding()]
+    param([object[]]$Results = @())   # empty-safe: no assessed controls -> OverallScore $null, empty tables
+
+    $scored = @($Results | Where-Object { $_.Outcome -in 'Met','Gap' })
+
+    $byCategory = foreach ($cat in $script:CVResilienceCategories) {
+        $c = @($scored | Where-Object { $_.Category -eq $cat })
+        if (-not $c.Count) { continue }
+        $met = @($c | Where-Object { $_.Outcome -eq 'Met' }).Count
+        [pscustomobject]@{
+            Category      = $cat
+            ControlsMet   = $met
+            ControlsTotal = $c.Count
+            PercentMet    = [math]::Round(100 * $met / $c.Count, 0)
+        }
+    }
+
+    $topGaps = $scored | Where-Object { $_.Outcome -eq 'Gap' } |
+        Group-Object Id | ForEach-Object {
+            $first = $_.Group[0]
+            [pscustomobject]@{
+                Id       = $_.Name
+                Title    = $first.Title
+                Category = $first.Category
+                Severity = $first.Severity
+                Count    = $_.Count
+                Weight   = $script:CVSeverityWeight[$first.Severity] * $_.Count
+            }
+        } | Sort-Object Weight -Descending
+
+    [pscustomobject]@{
+        OverallScore = Get-CVControlScore -Results $scored
+        ByCategory   = @($byCategory)
+        TopGaps      = @($topGaps)
+        Assessed     = $scored.Count
+        Excluded     = @($Results | Where-Object { $_.Outcome -in 'Unknown','NA' }).Count
+    }
+}
+
+# Metadata rows (for a legend/catalog CSV so readers can see what each Ctl_* column means).
+function Get-CVControlCatalog {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][object[]]$Controls, [string]$ResourceType)
+    foreach ($c in $Controls) {
+        [pscustomobject]@{ ResourceType = $ResourceType; Id = $c.Id; Title = $c.Title; Category = $c.Category; Severity = $c.Severity }
+    }
+}
+
+#endregion
+
+#region ------------------------------------------------------------- Per-resource gap report
+
+<#
+    The gap report answers "WHICH resources are exposed, how badly, and how much data is at risk" - one row per
+    resource. It replaces two files that could not answer that:
+      - the control catalog, which was a static legend identical on every run
+      - the gaps rollup, which was one row PER CONTROL with a count, so it told you the estate's worst control
+        but never which machines to go look at.
+
+    Resources whose signals could not be collected are included with Status = 'NotAssessed' and GapCount 0. They
+    are a finding in their own right - "we could not check 40 VMs" is something a reader of this file alone must
+    be able to see - and keeping them out of the gap counts preserves the Unknown-is-not-a-Gap rule.
+#>
 
 function Get-CVFirstProperty {
     <# .SYNOPSIS  First non-empty value among candidate property names. Collections disagree on field naming. #>
@@ -184,109 +419,154 @@ function Get-CVFirstProperty {
     return $null
 }
 
-function Get-CVControlSignalFields {
+function New-CVGapRow {
     <#
-      .SYNOPSIS  The inventory field names a control's Test reads.
-      .DESCRIPTION Derived from the Test scriptblock itself, so the export cannot drift from the controls: add a
-                   control that reads a new field and the field becomes a column automatically.
-    #>
-    [CmdletBinding()]
-    param([Parameter(Mandatory)]$Control)
-    return @([regex]::Matches($Control.Test.ToString(), '\$r\.([A-Za-z_][A-Za-z0-9_]*)') |
-                ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
-}
-
-function Get-CVSignalFieldMap {
-    <# .SYNOPSIS  ResourceType -> the signal fields that type's controls read. #>
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$ControlSets)
-    $map = @{}
-    foreach ($type in $ControlSets.Keys) {
-        $fields = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
-        foreach ($ctl in @($ControlSets[$type])) {
-            foreach ($f in (Get-CVControlSignalFields -Control $ctl)) { if (-not $fields.Contains($f)) { $fields[$f] = $true } }
-        }
-        $map[$type] = @($fields.Keys)
-    }
-    return $map
-}
-
-function Get-CVSignalColumns {
-    <#
-      .SYNOPSIS  Full ordered column list for the signals CSV: identity, collection status, then signal fields.
-      .DESCRIPTION Pass this as -PreferredOrder together with -KeepDeclaredColumns so the header is identical on
-                   every run. A signal field that is not currently collected still gets a (blank) column - the
-                   consumer needs to see that the field is part of the schema rather than infer it is unsupported.
-    #>
-    [CmdletBinding()]
-    param([Parameter(Mandatory)][hashtable]$ControlSets)
-    $cols = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($c in ($script:CVSignalIdentityColumns + $script:CVSignalStatusColumns)) { if (-not $cols.Contains($c)) { $cols[$c] = $true } }
-    # Resource types sorted so the column order is stable regardless of hashtable enumeration order.
-    $map = Get-CVSignalFieldMap -ControlSets $ControlSets
-    foreach ($type in ($map.Keys | Sort-Object)) {
-        foreach ($f in $map[$type]) { if (-not $cols.Contains($f)) { $cols[$f] = $true } }
-    }
-    return @($cols.Keys)
-}
-
-function New-CVSignalRow {
-    <#
-      .SYNOPSIS  One row per resource: identity, size, collection status, and the raw signal values.
-      .DESCRIPTION Always returns a row - there is no filtering, because filtering would require a verdict.
-                   Signal values are copied VERBATIM from the inventory row: no coercion, no defaulting. A field
-                   the resource does not carry is left absent, which the CSV renders blank. $false and blank are
-                   therefore distinguishable, which is the whole point.
-      .PARAMETER SignalFields  The field names to copy for this resource type (from Get-CVSignalFieldMap).
+      .SYNOPSIS  Build one gap-report row for a resource from its evaluation.
+      .PARAMETER FieldMap  Per-type field names that genuinely differ: @{ Name; Parent; SizeGB }.
+                           Identity fields (resource group, region, id, scope) are probed from candidate lists
+                           because their variation is mechanical rather than meaningful.
+      .OUTPUTS   pscustomobject row, or $null when the resource is fully Met (nothing to report).
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]$Resource,
         [Parameter(Mandatory)][string]$ResourceType,
-        [string[]]$SignalFields = @(),
+        [Parameter(Mandatory)]$Evaluation,
         [hashtable]$FieldMap = @{},
         [string[]]$ScopeCandidates = @('Subscription','Project','AwsAccountId','Account')
     )
 
+    $gaps = @($Evaluation.Results | Where-Object { $_.Outcome -eq 'Gap' })
+    $unknownCount = [int]$Evaluation.UnknownCount
+    # Fully compliant and fully assessed -> not a finding, no row.
+    if (-not $gaps.Count -and -not $unknownCount) { return $null }
+
+    $status = if ($gaps.Count) { 'Gap' } elseif ($Evaluation.MetCount -eq 0) { 'NotAssessed' } else { 'PartiallyAssessed' }
+
     $sizeVal = if ($FieldMap.SizeGB) { Get-CVFirstProperty -Resource $Resource -Name @($FieldMap.SizeGB) } else { $null }
     $sizeGB  = if ($null -ne $sizeVal -and "$sizeVal" -match '^\s*-?[\d\.]+\s*$') { [double]$sizeVal } else { $null }
 
-    $row = [ordered]@{
-        Scope          = Get-CVFirstProperty -Resource $Resource -Name $ScopeCandidates
-        ResourceGroup  = Get-CVFirstProperty -Resource $Resource -Name @('ResourceGroup','ResourceGroupName','VaultResourceGroup')
-        ResourceType   = $ResourceType
-        ResourceName   = Get-CVFirstProperty -Resource $Resource -Name @($FieldMap.Name)
-        ParentResource = if ($FieldMap.Parent) { Get-CVFirstProperty -Resource $Resource -Name @($FieldMap.Parent) } else { $null }
-        Region         = Get-CVFirstProperty -Resource $Resource -Name @('Region','Location','VaultRegion')
-        ResourceId     = Get-CVFirstProperty -Resource $Resource -Name @('ResourceId','Id','Arn','SelfLink','DiskSelfLink')
+    # Severity counts only. No weight and no score are emitted: scoring is decided (and re-tuned) on the backend,
+    # and publishing our numbers here would put two competing answers in circulation - ours going stale the moment
+    # the backend's model changed. Everything needed to recompute them is in the row: the per-control Gap_<id>
+    # results plus the severity counts below. Sort-CVGapRows derives an ordering weight from these at write time.
+    $bySeverity = @{ Critical = 0; High = 0; Medium = 0 }
+    foreach ($g in $gaps) {
+        if ($bySeverity.ContainsKey($g.Severity)) { $bySeverity[$g.Severity]++ }
+    }
+    $worst = if ($bySeverity.Critical) { 'Critical' } elseif ($bySeverity.High) { 'High' } elseif ($bySeverity.Medium) { 'Medium' } else { '' }
+
+    # One column per control: Gap_<id>. THREE states, not two - $true = gap found, $false = checked and clean,
+    # $null (blank in the CSV) = not assessed, or the control does not apply to this resource type.
+    # Unknown must NOT collapse to $false: that would assert "no gap here" about a control we never evaluated,
+    # which is the exact failure this whole subsystem was corrected to avoid. Blank and FALSE filter separately.
+    $gapCols = [ordered]@{}
+    foreach ($res in $Evaluation.Results) {
+        $gapCols["Gap_$($res.Id)"] = switch ($res.Outcome) {
+            'Gap' { $true }
+            'Met' { $false }
+            default { $null }      # Unknown / NA
+        }
+    }
+
+    $row = [pscustomobject]@{
+        # --- identity -------------------------------------------------------------------------------------
+        Scope             = Get-CVFirstProperty -Resource $Resource -Name $ScopeCandidates
+        ResourceGroup     = Get-CVFirstProperty -Resource $Resource -Name @('ResourceGroup','ResourceGroupName','VaultResourceGroup')
+        ResourceType      = $ResourceType
+        ResourceName      = Get-CVFirstProperty -Resource $Resource -Name @($FieldMap.Name)
+        ParentResource    = if ($FieldMap.Parent) { Get-CVFirstProperty -Resource $Resource -Name @($FieldMap.Parent) } else { $null }
+        Region            = Get-CVFirstProperty -Resource $Resource -Name @('Region','Location','VaultRegion')
+        # ARM id / ARN / self-link depending on cloud. Blank when the row genuinely has none - never fabricated.
+        ResourceId        = Get-CVFirstProperty -Resource $Resource -Name @('ResourceId','Id','Arn','SelfLink','DiskSelfLink')
+        # --- materiality ----------------------------------------------------------------------------------
         # $null, not 0, when unmeasured: a resource we could not size is not a small resource.
-        SizeGB         = $sizeGB
-        SizeTB         = if ($null -eq $sizeGB) { $null } else { [math]::Round($sizeGB / 1000, 4) }
+        SizeGB            = $sizeGB
+        SizeTB            = if ($null -eq $sizeGB) { $null } else { [math]::Round($sizeGB / 1000, 4) }
+        # --- findings -------------------------------------------------------------------------------------
+        # Observations only. No RiskWeight and no ResilienceScore: those are scoring decisions, and scoring is
+        # owned by the backend so it can be adjusted without reissuing reports. The counts below are raw facts
+        # about what failed, which the backend combines with its own severity model.
+        Status            = $status
+        WorstSeverity     = $worst
+        GapCount          = $gaps.Count
+        CriticalGaps      = $bySeverity.Critical
+        HighGaps          = $bySeverity.High
+        MediumGaps        = $bySeverity.Medium
+        # --- what is wrong --------------------------------------------------------------------------------
+        # GapIds is gone - the Gap_<id> columns below ARE the ids. GapTitles stays because the column headers
+        # are terse control ids and this is the sentence you can paste into a report.
+        GapCategories     = (@($gaps | Select-Object -ExpandProperty Category -Unique | Sort-Object) -join '; ')
+        GapTitles         = (@($gaps | Select-Object -ExpandProperty Title) -join '; ')
+        # --- confidence -----------------------------------------------------------------------------------
+        # How much of the check actually ran on this resource. Without these, GapCount reads as a complete audit:
+        # "1 gap of 3 controls checked" and "1 gap, 2 controls we could not evaluate" are very different claims.
+        # AssessedControls   = non-blank Gap_* cells (a real verdict, gap or clean)
+        # UnassessedControls = blank Gap_* cells (no verdict: missing permission, disabled API, or -Types omission)
+        AssessedControls   = [int]$Evaluation.MetCount + $gaps.Count
+        UnassessedControls = $unknownCount
+        AssessmentComplete = ($unknownCount -eq 0)
     }
-    foreach ($s in $script:CVSignalStatusColumns) {
-        $p = $Resource.PSObject.Properties[$s]
-        if ($p) { $row[$s] = $p.Value }
-    }
-    foreach ($f in @($SignalFields)) {
-        $p = $Resource.PSObject.Properties[$f]
-        # Only set the key when the resource actually has the property. Adding it as $null would be identical in
-        # the CSV, but this keeps "the row never carried it" visible to callers inspecting the object.
-        if ($p) { $row[$f] = $p.Value }
-    }
-    return [pscustomobject]$row
+
+    foreach ($k in $gapCols.Keys) { Add-Member -InputObject $row -NotePropertyName $k -NotePropertyValue $gapCols[$k] -Force }
+    return $row
 }
 
-function Sort-CVSignalRows {
+# Column order for the gap CSV. Export-CVCsv appends anything not listed, so adding a field to New-CVGapRow
+# cannot silently drop it - it just lands at the end until it is named here.
+$script:CVGapReportColumns = @(
+    'Scope','ResourceGroup','ResourceType','ResourceName','ParentResource','Region','ResourceId',
+    'SizeGB','SizeTB',
+    'Status','WorstSeverity','GapCount','CriticalGaps','HighGaps','MediumGaps',
+    'GapCategories','GapTitles',
+    'AssessedControls','UnassessedControls','AssessmentComplete'
+)
+
+function Get-CVGapReportColumns {
     <#
-      .SYNOPSIS  Deterministic, judgement-free ordering: scope, then type, then name.
-      .DESCRIPTION The gap report sorted by severity weight, which was a priority call. With no verdicts there is
-                   nothing to prioritise by, and inventing an order would smuggle judgement back in. Largest-first
-                   was tempting but size is not risk.
+      .SYNOPSIS  Gap-report column order: the fixed columns, then one Gap_<id> column per control.
+      .PARAMETER ControlSets  The cloud's ResourceType -> controls hashtable. Supplying it fixes the ORDER of the
+                              Gap_* columns to catalog order (resource type, then declaration order) instead of
+                              letting them appear in whatever order the first rows happened to introduce.
+                              Note the column SET still follows the estate: Export-CVCsv omits preferred columns
+                              that no row carries, so a run with no storage accounts has no Gap_st-* columns. That
+                              keeps the file narrow, but means two runs over different scopes are not necessarily
+                              column-for-column comparable.
+    #>
+    [CmdletBinding()]
+    param([hashtable]$ControlSets)
+
+    if (-not $ControlSets) { return $script:CVGapReportColumns }
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $gapCols = foreach ($type in @($ControlSets.Keys | Sort-Object)) {
+        foreach ($c in @($ControlSets[$type])) {
+            $name = "Gap_$($c.Id)"
+            if ($seen.Add($name)) { $name }     # a control shared by two resource types gets one column
+        }
+    }
+    return @($script:CVGapReportColumns) + @($gapCols)
+}
+
+function Sort-CVGapRows {
+    <#
+      .SYNOPSIS  Priority order: real gaps first, then severity weight, then data at risk.
+      .DESCRIPTION The weight is derived here from the severity COUNT columns rather than stored on the row.
+                   A CSV has to be in some order and severity-first is the useful one, but the ordering is a
+                   presentation choice - it is deliberately not published as a column, because scoring and
+                   weighting belong to the backend and a stale number in the file would compete with it.
     #>
     [CmdletBinding()]
     param([object[]]$Rows = @())
+    $weightOf = {
+        param($r)
+        ($script:CVSeverityWeight.Critical * [int]$r.CriticalGaps) +
+        ($script:CVSeverityWeight.High     * [int]$r.HighGaps)     +
+        ($script:CVSeverityWeight.Medium   * [int]$r.MediumGaps)
+    }
     return @($Rows | Sort-Object `
-        @{ E = { "$($_.Scope)" } },
+        @{ E = { if ($_.Status -eq 'Gap') { 0 } else { 1 } } },
+        @{ E = { & $weightOf $_ }; Descending = $true },
+        @{ E = { if ($null -eq $_.SizeGB) { -1 } else { [double]$_.SizeGB } }; Descending = $true },
         @{ E = { "$($_.ResourceType)" } },
         @{ E = { "$($_.ResourceName)" } })
 }

@@ -124,7 +124,7 @@ Common script parameters
 - `-ProfileLocation "<path>"` — shared Credentials file path.
 - `-CrossAccountRoleName "<RoleName>"` — role to assume in target accounts.
 - `-Regions "us-east-1,us-west-2"` — comma-separated regions to query.
-- `-OutputFormat csv|json|both` — output format (default: `csv`). Use `json` or `both` to generate a structured JSON file consumable by AI tools for PPT/PDF/HTML deliverable generation.
+- `-OutputFormat csv|json|both` — output format (default: `both`). The JSON feeds the cloud posture report; pass `csv` for CSV only or `json` for JSON only.
 
 
 Credential Files:
@@ -169,10 +169,10 @@ Files are written to the working directory with timestamps:
 - `comprehensive_all_aws_accounts_summary_YYYY-MM-DD_HHMMSS.xlsx` — consolidated workbook
 - `aws_sizing_script_output_YYYY-MM-DD_HHMMSS.log` — execution log
 - `aws_sizing_results_YYYY-MM-DD_HHMMSS.zip` — ZIP archive
-- `aws_sizing_YYYY-MM-DD_HHMMSS.json` *(when `-OutputFormat json|both`)* — structured JSON with `metadata`, `summary`, `protection_summary`, and per-service `workloads` arrays; ideal for AI-generated sizing deliverables
+- `aws_sizing_YYYY-MM-DD_HHMMSS.json` *(default; omit with `-OutputFormat csv`)* — structured JSON with `metadata`, `summary`, `protection_summary`, and per-service `workloads` arrays; the feed for the cloud posture report
 
-### JSON protection_summary fields
-The JSON output includes per-service protection metrics (coverage %, encrypted %, multi-AZ %, PITR status) and an `_overall` block with `overall_coverage_pct` across all protectable workloads.
+### JSON protection fields
+Every resource in `workloads` carries a `protection` object with a consistent, catalog-aligned status vocabulary — `backup`, `retention_days`, `immutability`, `pitr`, `public_exposure`, `cross_region`, and an `overall` label (see [CYBER_RESILIENCE_REPORT.md](../CYBER_RESILIENCE_REPORT.md#json-protection-summary)). A top-level `protection_summary` rolls these up per service and overall, with `coverage_pct` counted over resources whose backup was actually assessed.
 
 ### FetchAllAccountCreds.ps1
 Automatically fetches temporary credentials for all SSO-accessible AWS accounts and runs the sizing script across all of them in one pass, producing a combined JSON output.

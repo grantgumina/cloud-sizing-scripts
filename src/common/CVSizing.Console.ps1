@@ -310,6 +310,120 @@ function Export-CVCsv {
     }
 }
 
+function Export-CVSizingJson {
+    <#
+      .SYNOPSIS  Single shared writer for the <cloud>_sizing_<ts>.json the posture report consumes.
+      .DESCRIPTION Replaces the per-script inline JSON blocks (which had drifted and, on GCP/Azure, read
+                   undefined variables). Blends a normalized `protection` label object onto every resource
+                   (Get-CVProtectionPosture), builds the `summary`, and emits a normalized `protection_summary`
+                   rollup counted by the same vocabulary. Includes whatever workloads the caller passes - no
+                   per-type allow-list - so coverage follows the estate.
+      .PARAMETER Workloads  Ordered map workloadKey -> @{ Items=[object[]]; Type='<summary bucket>';
+                            PostureType='<control-set key>'; SizeField='<GB prop>' }.
+                            `Type` names the summary / protection_summary bucket (a display name, e.g. 'Aurora');
+                            keys sharing a Type accumulate. `PostureType` (defaults to Type) is the resilience
+                            control-set key used for posture - so Aurora/DocumentDB can bucket separately yet share
+                            the RDS controls, and MySQL/PostgreSQL share FlexDB.
+      .PARAMETER Controls   The cloud's ResourceType -> controls hashtable, for posture fallback when the
+                            resilience pass did not run (no Ctl_* columns on the row).
+      .OUTPUTS  The path written.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('aws','azure','gcp')][string]$Cloud,
+        [Parameter(Mandatory)][string]$OutputDir,
+        [Parameter(Mandatory)][string]$TimeStamp,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Metadata,
+        [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$Workloads,
+        [hashtable]$Controls,
+        [string]$SchemaVersion = '3.0'
+    )
+
+    $summary      = [ordered]@{}
+    $protSummary  = [ordered]@{}
+    $workloadsOut = [ordered]@{}
+
+    foreach ($key in @($Workloads.Keys)) {
+        $entry     = $Workloads[$key]
+        $items     = @($entry.Items | Where-Object { $null -ne $_ })
+        $type      = if ($entry.Type) { $entry.Type } else { $key }
+        $postType  = if ($entry.PostureType) { $entry.PostureType } else { $type }
+        $sizeField = $entry.SizeField
+        $ctrlSet   = if ($Controls -and $postType -and $Controls.ContainsKey($postType)) { $Controls[$postType] } else { $null }
+
+        # Size total for this collection (skip non-numeric / missing values).
+        $sumGb = 0.0
+        if ($sizeField) {
+            foreach ($it in $items) {
+                $v = $it.$sizeField
+                if ($null -ne $v -and "$v" -match '^\s*-?[\d\.]+\s*$') { $sumGb += [double]$v }
+            }
+        }
+
+        # Attach the normalized protection label object to each resource; keep the postures for the rollup.
+        $postures = foreach ($it in $items) {
+            $p = Get-CVProtectionPosture -Resource $it -Cloud $Cloud -ResourceType $postType -ControlSet $ctrlSet
+            Add-Member -InputObject $it -NotePropertyName protection -NotePropertyValue $p -Force
+            $p
+        }
+        $workloadsOut[$key] = $items
+
+        # summary - accumulate by engine type so shared-type keys (FlexDB) sum rather than overwrite.
+        if (-not $summary.Contains($type)) { $summary[$type] = [ordered]@{ count = 0; total_storage_gb = 0.0; notes = '' } }
+        $summary[$type].count            += $items.Count
+        $summary[$type].total_storage_gb += $sumGb
+
+        # protection_summary - counted by the per-resource label vocabulary.
+        if (-not $protSummary.Contains($type)) {
+            $protSummary[$type] = [ordered]@{ total = 0; protected = 0; unprotected = 0; not_assessed = 0
+                                              immutable = 0; publicly_exposed = 0; pitr_enabled = 0; cross_region = 0 }
+        }
+        $ps = $protSummary[$type]
+        foreach ($p in @($postures)) {
+            $ps.total++
+            switch ($p.backup) { 'Protected' { $ps.protected++ } 'Unprotected' { $ps.unprotected++ } default { $ps.not_assessed++ } }
+            if ($p.immutability    -eq 'Immutable') { $ps.immutable++ }
+            if ($p.public_exposure -eq 'Public')    { $ps.publicly_exposed++ }
+            if ($p.pitr            -eq 'Enabled')   { $ps.pitr_enabled++ }
+            if ($p.cross_region    -eq 'Protected') { $ps.cross_region++ }
+        }
+    }
+
+    foreach ($t in @($summary.Keys)) { $summary[$t].total_storage_gb = [math]::Round([double]$summary[$t].total_storage_gb, 4) }
+
+    # Overall coverage over resources whose backup was actually assessed (NotAssessed excluded, never a failure).
+    $ovTotal = 0; $ovProt = 0; $ovUnprot = 0; $ovNA = 0
+    foreach ($t in @($protSummary.Keys)) {
+        $ovTotal += $protSummary[$t].total; $ovProt += $protSummary[$t].protected
+        $ovUnprot += $protSummary[$t].unprotected; $ovNA += $protSummary[$t].not_assessed
+    }
+    $protSummary['_overall'] = [ordered]@{
+        total        = $ovTotal
+        protected    = $ovProt
+        unprotected  = $ovUnprot
+        not_assessed = $ovNA
+        coverage_pct = if (($ovProt + $ovUnprot) -gt 0) { [math]::Round(100 * [double]$ovProt / ($ovProt + $ovUnprot), 1) } else { $null }
+    }
+
+    $meta = [ordered]@{}
+    foreach ($k in $Metadata.Keys) { $meta[$k] = $Metadata[$k] }
+    $meta['cloud']          = $Cloud
+    $meta['generated_at']   = (Get-Date -Format 'o')
+    $meta['schema_version'] = $SchemaVersion
+
+    $doc = [ordered]@{
+        metadata           = $meta
+        summary            = $summary
+        protection_summary = $protSummary
+        workloads          = $workloadsOut
+    }
+
+    if (-not (Test-Path -LiteralPath $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
+    $jsonPath = Join-Path $OutputDir ("{0}_sizing_{1}.json" -f $Cloud, $TimeStamp)
+    $doc | ConvertTo-Json -Depth 12 | Set-Content -Path $jsonPath -Encoding UTF8
+    return $jsonPath
+}
+
 #endregion
 
 #region ---------------------------------------------------------- Spectre helpers (internal)

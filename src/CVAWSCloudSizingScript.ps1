@@ -71,7 +71,7 @@
             – Account-level report (workload summaries + detailed sheets per service)
         - comprehensive_all_aws_accounts_summary_YYYY-MM-DD_HHMMSS.xlsx
             – Consolidated report across all AWS accounts
-        - aws_sizing_YYYY-MM-DD_HHMMSS.json        (only with -OutputFormat json|both)
+        - aws_sizing_YYYY-MM-DD_HHMMSS.json        (default; omit with -OutputFormat csv)
     Output/aws_YYYY-MM-DD_HHMMSS.zip
         – ZIP archive of the run's output files
     Logs/aws_YYYY-MM-DD_HHMMSS.log
@@ -115,7 +115,7 @@ param (
     [switch]$SkipBucketTags,
     [switch]$DebugBucketTags,
     [switch]$SelectiveZipping = $true,
-    [ValidateSet("csv","json","both")][string]$OutputFormat = "csv",  # Output format: csv (default), json, or both
+    [ValidateSet("csv","json","both")][string]$OutputFormat = "both",  # Output format: csv, json, or both (default - JSON feeds the cloud posture report)
     [switch]$NonInteractive,   # force plain, non-interactive output (no progress bars / rich UI) - for CI / automation
     [switch]$Quiet,            # minimal console output (still writes the full log file)
     [switch]$SkipResilienceReport, # do not compute or write the cyber resilience posture report
@@ -774,6 +774,66 @@ function Get-AWSBackupRecoveryPoint {
     } catch { return $null }
 }
 
+# ── AWS immutability lookups: Backup Vault Lock + S3 Object Lock ────────────
+# Same discipline as the backup helpers: a lookup we could not perform returns $null (Unknown), never a
+# fabricated "not immutable". Vault Lock is a VAULT property, so we map the resource's most recent recovery
+# point to its vault, then read that vault's Locked flag from a per-region list fetched once.
+$script:AWSBackupVaultLockCache = @{}   # Region -> @{ VaultName -> [bool]Locked } ; $null when the list lookup failed
+
+function Get-AWSBackupVaultLockMap {
+    <# .SYNOPSIS  Region-scoped VaultName -> Locked(bool). $null when the vault list could not be read (Unknown). #>
+    param($Credential, [string]$Region)
+    if ($script:AWSBackupVaultLockCache.ContainsKey($Region)) { return $script:AWSBackupVaultLockCache[$Region] }
+    $cmd = Resolve-CVAwsCommand -Candidates @('Get-BAKBackupVaultList','Get-BKPBackupVaultList')
+    if (-not $cmd) { $script:AWSBackupVaultLockCache[$Region] = $null; return $null }
+    try {
+        $vaults = & $cmd -Credential $Credential -Region $Region -ErrorAction Stop
+        $map = @{}
+        foreach ($v in @($vaults)) { if ($v.BackupVaultName) { $map[$v.BackupVaultName] = [bool]$v.Locked } }
+        $script:AWSBackupVaultLockCache[$Region] = $map
+        return $map
+    } catch {
+        Write-ScriptOutput "AWS Backup vault list lookup failed in ${Region}: $($_.Exception.Message)" -Level Warning
+        $script:AWSBackupVaultLockCache[$Region] = $null
+        return $null
+    }
+}
+
+function Get-AWSBackupVaultLocked {
+    <#
+      .SYNOPSIS  Is the resource's most recent recovery point held in a locked (immutable) vault?
+      .OUTPUTS   $true / $false, or $null when the resource is not AWS Backup protected, has no recovery point,
+                 or the vault list could not be read - so "we could not look" is never scored as "not immutable".
+      .PARAMETER RecoveryPoint  Optional already-fetched recovery point, to avoid a second API call.
+    #>
+    param([string]$ResourceArn, $RecoveryPoint, $Credential, [string]$Region)
+    $rp = if ($RecoveryPoint) { $RecoveryPoint } else { Get-AWSBackupRecoveryPoint -ResourceArn $ResourceArn -Credential $Credential -Region $Region }
+    if (-not $rp -or -not $rp.BackupVaultName) { return $null }
+    $map = Get-AWSBackupVaultLockMap -Credential $Credential -Region $Region
+    if ($null -eq $map) { return $null }
+    if ($map.ContainsKey($rp.BackupVaultName)) { return [bool]$map[$rp.BackupVaultName] }
+    return $null
+}
+
+function Get-S3ObjectLockEnabled {
+    <#
+      .SYNOPSIS  $true when S3 Object Lock (WORM) is enabled on the bucket, $false when it is definitively not,
+                 $null when the check could not be performed (Unknown - never a fabricated gap).
+    #>
+    param([string]$BucketName, $Credential, [string]$Region)
+    $cmd = Resolve-CVAwsCommand -Candidates @('Get-S3ObjectLockConfiguration')
+    if (-not $cmd) { return $null }
+    try {
+        $cfg = & $cmd -BucketName $BucketName -Credential $Credential -Region $Region -ErrorAction Stop
+        return [bool]("$($cfg.ObjectLockEnabled)" -eq 'Enabled')
+    } catch {
+        # A bucket with Object Lock never configured returns ObjectLockConfigurationNotFoundError - a real "no",
+        # not an Unknown. Any other error (permissions, throttling) stays Unknown.
+        if ("$($_.Exception.Message)" -match 'ObjectLockConfigurationNotFound|does not have an ObjectLock|not enabled') { return $false }
+        return $null
+    }
+}
+
 function Process-EC2Instance {
     param($Item, $Credential, $Region, $AccountInfo, $AccountAlias)
 
@@ -828,9 +888,13 @@ function Process-EC2Instance {
     $snapshotSizeGiB = 0
 
     # AWS Backup protected-resource list is per REGION, not per instance - fetch once and reuse.
+    $backupVaultLocked = $null
     $protectedArns = Get-AWSBackupProtectedArn -Credential $Credential -Region $Region
     if ($null -ne $protectedArns) {
-        $awsBackupProtected = @($protectedArns | Where-Object { $_ -like "*$($Item.InstanceId)*" }).Count -gt 0
+        $matchedArns = @($protectedArns | Where-Object { $_ -like "*$($Item.InstanceId)*" })
+        $awsBackupProtected = $matchedArns.Count -gt 0
+        # Immutability: are this instance's recovery points in a locked (immutable) Backup vault?
+        if ($awsBackupProtected) { $backupVaultLocked = Get-AWSBackupVaultLocked -ResourceArn $matchedArns[0] -Credential $Credential -Region $Region }
     }
 
     # EBS snapshots belong to VOLUMES, not instances: 'source-instance-id' is not a valid DescribeSnapshots
@@ -899,6 +963,7 @@ function Process-EC2Instance {
         # EC2 does not return an ARN, so build the canonical one rather than leave the row unjoinable.
         ResourceId            = "arn:aws:ec2:${Region}:$($AccountInfo.Account):instance/$($Item.InstanceId)"
         AWSBackupProtected    = $awsBackupProtected
+        BackupVaultLocked     = $backupVaultLocked
         EBSSnapshotCount      = $snapshotCount
         # Reported in TB only (decimal) - the sizing spreadsheet takes TB, and mixed units invite copy/paste errors.
         EBSSnapshotSizeTB     = [math]::Round(($snapshotSizeGiB * 1GB) / 1000000000000, 4)
@@ -1046,6 +1111,9 @@ function Process-S3Bucket {
             }
         } catch { $serverSideEncryption = 'None' }
 
+        # ── Object Lock (WORM immutability) ───────────────────────────────
+        $objectLockEnabled = Get-S3ObjectLockEnabled -BucketName $bucketName -Credential $Credential -Region $actualRegion
+
         # ── Protection status inference ───────────────────────────────────
         $s3ProtectionStatus = if ($replicationEnabled -and $versioningStatus -eq 'Enabled') { 'Protected' }
                               elseif ($versioningStatus -eq 'Enabled') { 'Versioned' }
@@ -1061,6 +1129,7 @@ function Process-S3Bucket {
             CreationDate          = if ($Item.CreationDate) { $Item.CreationDate } else { $null }
             VersioningStatus      = $versioningStatus
             PublicAccessBlocked   = $publicAccessBlocked
+            ObjectLockEnabled     = $objectLockEnabled
             ReplicationEnabled    = $replicationEnabled
             LifecycleRuleCount    = $lifecycleRuleCount
             ServerSideEncryption  = $serverSideEncryption
@@ -1717,7 +1786,10 @@ function Process-RDSInstance {
         $dbStatus = if ($Item.DBInstanceStatus) { $Item.DBInstanceStatus } else { 'unknown' }
 
         # ── AWS Backup coverage ───────────────────────────────────────────
-        $awsBackupProtected = [bool](Get-AWSBackupRecoveryPoint -ResourceArn $Item.DBInstanceArn -Credential $Credential -Region $Region)
+        $rdsRp = Get-AWSBackupRecoveryPoint -ResourceArn $Item.DBInstanceArn -Credential $Credential -Region $Region
+        $awsBackupProtected = [bool]$rdsRp
+        # Immutability: are the recovery points in a locked (immutable) Backup vault?
+        $backupVaultLocked = if ($rdsRp) { Get-AWSBackupVaultLocked -RecoveryPoint $rdsRp -Credential $Credential -Region $Region } else { $null }
 
         $protectionStatus = if ($awsBackupProtected) { 'Protected' }
                             elseif ($automatedBackupsEnabled) { 'Automated-Backup' }
@@ -1745,6 +1817,7 @@ function Process-RDSInstance {
             PITREnabled             = $pitrEnabled
             LatestRestorableTime    = $latestRestorableTime
             AWSBackupProtected      = $awsBackupProtected
+            BackupVaultLocked       = $backupVaultLocked
             ProtectionStatus        = $protectionStatus
             SizeGiB                 = $sizes.SizeGiB
             SizeTiB                 = $sizes.SizeTiB
@@ -1835,6 +1908,8 @@ function Process-DocumentDBCluster {
         $docdbPitrEnabled = $docdbBackupDays -gt 0
         $docdbLatestRestore = if ($Item.LatestRestorableTime) { $Item.LatestRestorableTime.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
         $docdbEarliestRestore = if ($Item.EarliestRestorableTime) { $Item.EarliestRestorableTime.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+        # Immutability: recovery points held in a locked (immutable) AWS Backup vault.
+        $backupVaultLocked = Get-AWSBackupVaultLocked -ResourceArn $Item.DBClusterArn -Credential $Credential -Region $Region
 
         $docdbClusterObj = [PSCustomObject]@{
             AwsAccountId          = "$($AccountInfo.Account)"
@@ -1854,6 +1929,7 @@ function Process-DocumentDBCluster {
             ClusterCreateTime     = if ($Item.ClusterCreateTime) { $Item.ClusterCreateTime } else { $null }
             BackupRetentionPeriod = $docdbBackupDays
             PITREnabled           = $docdbPitrEnabled
+            BackupVaultLocked     = $backupVaultLocked
             LatestRestorableTime  = $docdbLatestRestore
             EarliestRestorableTime = $docdbEarliestRestore
             PreferredBackupWindow = if ($Item.PreferredBackupWindow) { $Item.PreferredBackupWindow } else { $null }
@@ -1900,6 +1976,8 @@ function Process-AuroraCluster {
         $aurPitrEnabled = ($Item.BackupRetentionPeriod -ne $null) -and ([int]$Item.BackupRetentionPeriod -gt 0)
         $aurLatestRestore = if ($Item.LatestRestorableTime) { $Item.LatestRestorableTime.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
         $aurEarliestRestore = if ($Item.EarliestRestorableTime) { $Item.EarliestRestorableTime.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
+        # Immutability: recovery points held in a locked (immutable) AWS Backup vault.
+        $backupVaultLocked = Get-AWSBackupVaultLocked -ResourceArn $Item.DBClusterArn -Credential $Credential -Region $Region
 
         $auroraObj = [PSCustomObject]@{
             AwsAccountId          = "$($AccountInfo.Account)"
@@ -1917,6 +1995,7 @@ function Process-AuroraCluster {
             InstanceCount         = ($Item.DBClusterMembers | Measure-Object).Count
             BackupRetentionDays   = $Item.BackupRetentionPeriod
             PITREnabled           = $aurPitrEnabled
+            BackupVaultLocked     = $backupVaultLocked
             LatestRestorableTime  = $aurLatestRestore
             EarliestRestorableTime = $aurEarliestRestore
             SizeGiB               = $sizes.SizeGiB
@@ -2065,6 +2144,9 @@ function Process-DynamoDBTable {
 
         $ddbProtectionStatus = if ($pitrEnabled) { 'Protected' } else { 'Unprotected' }
 
+        # Immutability: recovery points held in a locked (immutable) AWS Backup vault.
+        $backupVaultLocked = if ($tableArn) { Get-AWSBackupVaultLocked -ResourceArn $tableArn -Credential $Credential -Region $Region } else { $null }
+
         $ddbObj = [PSCustomObject]@{
             AwsAccountId     = "$($AccountInfo.Account)"
             AwsAccountAlias  = $AccountAlias
@@ -2076,6 +2158,7 @@ function Process-DynamoDBTable {
             TableStatus      = $tableStatus
             ItemCount        = $itemCount
             PITREnabled      = $pitrEnabled
+            BackupVaultLocked = $backupVaultLocked
             ProtectionStatus = $ddbProtectionStatus
             TableSizeGiB     = $sizes.SizeGiB
             TableSizeTiB     = $sizes.SizeTiB
@@ -4000,183 +4083,40 @@ try {
     # ============================================================
     if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
         Write-ScriptOutput "Writing JSON sizing output..." -Level Info
-        $jsonSummary = @{}
-        $allWorkloads = @{}
 
-        # Map each service to the GB property on its workload objects
+        # GB property per service (same fields the CSV/summary use).
         $serviceSizeField = @{
-            EC2              = "SizeGB"
-            S3               = "SizeGB"
-            EFS              = "SizeGB"
-            FSX              = "SizeGB"
-            FSX_SVM          = $null
-            EKS              = $null
-            UnattachedVolumes = "SizeGB"
-            RDS              = "SizeGB"
-            DynamoDB         = "TableSizeGB"
-            Redshift         = "TotalSizeGB"
-            DocumentDB       = "SizeGB"
-            Aurora           = "SizeGB"
-            ElastiCache      = $null
-            AWSBackup        = "LastBackupSizeGB"
+            EC2 = "SizeGB"; S3 = "SizeGB"; EFS = "SizeGB"; FSX = "SizeGB"; FSX_SVM = $null; EKS = $null
+            UnattachedVolumes = "SizeGB"; RDS = "SizeGB"; DynamoDB = "TableSizeGB"; Redshift = "TotalSizeGB"
+            DocumentDB = "SizeGB"; Aurora = "SizeGB"; ElastiCache = $null; AWSBackup = "LastBackupSizeGB"
         }
 
-        foreach ($account in $script:AccountsProcessed) {
-            foreach ($serviceName in $script:ServiceRegistry.Keys) {
-                $items = @($script:ServiceDataByAccount[$account.Account][$serviceName])
-                if ($items.Count -gt 0) {
-                    $key = "aws_" + $serviceName.ToLower()
-                    if (-not $allWorkloads.ContainsKey($key)) { $allWorkloads[$key] = @() }
-                    $allWorkloads[$key] += $items
-                }
-                if (-not $jsonSummary.ContainsKey($serviceName)) {
-                    $jsonSummary[$serviceName] = @{ count = 0; total_storage_gb = 0.0; notes = "" }
-                }
-                $jsonSummary[$serviceName].count += $items.Count
-
-                # Accumulate storage from each workload item
-                $sizeField = $serviceSizeField[$serviceName]
-                if ($sizeField -and $items.Count -gt 0) {
-                    foreach ($item in $items) {
-                        $val = $item.$sizeField
-                        if ($null -ne $val) {
-                            $jsonSummary[$serviceName].total_storage_gb += [double]$val
-                        }
-                    }
+        # One workload array per service, merged across accounts. Type is the service (summary bucket);
+        # PostureType is its resilience control set (Aurora/DocumentDB share RDS; UnattachedVolumes -> EBS).
+        $workloads = [ordered]@{}
+        foreach ($serviceName in $script:ServiceRegistry.Keys) {
+            $merged = New-Object System.Collections.Generic.List[psobject]
+            foreach ($account in $script:AccountsProcessed) {
+                foreach ($item in @($script:ServiceDataByAccount[$account.Account][$serviceName])) {
+                    if ($null -ne $item) { $merged.Add($item) }
                 }
             }
-        }
-
-        # Round all totals to 4 decimal places
-        foreach ($key in @($jsonSummary.Keys)) {
-            $jsonSummary[$key].total_storage_gb = [math]::Round($jsonSummary[$key].total_storage_gb, 4)
-        }
-
-        # ── Protection summary (cross-service) ────────────────────────────
-        function Get-ProtectionCounts {
-            param([array]$Items)
-            if (-not $Items -or $Items.Count -eq 0) {
-                return @{ protected = 0; unprotected = 0; partial = 0; unknown = 0; total = 0; assessed = 0; coverage_pct = $null }
-            }
-            $protected   = ($Items | Where-Object { $_.ProtectionStatus -eq 'Protected' }).Count
-            $automated   = ($Items | Where-Object { $_.ProtectionStatus -in @('Automated-Backup','Snapshot-Only','Versioned') }).Count
-            $unprotected = ($Items | Where-Object { $_.ProtectionStatus -eq 'Unprotected' }).Count
-            # Resources we could not assess are reported separately and excluded from the coverage denominator -
-            # rolling them into "unprotected" would overstate exposure using data we never collected.
-            $unknown     = ($Items | Where-Object { $_.ProtectionStatus -eq 'Unknown' -or -not $_.ProtectionStatus }).Count
-            $total       = $Items.Count
-            $assessed     = $protected + $automated + $unprotected
-            $coveredCount = $protected + $automated
-            return @{
-                protected       = $protected
-                partial         = $automated
-                unprotected     = $unprotected
-                unknown         = $unknown
-                total           = $total
-                assessed        = $assessed
-                coverage_pct    = if ($assessed -gt 0) { [math]::Round(($coveredCount / $assessed) * 100, 1) } else { $null }
+            if ($merged.Count -eq 0) { continue }
+            $workloads["aws_" + $serviceName.ToLower()] = @{
+                Items       = $merged.ToArray()
+                Type        = $serviceName
+                PostureType = $script:AwsResilienceMap[$serviceName]
+                SizeField   = $serviceSizeField[$serviceName]
             }
         }
 
-        $protectionSummary = @{}
-
-        # EC2
-        $ec2Items = @($allWorkloads['aws_ec2'] | Where-Object { $_ -ne $null })
-        $protectionSummary['EC2'] = Get-ProtectionCounts -Items $ec2Items
-        $protectionSummary['EC2']['encrypted_volumes_pct'] = if ($ec2Items.Count -gt 0) {
-            $encTotal = ($ec2Items | Where-Object { $_.AllVolumesEncrypted -eq $true }).Count
-            [math]::Round(($encTotal / $ec2Items.Count) * 100, 1)
-        } else { 0.0 }
-
-        # RDS
-        $rdsItems = @($allWorkloads['aws_rds'] | Where-Object { $_ -ne $null })
-        $protectionSummary['RDS'] = Get-ProtectionCounts -Items $rdsItems
-        $protectionSummary['RDS']['multi_az_pct'] = if ($rdsItems.Count -gt 0) {
-            [math]::Round((($rdsItems | Where-Object { $_.MultiAZ -eq $true }).Count / $rdsItems.Count) * 100, 1)
-        } else { 0.0 }
-        $protectionSummary['RDS']['encrypted_pct'] = if ($rdsItems.Count -gt 0) {
-            [math]::Round((($rdsItems | Where-Object { $_.StorageEncrypted -eq $true }).Count / $rdsItems.Count) * 100, 1)
-        } else { 0.0 }
-
-        # S3
-        $s3Items = @($allWorkloads['aws_s3'] | Where-Object { $_ -ne $null })
-        $protectionSummary['S3'] = Get-ProtectionCounts -Items $s3Items
-        $protectionSummary['S3']['versioned_pct'] = if ($s3Items.Count -gt 0) {
-            [math]::Round((($s3Items | Where-Object { $_.VersioningStatus -eq 'Enabled' }).Count / $s3Items.Count) * 100, 1)
-        } else { 0.0 }
-        $protectionSummary['S3']['public_access_exposed_count'] = ($s3Items | Where-Object { $_.PublicAccessBlocked -eq $false }).Count
-
-        # EFS
-        $efsItems = @($allWorkloads['aws_efs'] | Where-Object { $_ -ne $null })
-        $protectionSummary['EFS'] = Get-ProtectionCounts -Items $efsItems
-        $protectionSummary['EFS']['encrypted_pct'] = if ($efsItems.Count -gt 0) {
-            [math]::Round((($efsItems | Where-Object { $_.Encrypted -eq $true }).Count / $efsItems.Count) * 100, 1)
-        } else { 0.0 }
-
-        # DynamoDB
-        $ddbItems = @($allWorkloads['aws_dynamodb'] | Where-Object { $_ -ne $null })
-        $protectionSummary['DynamoDB'] = Get-ProtectionCounts -Items $ddbItems
-        $protectionSummary['DynamoDB']['pitr_enabled_count'] = ($ddbItems | Where-Object { $_.PITREnabled -eq $true }).Count
-
-        # Redshift
-        $rsItems = @($allWorkloads['aws_redshift'] | Where-Object { $_ -ne $null })
-        $protectionSummary['Redshift'] = Get-ProtectionCounts -Items $rsItems
-        $protectionSummary['Redshift']['encrypted_pct'] = if ($rsItems.Count -gt 0) {
-            [math]::Round((($rsItems | Where-Object { $_.Encrypted -eq $true }).Count / $rsItems.Count) * 100, 1)
-        } else { 0.0 }
-
-        # Unattached Volumes
-        $uvItems = @($allWorkloads['aws_unattachedvolumes'] | Where-Object { $_ -ne $null })
-        $uvEncryptedCount = ($uvItems | Where-Object { $_.Encrypted -eq $true }).Count
-        $protectionSummary['UnattachedVolumes'] = @{
-            total               = $uvItems.Count
-            encrypted_count     = $uvEncryptedCount
-            unencrypted_count   = $uvItems.Count - $uvEncryptedCount
-        }
-
-        # Aurora
-        $auroraItems = @($allWorkloads['aws_aurora'] | Where-Object { $_ -ne $null })
-        $protectionSummary['Aurora'] = @{
-            total          = $auroraItems.Count
-            multi_az_count = ($auroraItems | Where-Object { $_.MultiAZ -eq $true }).Count
-            protected      = ($auroraItems | Where-Object { [int]$_.BackupRetentionDays -gt 0 }).Count
-            unprotected    = ($auroraItems | Where-Object { [int]$_.BackupRetentionDays -eq 0 }).Count
-        }
-
-        # Cross-service totals
-        $allProtectable = @('EC2','RDS','S3','EFS','DynamoDB','Redshift')
-        $totalProtected   = ($allProtectable | ForEach-Object { $protectionSummary[$_].protected ?? 0 } | Measure-Object -Sum).Sum
-        $totalPartial     = ($allProtectable | ForEach-Object { $protectionSummary[$_].partial ?? 0 } | Measure-Object -Sum).Sum
-        $totalUnprotected = ($allProtectable | ForEach-Object { $protectionSummary[$_].unprotected ?? 0 } | Measure-Object -Sum).Sum
-        $totalWorkloads   = $totalProtected + $totalPartial + $totalUnprotected
-        $protectionSummary['_overall'] = @{
-            total_workloads      = $totalWorkloads
-            fully_protected      = $totalProtected
-            partially_protected  = $totalPartial
-            unprotected          = $totalUnprotected
-            overall_coverage_pct = if ($totalWorkloads -gt 0) {
-                [math]::Round((($totalProtected + $totalPartial) / $totalWorkloads) * 100, 1)
-            } else { 0.0 }
-        }
-
-        $jsonDoc = @{
-            metadata = @{
-                cloud          = "aws"
-                accounts       = @($script:AccountsProcessed | ForEach-Object { $_.Account })
-                generated_at   = (Get-Date -Format "o")
-                script_version = "2.2"
-            }
-            summary            = $jsonSummary
-            protection_summary = $protectionSummary
-            workloads          = $allWorkloads
-        }
-
-        $jsonTimestamp = (Get-Date -Format "yyyy-MM-dd_HHmmss")
         # Never fall back to $PSScriptRoot - that wrote the JSON report into the script's own source directory.
         $jsonOutDir = if ($script:ResolvedOutputDir) { $script:ResolvedOutputDir } else { $script:RunPaths.OutputDir }
-        if (-not (Test-Path $jsonOutDir)) { New-Item -ItemType Directory -Path $jsonOutDir -Force | Out-Null }
-        $jsonPath = Join-Path $jsonOutDir ("aws_sizing_" + $jsonTimestamp + ".json")
-        $jsonDoc | ConvertTo-Json -Depth 10 | Set-Content -Path $jsonPath -Encoding UTF8
+        $jsonPath = Export-CVSizingJson -Cloud 'aws' -OutputDir $jsonOutDir `
+            -TimeStamp (Get-Date -Format "yyyy-MM-dd_HHmmss") `
+            -Metadata ([ordered]@{ accounts = @($script:AccountsProcessed | ForEach-Object { $_.Account }); script_version = "2.2" }) `
+            -Workloads $workloads `
+            -Controls (Get-CVAwsResilienceControls)
         Write-ScriptOutput "JSON sizing report written: $jsonPath" -Level Success
     }
 

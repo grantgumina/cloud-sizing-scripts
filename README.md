@@ -153,20 +153,28 @@ Filters are `Key=Value` (union: a resource matches if it is in **any** listed re
 
 **Extra prerequisites for the Cloud Rewind pass:** AWS needs `AWS.Tools.ResourceGroupsTaggingAPI`; Azure needs `Az.Resources` + `Az.Network`; GCP needs the **Cloud Asset API** (`cloudasset.googleapis.com`) enabled. Add `-SkipCloudRewind` to run without them.
 
-## Cyber resilience signals
+## Cyber resilience gap report
 
-Alongside the inventory, every run exports the resilience-relevant configuration of each discovered resource to
-`Output/<cloud>_<timestamp>/<cloud>_resilience_signals_<timestamp>.csv` — one row per resource, one column per
-signal, using the values read from the cloud API.
+Alongside the inventory, every run scores each discovered resource against the Cloud Resilience Control Catalog
+and writes `Output/<cloud>_<timestamp>/<cloud>_resilience_gaps_<timestamp>.csv` — one row per resource that has
+at least one gap, or that could not be fully assessed. It measures the customer's **current native cloud configuration, as-is** — it is not a Commvault plan state.
 
-The file is deliberately **judgement-free**: it carries the values, not verdicts about them. There is no score, no
-risk weight and no pass/fail column, because scoring is owned by the backend and can be re-tuned there without
-reissuing reports.
-
-See **[CYBER_RESILIENCE_REPORT.md](CYBER_RESILIENCE_REPORT.md)** for the full schema and every signal, per cloud
-and per resource type.
+See **[CYBER_RESILIENCE_REPORT.md](CYBER_RESILIENCE_REPORT.md)** for how to read the file, how scoring works,
+and the full catalog of all 83 controls across the three clouds.
 
 Skip the pass entirely with `-SkipResilienceReport`.
+
+## JSON output for the cloud posture report
+
+Every AWS/Azure/GCP run also writes `<cloud>_sizing_<timestamp>.json` — the machine-readable feed for the
+downstream cloud posture report. It carries `metadata`, a per-service `summary`, a normalized
+`protection_summary` rollup, and `workloads` (one array per service). Each resource in `workloads` includes a
+`protection` object with a consistent, catalog-aligned status vocabulary — `backup`, `retention_days`,
+`immutability`, `pitr`, `public_exposure`, `cross_region`, and an `overall` label. The vocabulary and how it is
+derived are documented in **[CYBER_RESILIENCE_REPORT.md](CYBER_RESILIENCE_REPORT.md#json-protection-summary)**.
+
+`-OutputFormat` now defaults to **`both`** (CSV + JSON) so the JSON is always produced; pass `-OutputFormat csv`
+for CSV only, or `json` for JSON only. The JSON is included in the run's ZIP for upload.
 
 ## Repository layout
 
@@ -180,7 +188,7 @@ src/                 All sizing scripts (run these directly)
   common/CVSizing.Console.ps1       Shared console/diagnostics layer (loaded by the scripts)
   OCI/                              Oracle Cloud sizing (Python subproject)
 docs/                Per-cloud setup & run instructions (AWS.md, Azure.md, GoogleCloud.md)
-CYBER_RESILIENCE_REPORT.md   Resilience signal export: schema + every signal per cloud/resource type
+CYBER_RESILIENCE_REPORT.md   How the resilience gap report is scored + the full control catalog
 tests/               Dependency-free test suite for the shared console layer
 tools/               Show-CVConsoleDemo.ps1 - visual demo of the console layer
 k8s/                 Dockerfiles, entrypoints and Job manifests for containerized runs

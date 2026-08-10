@@ -38,6 +38,7 @@ function Get-CVAwsResilienceControls {
             [bool]([int]$r.DaysSinceLastBackup -le 7)
         }
         New-CVControl -Id 'ec2-encrypted' -Title 'All attached EBS volumes encrypted'          -Category DataExposure  -Severity High     -Test { param($r) Get-CVTri $r.AllVolumesEncrypted }
+        New-CVControl -Id 'ec2-vaultlock' -Title 'Backups held in a locked (immutable) vault'  -Category Immutability   -Severity High     -Test { param($r) Get-CVTri $r.BackupVaultLocked }
     )
 
     # EBS volumes tracked independently of an instance (includes unattached).
@@ -58,6 +59,7 @@ function Get-CVAwsResilienceControls {
         New-CVControl -Id 'rds-multiaz'   -Title 'Multi-AZ deployment'                         -Category Availability  -Severity High     -Test { param($r) Get-CVTri $r.MultiAZ }
         New-CVControl -Id 'rds-encrypted' -Title 'Storage encrypted at rest'                   -Category DataExposure  -Severity High     -Test { param($r) Get-CVTri $r.StorageEncrypted }
         New-CVControl -Id 'rds-delprot'   -Title 'Deletion protection enabled'                 -Category Immutability  -Severity High     -Test { param($r) Get-CVTri $r.DeletionProtection }
+        New-CVControl -Id 'rds-vaultlock' -Title 'Backups held in a locked (immutable) vault'  -Category Immutability  -Severity High     -Test { param($r) Get-CVTri $r.BackupVaultLocked }
     )
 
     $s3 = @(
@@ -73,6 +75,7 @@ function Get-CVAwsResilienceControls {
             [bool]("$($r.ServerSideEncryption)" -notin @('None','Disabled',''))
         }
         New-CVControl -Id 's3-public'     -Title 'Public access blocked'                       -Category DataExposure  -Severity Critical -Test { param($r) Get-CVTri $r.PublicAccessBlocked }
+        New-CVControl -Id 's3-objectlock' -Title 'Object Lock (WORM) enabled'                  -Category Immutability  -Severity High     -Test { param($r) Get-CVTri $r.ObjectLockEnabled }
         New-CVControl -Id 's3-lifecycle'  -Title 'Lifecycle policy configured'                 -Category RecoveryReady -Severity Medium   -Test {
             param($r)
             if ($null -eq $r.LifecycleRuleCount) { return $null }
@@ -92,6 +95,7 @@ function Get-CVAwsResilienceControls {
     $dynamodb = @(
         New-CVControl -Id 'ddb-pitr'      -Title 'Point-in-time recovery enabled'              -Category RecoveryReady -Severity Critical -Test { param($r) Get-CVTri $r.PITREnabled }
         New-CVControl -Id 'ddb-vault'     -Title 'Covered by an AWS Backup plan'               -Category RecoveryReady -Severity Medium   -Test { param($r) Get-CVTri $r.AWSBackupProtected }
+        New-CVControl -Id 'ddb-vaultlock' -Title 'Backups held in a locked (immutable) vault'  -Category Immutability  -Severity High     -Test { param($r) Get-CVTri $r.BackupVaultLocked }
     )
 
     $redshift = @(
