@@ -278,7 +278,13 @@ function Export-CVCsv {
             return
         }
 
-        $keys = [System.Collections.Specialized.OrderedDictionary]::new()
+        # OrdinalIgnoreCase is REQUIRED, not a nicety. OrderedDictionary defaults to a case-SENSITIVE comparer,
+        # so 'Tag_Demoroom' and 'Tag_demoroom' were admitted as two separate columns - but Select-Object resolves
+        # properties case-INSENSITIVELY and rejects the second with "the property ... already exists", spraying one
+        # error per row per collision. Cloud tag keys preserve case, so any estate tagging some resources 'owner'
+        # and others 'Owner' hit this. First-seen casing wins; the other row's value is still picked up because
+        # property lookup ignores case, which is why the CSV was correct despite the noise.
+        $keys = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
         foreach ($p in @($PreferredOrder)) {
             if ($p -and -not $keys.Contains($p)) { $keys[$p] = $true }
         }

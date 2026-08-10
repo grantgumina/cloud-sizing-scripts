@@ -169,6 +169,29 @@ $back = Import-Csv $csv
 Assert-CV 'row 1 Tag_env is empty, not missing' ($null -ne $back[0].PSObject.Properties['Tag_env']) $true
 Assert-CV 'row 2 Tag_env survived'              $back[1].Tag_env 'prod'
 Assert-CV 'row 2 StorageGB survived'            $back[1].StorageGB '10'
+
+# Reported from the field: cloud tag keys preserve case, so an estate tagging some resources 'owner' and others
+# 'Owner' produced one "the property ... already exists" error PER ROW. OrderedDictionary defaults to a
+# case-SENSITIVE comparer while Select-Object resolves properties case-insensitively, so case variants were
+# admitted as separate columns and then rejected. The CSV was still correct - the errors were pure noise - but
+# a screen of red during output writing reads like data loss.
+$caseA = [pscustomobject]@{ VMName = 'vm1'; Tag_Demoroom = 'yes'; Tag_owner = 'grant' }
+$caseB = [pscustomobject]@{ VMName = 'vm2'; Tag_demoroom = 'no';  Tag_Owner = 'chris' }
+$err = $null
+@($caseA, $caseB) | Export-CVCsv -Path $csv -ErrorVariable err -ErrorAction SilentlyContinue
+Assert-CV 'case-variant tag keys emit no errors' (@($err).Count) 0
+$hdr = (Get-Content $csv)[0]
+Assert-CV 'collapsed to one column per tag, first casing wins' $hdr '"VMName","Tag_Demoroom","Tag_owner"'
+# Collapsing must not lose the other row's value - property lookup is case-insensitive, so it still resolves.
+$rt = Import-Csv $csv
+Assert-CV 'row 1 value kept'                    $rt[0].Tag_Demoroom 'yes'
+Assert-CV 'row 2 differently-cased value kept'  $rt[1].Tag_Demoroom 'no'
+Assert-CV 'row 2 differently-cased owner kept'  $rt[1].Tag_owner 'chris'
+# Same collision via -PreferredOrder rather than between rows.
+$err = $null
+@($caseB) | Export-CVCsv -Path $csv -PreferredOrder @('VMName','Tag_Demoroom') -ErrorVariable err -ErrorAction SilentlyContinue
+Assert-CV 'preferred-order casing collision is clean' (@($err).Count) 0
+Assert-CV 'preferred casing wins over row casing' ((Get-Content $csv)[0]) '"VMName","Tag_Demoroom","Tag_Owner"'
 Remove-Item $csv -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------
