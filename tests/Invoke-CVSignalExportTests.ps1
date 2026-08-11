@@ -140,12 +140,25 @@ foreach ($spec in @(@{c='Azure';f='Get-CVAzureResilienceControls';min=20},
     Assert-CV "$($spec.c): no Gap_ columns leaked in" (@($c | Where-Object { $_ -like 'Gap_*' }).Count) 0
 }
 
-Write-Host "`n[10] Every signal field is documented in CYBER_RESILIENCE_REPORT.md"
+Write-Host "`n[10] Every signal field is documented in the signals reference"
 # The doc is now the schema reference for the backend, so an undocumented column is a real defect. The previous
 # version of this guard only checked control IDs, which is why the doc could describe Gap_<id> semantics long
 # after the export stopped emitting them.
-$docPath = Join-Path $repoRoot 'CYBER_RESILIENCE_REPORT.md'
-Assert-CV 'CYBER_RESILIENCE_REPORT.md exists' (Test-Path -LiteralPath $docPath) $true
+#
+# The filename is RESOLVED, not hardcoded. This guard silently died once already: it named
+# CYBER_RESILIENCE_REPORT.md, the file was renamed to CYBER_RESILIENCE_SIGNALS.md, and under
+# $ErrorActionPreference='Stop' the Get-Content below threw - so sections [10]-[12] stopped running altogether
+# and the suite died before printing its own pass/fail banner. A dead guard is worse than no guard, because the
+# green suite reads as proof. Accept either name, and fail loudly if neither is present.
+$docCandidates = @('CYBER_RESILIENCE_SIGNALS.md', 'CYBER_RESILIENCE_REPORT.md')
+$docPath = @($docCandidates | ForEach-Object { Join-Path $repoRoot $_ } |
+                Where-Object { Test-Path -LiteralPath $_ }) | Select-Object -First 1
+Assert-CV 'signals reference doc exists' ([bool]$docPath) $true
+if (-not $docPath) {
+    Write-Host "        looked for: $($docCandidates -join ', ')" -ForegroundColor DarkYellow
+    Write-Host ("`n======  {0} passed, {1} failed  ======`n" -f $script:Pass, ($script:Fail)) -ForegroundColor Red
+    exit 1
+}
 $doc = Get-Content -Raw $docPath
 $allFields = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 foreach ($spec in @('Azure','GCP','AWS')) {

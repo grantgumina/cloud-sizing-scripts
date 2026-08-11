@@ -1,44 +1,21 @@
 # Cyber Resilience Signal Export
 
-Reference for the resilience data produced by the AWS, Azure and Google Cloud sizing scripts: what the file
-contains, what every signal means, and which resource types carry which signals.
+This is a reference for the resilience data produced by the AWS, Azure and Google Cloud scripts.
 
 See [README.md](README.md) for installation and how to run the scripts.
 
 Each run writes `Output/<cloud>_<timestamp>/<cloud>_resilience_signals_<timestamp>.csv` — **one row per resource**
-of an assessed type, carrying the resilience-relevant configuration values read from the cloud API.
-
-## This file contains no verdicts
-
-It publishes **the values**, not conclusions about them. There is no score, no risk weight, no pass/fail column,
-and no gap count. Scoring, weighting and thresholds are owned by the backend so they can be re-tuned without
-reissuing reports.
-
-That is a deliberate reversal of an earlier design that emitted one `Gap_<control>` column per control holding
-`True`/`False`. It discarded information: `Gap_st-xregion = False` threw away the fact that the SKU was
-`Standard_RAGRS`, so no consumer could distinguish RA-GRS from GRS from GZRS, or re-decide what counts as
-geo-redundant. Note the polarity also differs — the old `Gap_st-public = False` is the new
-`PublicAccessBlocked = True`.
-
-Consequences, both intentional:
-
-- **Every resource of an assessed type appears**, not only ones with findings. Filtering to "has a gap" would
-  require a verdict.
-- **No rollups.** Counts of gaps, severity breakdowns and category percentages are all derived from verdicts, so
-  the backend computes them.
-
-The per-service inventory CSVs likewise no longer carry `Ctl_*` or `ResilienceScore` columns, and the console no
-longer prints a score.
+of an assessed type with the relevant configuration values read from the cloud API.
 
 ## Reading the file
 
 | Column | Meaning |
 |---|---|
 | `Scope` | Subscription (Azure), project (GCP) or account (AWS) |
-| `ResourceGroup` | Resource group / equivalent grouping. Blank where the type has none |
-| `ResourceType` | Which signal set applies to the row — see the tables below |
+| `ResourceGroup` | Resource group / equivalent grouping. Blank where the resource has none |
+| `ResourceType` | Classification of the resource
 | `ResourceName` | Resource name |
-| `ParentResource` | Server for a database, storage account for a file share. Blank otherwise |
+| `ParentResource` | Server for a database, storage account for a file share. Blank otherwise. |
 | `Region` | Region / location |
 | `ResourceId` | ARM ID (Azure), ARN (AWS), self-link (GCP). Blank where the type does not expose one |
 | `SizeGB` / `SizeTB` | Size. **Blank means unmeasured, not zero** — a resource we could not size is not a small one |
@@ -47,28 +24,14 @@ longer prints a score.
 | *signal columns* | The raw configuration values, named exactly as collected. See the tables below |
 
 **A blank signal means the value was not collected** — the API was not reachable, permission was denied, the
-service was not requested via `-Types`, or the signal does not apply to that resource type. It never means "off".
-`FALSE` and blank are distinct and must stay distinct in any consumer.
+service was not requested via `-Types`, or the signal does not apply to that resource type. `FALSE` and blank are distinct.
 
-`BackupDataStatus` and `SnapshotDataStatus` exist to explain a blank. A VM with `BackupEnabled` blank and
-`BackupDataStatus = Skipped` was simply not asked about; the same VM with `Failed` was asked and the query failed.
-Those are facts about collection, not judgements about the resource.
-
-**The schema is fixed.** Every column below is emitted on every run regardless of what the estate contains, so the
-header is byte-identical between runs and scopes. Because one file spans every resource type, most cells are blank
-by construction — a VM row populates only the VM signals.
+**The schema is fixed.** Every column below is emitted on every run regardless of what resource type, so the
+header is identical between runs. Because one file contains information for every resource type, most cells are blank
+by design — e.g. a VM row populates only the VM signals.
 
 ## Signals by cloud and resource type
 
-`Collected` = the script populates this today. `Not yet` = the signal is declared and has a column, but the value
-is not gathered, so the column is always blank. Those are tracked in `tests/Invoke-CVControlWiringTests.ps1` and
-cannot grow silently.
-
-> **A signal shared across resource types is only collected where its own row builder sets it.** `CmkEncrypted`
-> is read by five Azure control sets, and for a long time only storage accounts populated it — the other four
-> columns shipped blank while the wiring guard stayed green, because that guard searched the whole source tree
-> for the field name rather than the specific collection. Section `[4]` of the wiring test now resolves each
-> resource type to its own row builder, so this table cannot drift back out of truth unnoticed.
 
 ### Azure
 
@@ -167,15 +130,6 @@ Every AWS signal is collected today.
 | | `BackupXRegion` | ❌ not yet | Needs the backup plan's region |
 | | `SecretsEncryptionCmk` | ❌ not yet | Needs `databaseEncryption` from cluster describe |
 
-## Two traps worth restating
-
-**Polarity is not uniform.** `PublicAccessBlocked = TRUE` is the *good* state; `DeletionProtection = TRUE` is the
-good state; `BackupPolicyBackupType = Periodic` is the *weaker* state. The signal names describe what was measured,
-not whether it is good — which is the point, since "good" is the backend's call.
-
-**Two signals carry a source SKU rather than a boolean.** `StorageAccountSkuName` and the redundancy fields report
-Azure's own vocabulary (`Standard_RAGRS`, `GeoZone`, …). Consumers should match on substrings such as `GRS`/`GZRS`
-or `Geo` rather than expecting a fixed list, because Azure adds SKUs.
 
 ## Where this lives in the code
 

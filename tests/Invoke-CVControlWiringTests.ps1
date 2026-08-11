@@ -35,6 +35,12 @@ function Assert-CV { param([string]$Name, $Actual, $Expected)
     control that cannot be evaluated inflates UnassessedControls and makes the report look broken.
 #>
 $script:KnownUnwired = @{
+    # These two were exposed the moment the detector became per-cloud: both fields are set ONLY by the GCP
+    # script, so the old cross-cloud text blob reported them as wired for Azure while the columns shipped blank
+    # and CYBER_RESILIENCE_SIGNALS.md claimed both were collected. Both are being collected now; these entries
+    # exist so the suite stays green in between, and the stale-entry check below forces their removal.
+    'Azure/aks-backup'    = 'HasBackupPlan set only by GCP; Azure needs DataProtection backup instances'
+    'Azure/fs-backup'     = 'HasBackup set only by GCP; Azure Files items are collected but not attributed to shares'
     'Azure/aks-secretenc' = 'needs AKS SecurityProfile / KMS etcd-encryption lookup'
     'Azure/cos-delprot'   = 'needs Get-AzResourceLock per Cosmos account'
     'Azure/db-delprot'    = 'needs Get-AzResourceLock per SQL database'
@@ -53,11 +59,49 @@ $script:KnownUnwired = @{
 # they READ fields, and counting a control's own reference as "set" would defeat the whole check.
 $srcFiles = @(Get-ChildItem -Path (Join-Path $repoRoot 'src') -Recurse -Filter *.ps1 |
                 Where-Object { $_.Name -notlike 'CVSizing.Resilience.*' })
-$srcText  = ($srcFiles | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
+
+<#
+    PER-CLOUD, not one concatenated blob. A single $srcText made a field count as wired for EVERY cloud the
+    moment ANY cloud set it, so every field name shared between clouds - CmkEncrypted, SoftDeleteEnabled,
+    HasBackup, EncryptedAtRest, PublicAccessBlocked, HasBackupPlan - was untested in at least one of them.
+
+    That was not hypothetical: HasBackupPlan is set only in CVGoogleCloudSizingScript.ps1, yet Azure/aks-backup
+    passed this check and was absent from the allow-list, so Azure AKS backup coverage silently shipped blank
+    while CYBER_RESILIENCE_SIGNALS.md claimed it was collected.
+
+    A cloud sees: its own cloud script, the shared commons that any cloud can enrich rows through, and its own
+    per-cloud helpers - but never another cloud's script or helpers.
+#>
+$script:CVAgnosticCommons = @('CVSizing.Console.ps1', 'CVSizing.CloudRewind.ps1', 'CVSizing.Kubectl.ps1')
+$script:CVCloudScript     = @{ Azure = 'CVAzureCloudSizingScript.ps1'
+                              AWS   = 'CVAWSCloudSizingScript.ps1'
+                              GCP   = 'CVGoogleCloudSizingScript.ps1' }
+
+$script:CVCloudText = @{}
+foreach ($cloud in $script:CVCloudScript.Keys) {
+    $files = @($srcFiles | Where-Object {
+        $_.Name -eq $script:CVCloudScript[$cloud] -or
+        $_.Name -in $script:CVAgnosticCommons -or
+        $_.Name -like "*.$cloud.ps1"
+    })
+    $script:CVCloudText[$cloud] = ($files | ForEach-Object { Get-Content -Raw $_.FullName }) -join "`n"
+}
+# Guard the split itself: a typo in the filters would silently produce empty text and pass everything.
+foreach ($cloud in @('Azure','AWS','GCP')) {
+    Assert-CV "per-cloud source text built for $cloud" ([bool]($script:CVCloudText[$cloud].Length -gt 10000)) $true
+}
+# And prove the isolation is real, using the leak that motivated it.
+Assert-CV 'GCP sees HasBackupPlan'        ([bool]($script:CVCloudText['GCP']   -match '-NotePropertyName\s+HasBackupPlan\b')) $true
+Assert-CV 'Azure does NOT see it (leak closed)' ([bool]($script:CVCloudText['Azure'] -match '-NotePropertyName\s+HasBackupPlan\b')) $false
 
 function Test-CVFieldIsPopulated {
-    <# .SYNOPSIS  Does anything outside the control definitions assign this property name? #>
-    param([string]$Field)
+    <#
+      .SYNOPSIS  Does anything outside the control definitions assign this property name, IN THIS CLOUD?
+      .PARAMETER Cloud  Azure | AWS | GCP. Required: a global search is what let a GCP-only field mark an
+                        Azure control as wired.
+    #>
+    param([string]$Field, [Parameter(Mandatory)][ValidateSet('Azure','AWS','GCP')][string]$Cloud)
+    $srcText = $script:CVCloudText[$Cloud]
     $e = [regex]::Escape($Field)
     return  ($srcText -match "\b$e\s*=")               -or   # Field = value            (bare hashtable key)
             ($srcText -match "[""']$e[""']\s*=")        -or   # "Field" = value          (quoted hashtable key)
@@ -68,11 +112,14 @@ function Test-CVFieldIsPopulated {
 
 Write-Host "`n[0] Detector sanity - it must find real assignments and miss absent ones"
 # Guard the guard: a broken detector would silently pass everything.
-Assert-CV 'finds a bare hashtable key'   (Test-CVFieldIsPopulated 'BackupEnabled')            $true
-Assert-CV 'finds an .Add() key'          (Test-CVFieldIsPopulated 'BackupStorageRedundancy')  $true
-Assert-CV 'finds a quoted hashtable key' (Test-CVFieldIsPopulated 'BackupPolicyBackupType')   $true
-Assert-CV 'finds an Add-Member field'    (Test-CVFieldIsPopulated 'XRegionBackup')            $true
-Assert-CV 'misses a field nobody sets'   (Test-CVFieldIsPopulated 'TotallyFakeFieldXyz')      $false
+Assert-CV 'finds a bare hashtable key'   (Test-CVFieldIsPopulated 'BackupEnabled'           -Cloud Azure) $true
+Assert-CV 'finds an .Add() key'          (Test-CVFieldIsPopulated 'BackupStorageRedundancy' -Cloud Azure) $true
+Assert-CV 'finds a quoted hashtable key' (Test-CVFieldIsPopulated 'BackupPolicyBackupType'  -Cloud Azure) $true
+Assert-CV 'finds an Add-Member field'    (Test-CVFieldIsPopulated 'XRegionBackup'           -Cloud GCP)   $true
+Assert-CV 'misses a field nobody sets'   (Test-CVFieldIsPopulated 'TotallyFakeFieldXyz'     -Cloud Azure) $false
+# The isolation itself, at the detector level: GCP sets HasBackupPlan, Azure does not.
+Assert-CV 'GCP: HasBackupPlan populated'   (Test-CVFieldIsPopulated 'HasBackupPlan' -Cloud GCP)   $true
+Assert-CV 'Azure: HasBackupPlan NOT populated' (Test-CVFieldIsPopulated 'HasBackupPlan' -Cloud Azure) $false
 
 Write-Host "`n[1] Every control reads at least one field it could actually be given"
 $unwired = @()
@@ -88,7 +135,7 @@ foreach ($spec in @(@{c='Azure';f='Get-CVAzureResilienceControls'},
             $fields = @([regex]::Matches($ctl.Test.ToString(), '\$r\.([A-Za-z_][A-Za-z0-9_]*)') |
                           ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
             if (-not $fields.Count) { continue }   # a control with no $r.* reference is a constant; not our concern
-            $missing = @($fields | Where-Object { -not (Test-CVFieldIsPopulated $_) })
+            $missing = @($fields | Where-Object { -not (Test-CVFieldIsPopulated $_ -Cloud $spec.c) })
             # Only fully-dead controls matter: if ANY field it reads is populated, the control can produce a verdict.
             if ($missing.Count -eq $fields.Count) {
                 $unwired += "$($spec.c)/$($ctl.Id)"
@@ -105,7 +152,9 @@ if ($unexpected.Count) {
     Write-Host "        These controls read fields nothing populates - they can never be evaluated:" -ForegroundColor DarkYellow
     $unexpected | ForEach-Object { Write-Host "          $_" -ForegroundColor DarkYellow }
     Write-Host "        Either point the Test at the field the inventory row actually carries, collect the" -ForegroundColor DarkYellow
-    Write-Host "        signal, or add it to \$script:KnownUnwired with a reason." -ForegroundColor DarkYellow
+    # Backtick, not backslash: PowerShell's escape in a double-quoted string. "\$script:KnownUnwired" rendered
+    # as "\System.Collections.Hashtable" because the variable interpolated anyway.
+    Write-Host "        signal, or add it to `$script:KnownUnwired with a reason." -ForegroundColor DarkYellow
 }
 
 # And the reverse: an allow-list entry that is now wired should be REMOVED, or the list rots into a lie.
@@ -181,7 +230,10 @@ $builders = @{
     FlexDB    = @('mysqlObj', 'postgresObj')
     Cosmos    = @('cosmosObj')
     FileShare = @('fileShareObj')
-    AKS       = @('aksObj')
+    # NOT 'aksObj' - no such variable exists. The AKS row is built as $AKSCluster, so the mapping silently
+    # resolved to an empty field set and the AKS half of this section asserted nothing at all. Spelling must
+    # match the source exactly: the extractor compares assignment extent text with case-sensitive -eq.
+    AKS       = @('AKSCluster')
 }
 
 function Get-CVBuilderFields {
@@ -207,13 +259,35 @@ function Get-CVBuilderFields {
     return $fields
 }
 
-# Enrichment fields: Add-Member -NotePropertyName X, applied post-hoc to whole collections.
+# Enrichment fields: Add-Member -NotePropertyName X, applied post-hoc to whole collections. Scoped to Azure -
+# a global sweep here was the second half of the same leak, and on its own was enough to make Azure/aks-backup
+# look wired off GCP's HasBackupPlan even after the detector above was fixed.
 $enriched = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-[regex]::Matches($srcText, '-NotePropertyName\s+[''"]?([A-Za-z_][A-Za-z0-9_]*)') |
+[regex]::Matches($script:CVCloudText['Azure'], '-NotePropertyName\s+[''"]?([A-Za-z_][A-Za-z0-9_]*)') |
     ForEach-Object { [void]$enriched.Add($_.Groups[1].Value) }
+Assert-CV 'enriched set is Azure-scoped (excludes GCP HasBackupPlan)' ([bool]$enriched.Contains('HasBackupPlan')) $false
 
 Assert-CV 'builder-field extraction works (vmObj has VMName)' ([bool](Get-CVBuilderFields 'vmObj').Contains('VMName')) $true
 Assert-CV 'builder-field extraction is scoped (vmObj lacks DiskName)' ([bool](Get-CVBuilderFields 'vmObj').Contains('DiskName')) $false
+
+# Guard the mapping itself. A $builders entry naming a variable that does not exist yields an empty field set,
+# which makes that resource type's whole check pass for free - it asserted nothing while looking like it did.
+# That is exactly what AKS = @('aksObj') did. Every declared builder must resolve to real fields.
+$emptyBuilders = @()
+foreach ($type in ($builders.Keys | Sort-Object)) {
+    foreach ($b in $builders[$type]) {
+        if (-not (Get-CVBuilderFields $b).Count) { $emptyBuilders += "$type -> `$$b" }
+    }
+}
+Assert-CV 'every declared row builder resolves to real fields' $emptyBuilders.Count 0
+if ($emptyBuilders.Count) {
+    Write-Host "        these name no variable that exists in the Azure script:" -ForegroundColor DarkYellow
+    $emptyBuilders | ForEach-Object { Write-Host "          $_" -ForegroundColor DarkYellow }
+}
+# And every resource type with controls must have a builder mapping, or the loop below skips it entirely.
+$unmappedTypes = @((Get-CVAzureResilienceControls).Keys | Where-Object { -not $builders.ContainsKey($_) })
+Assert-CV 'every Azure resource type has a builder mapping' $unmappedTypes.Count 0
+if ($unmappedTypes.Count) { Write-Host "        unmapped: $($unmappedTypes -join ', ')" -ForegroundColor DarkYellow }
 
 . (Join-Path $repoRoot 'src' 'common' 'CVSizing.Resilience.Azure.ps1')
 $azSets = Get-CVAzureResilienceControls

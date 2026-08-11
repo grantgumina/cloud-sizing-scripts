@@ -163,7 +163,7 @@ The file is deliberately **judgement-free**: it carries the values, not verdicts
 risk weight and no pass/fail column, because scoring is owned by the backend and can be re-tuned there without
 reissuing reports.
 
-See **[CYBER_RESILIENCE_REPORT.md](CYBER_RESILIENCE_REPORT.md)** for the full schema and every signal, per cloud
+See **[CYBER_RESILIENCE_SIGNALS.md](CYBER_RESILIENCE_SIGNALS.md)** for the full schema and every signal, per cloud
 and per resource type.
 
 Skip the pass entirely with `-SkipResilienceReport`.
@@ -180,7 +180,7 @@ src/                 All sizing scripts (run these directly)
   common/CVSizing.Console.ps1       Shared console/diagnostics layer (loaded by the scripts)
   OCI/                              Oracle Cloud sizing (Python subproject)
 docs/                Per-cloud setup & run instructions (AWS.md, Azure.md, GoogleCloud.md)
-CYBER_RESILIENCE_REPORT.md   Resilience signal export: schema + every signal per cloud/resource type
+CYBER_RESILIENCE_SIGNALS.md  Resilience signal export: schema + every signal per cloud/resource type
 tests/               Dependency-free test suite for the shared console layer
 tools/               Show-CVConsoleDemo.ps1 - visual demo of the console layer
 k8s/                 Dockerfiles, entrypoints and Job manifests for containerized runs
