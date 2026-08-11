@@ -128,6 +128,27 @@ $addMemberOffenders = @(Get-ChildItem -Path $srcRoot -Recurse -Filter *.ps1 | Fo
 Assert-CV 'every Add-Member -NotePropertyName passes -Force' $addMemberOffenders.Count 0
 if ($addMemberOffenders.Count) { $addMemberOffenders | ForEach-Object { Write-Host "        $_" -ForegroundColor DarkYellow } }
 
+Write-Host "`n[7a2] The Azure script goes through the shared console and metric layers"
+<#
+    Raw Write-Progress bypasses the console layer entirely: no tier awareness (so -NonInteractive still emitted
+    bars), no 300ms throttle, no owner-thread guard. It also used bare integer ids, and ids 3, 8 and 9 were each
+    reused for TWO different activities, so those bars overwrote one another.
+
+    Raw Get-AzMetric bypasses Get-CVAzMetricValue, which owns the per-metric window and reports NoDatapoint as
+    $null instead of a measured 0. Worse, a single multi-name Get-AzMetric call couples the metrics together: one
+    unsupported name throws and blanks ALL of them. That is not hypothetical - requesting
+    storage_space_used_mb and reserved_storage_mb together silently blanked every SQL Managed Instance storage
+    column until each was queried independently.
+#>
+$azBodyLayer = Get-Content -Raw (Join-Path $srcRoot 'CVAzureCloudSizingScript.ps1')
+$rawProgress = @([regex]::Matches($azBodyLayer, '(?m)^[^#\r\n]*\bWrite-Progress\b'))
+Assert-CV 'Azure: no raw Write-Progress (use Update-/Complete-CVProgress)' $rawProgress.Count 0
+$rawMetric = @([regex]::Matches($azBodyLayer, '(?m)^[^#\r\n]*\bGet-AzMetric\b(?!Definition)'))
+Assert-CV 'Azure: no raw Get-AzMetric (use Get-CVAzMetricValue/-Set)' $rawMetric.Count 0
+# The console layer must actually be in use, so the two asserts above cannot be satisfied by removing progress.
+Assert-CV 'Azure: uses Update-CVProgress'   ([bool]($azBodyLayer -match '\bUpdate-CVProgress\b'))   $true
+Assert-CV 'Azure: uses Complete-CVProgress' ([bool]($azBodyLayer -match '\bComplete-CVProgress\b')) $true
+
 Write-Host "`n[7b] Every shared CV command a script calls is in that script's own `$cvRequired"
 <#
     The defect this catches: the Azure script called Install-CVKubectl while CVSizing.Kubectl.ps1 was absent from

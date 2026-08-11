@@ -354,5 +354,20 @@ finally {
 }
 
 # ---------------------------------------------------------------------------
+Write-Host "`n[Progress] Named scopes and -ParentId nesting"
+# The Azure script's 51 raw Write-Progress calls were migrated onto this layer. Two things had to hold:
+#  1. Update-CVProgress needed a -ParentId, or a 1:1 swap of a nested `Write-Progress -ParentId 1` would have
+#     silently flattened the display to a flat list of bars.
+#  2. Scopes are named rather than numbered. The old code reused id 3, 8 and 9 for TWO different activities each
+#     ("Processing SQL Servers" and "Scanning Resource Groups for CosmosDB" shared id 8), so those bars
+#     overwrote one another; distinct names must map to distinct ids.
+Assert-CV 'Update-CVProgress accepts -ParentId' `
+    ([bool]((Get-Command Update-CVProgress).Parameters.ContainsKey('ParentId'))) $true
+$null = Initialize-CVConsole -Cloud Generic -Title 'progress' -NonInteractive
+$ids = @('vms','storage','sqlservers','cosmos-rg','aks') | ForEach-Object { Resolve-CVProgressIntId -Id $_ }
+Assert-CV 'named scopes get unique int ids'    (@($ids | Sort-Object -Unique).Count) 5
+Assert-CV 'the same name resolves to the same id' (Resolve-CVProgressIntId -Id 'vms') $ids[0]
+
+# ---------------------------------------------------------------------------
 Write-Host ("`n{0}  {1} passed, {2} failed  {0}" -f ('=' * 6), $script:Pass, $script:Fail) -ForegroundColor ($script:Fail ? 'Red' : 'Green')
 exit ($script:Fail -gt 0 ? 1 : 0)

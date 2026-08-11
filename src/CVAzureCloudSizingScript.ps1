@@ -227,7 +227,7 @@ param(
     [ValidateSet("csv","json","both")][string]$OutputFormat = "csv",  # Output format: csv (default), json, or both
     [switch]$NonInteractive,   # force plain, non-interactive output (no progress bars / rich UI) - for CI / automation
     [switch]$Quiet,            # minimal console output (still writes the full log file)
-    [switch]$SkipResilienceReport, # do not compute or write the cyber resilience posture report
+    [switch]$SkipResilienceReport, # do not write the cyber resilience SIGNAL export (no score is computed)
     [string[]]$ResourceGroups,     # limit BOTH passes to these resource groups (union with -Tags). Omitted = all.
     [string[]]$Tags,               # limit BOTH passes to resources carrying any of these 'Key=Value' tags. Omitted = all.
     [switch]$SkipCloudRewind,      # skip the Cloud Rewind billable-resource sizing pass
@@ -794,7 +794,7 @@ $savedEAP = $ErrorActionPreference   # restored in the finally below so the per-
 try {
 foreach ($sub in $subs) {
     $subIdx++
-    Write-Progress -Id 1 -Activity "Processing Azure Subscriptions" -Status "Subscription $subIdx of $($subs.Count): $($sub.Name)" -PercentComplete (($subIdx / $subs.Count) * 100)
+    Update-CVProgress -Id 'subscriptions' -Activity "Processing Azure Subscriptions" -Status "Subscription $subIdx of $($subs.Count): $($sub.Name)" -PercentComplete (($subIdx / $subs.Count) * 100)
 
     $ErrorActionPreference = "Stop"
     # Unguarded under "Stop", one inaccessible subscription aborted the ENTIRE loop - skipping every remaining
@@ -893,7 +893,7 @@ foreach ($sub in $subs) {
                 foreach ($vm in $vmList) {  
                     $vmCount++
                     $vmPercentComplete = [math]::Round(($vmCount / $vmList.Count) * 100, 1)
-                    Write-Progress -Id 2 -ParentId 1 -Activity "Processing Virtual Machines" -Status "Processing VM $vmCount of $($vmList.Count) - $vmPercentComplete% complete" -PercentComplete $vmPercentComplete
+                    Update-CVProgress -Id 'vms' -ParentId 'subscriptions' -Activity "Processing Virtual Machines" -Status "Processing VM $vmCount of $($vmList.Count) - $vmPercentComplete% complete" -PercentComplete $vmPercentComplete
                     
                     # Calculate disk information
                 $diskCount = 0
@@ -992,7 +992,7 @@ foreach ($sub in $subs) {
                 $VMs += [PSCustomObject]$vmObj
             }
             }
-            Write-Progress -Id 2 -Activity "Processing Virtual Machines" -Completed
+            Complete-CVProgress -Id 'vms'
         } catch {
             Write-CVLog "Error getting VMs: $($_.Exception.Message)" -Level Warning -Source 'VM' -Scope @{ Subscription = $sub.Name }
         }  
@@ -1039,7 +1039,7 @@ foreach ($sub in $subs) {
                     foreach ($sa in $accounts) {  
                         $saCount++
                         $saPercentComplete = [math]::Round(($saCount / $accounts.Count) * 100, 1)
-                        Write-Progress -Id 3 -ParentId 1 -Activity "Processing Storage Account Metrics" -Status "Processing Storage Account $saCount of $($accounts.Count) - $saPercentComplete% complete" -PercentComplete $saPercentComplete
+                        Update-CVProgress -Id 'storage-metrics' -ParentId 'subscriptions' -Activity "Processing Storage Account Metrics" -Status "Processing Storage Account $saCount of $($accounts.Count) - $saPercentComplete% complete" -PercentComplete $saPercentComplete
                         try {
                         # Storage capacity metrics. BlobCapacity/BlobCount/ContainerCount are DAILY metrics with
                         # ingestion lag, and this used to request a ONE HOUR window - so the query usually returned
@@ -1146,7 +1146,7 @@ foreach ($sub in $subs) {
                         Write-CVLog "Error getting storage metrics: $($_.Exception.Message)" -Level Warning -Source 'Storage' -Scope @{ Subscription = $sub.Name; StorageAccount = $sa.StorageAccountName }
                     }
                     }
-                    Write-Progress -Id 3 -Activity "Processing Storage Account Metrics" -Completed
+                    Complete-CVProgress -Id 'storage-metrics'
                 }
                 
                 # Process File Shares if selected (separate progress tracking)
@@ -1156,7 +1156,7 @@ foreach ($sub in $subs) {
                     foreach ($sa in $accounts) {  
                         $fileShareCount++
                         $fsPercentComplete = [math]::Round(($fileShareCount / $accounts.Count) * 100, 1)
-                        Write-Progress -Id 4 -ParentId 1 -Activity "Processing File Shares" -Status "Processing Storage Account $fileShareCount of $($accounts.Count) for File Shares - $fsPercentComplete% complete" -PercentComplete $fsPercentComplete
+                        Update-CVProgress -Id 'fileshares' -ParentId 'subscriptions' -Activity "Processing File Shares" -Status "Processing Storage Account $fileShareCount of $($accounts.Count) for File Shares - $fsPercentComplete% complete" -PercentComplete $fsPercentComplete
                         try {
                             # Check if this storage account supports Azure Files
                             if (Get-AzureFileSAs -StorageAccount $sa) {
@@ -1214,10 +1214,10 @@ foreach ($sub in $subs) {
                             Write-CVLog "Error getting Azure File Storage information: $($_.Exception.Message)" -Level Warning -Source 'FileShare' -Scope @{ Subscription = $sub.Name; StorageAccount = $sa.StorageAccountName }
                         }
                     }
-                    Write-Progress -Id 4 -Activity "Processing File Shares" -Completed
+                    Complete-CVProgress -Id 'fileshares'
                 }
             }
-            Write-Progress -Id 3 -Activity "Processing Storage Accounts" -Completed
+            Complete-CVProgress -Id 'storage'
         } catch {
             Write-CVLog "Error getting storage accounts: $($_.Exception.Message)" -Level Warning -Source 'Storage' -Scope @{ Subscription = $sub.Name }
         }  
@@ -1260,7 +1260,7 @@ foreach ($sub in $subs) {
                 foreach ($account in $anfAccounts) {
                     $anfCount++
                     $anfPercentComplete = [math]::Round(($anfCount / $totalAnfAccounts) * 100, 1)
-                    Write-Progress -Id 6 -ParentId 1 -Activity "Processing NetApp Volumes" -Status "Processing NetApp Account $anfCount of $totalAnfAccounts - $anfPercentComplete% complete" -PercentComplete $anfPercentComplete
+                    Update-CVProgress -Id 'netapp' -ParentId 'subscriptions' -Activity "Processing NetApp Volumes" -Status "Processing NetApp Account $anfCount of $totalAnfAccounts - $anfPercentComplete% complete" -PercentComplete $anfPercentComplete
         
                     try {
                         try {
@@ -1294,21 +1294,17 @@ foreach ($sub in $subs) {
                                 }
                                 
                                 try {
-                                    # Get usage metric (LogicalSize)
+                                    # Get usage metric (LogicalSize). Routed through the shared wrapper, which owns
+                                    # the window (48h, since a quiet volume easily has no datapoint in the last
+                                    # hour) and reports NoDatapoint as $null rather than a measured 0.
                                     $usedBytes = 0
-                                    try {
-                                        # 48h window, not 1h: a quiet volume can easily have no datapoint in the
-                                        # last hour, and the 0 that produced was reported as measured usage.
-                                        $metric = Get-AzMetric -ResourceId $vol.Id -StartTime (Get-Date).ToUniversalTime().AddHours(-(Get-CVAzMetricWindowHours 'VolumeLogicalSize')) -MetricName "VolumeLogicalSize" -AggregationType Average -WarningAction SilentlyContinue
-                                        
-                                        if ($metric.Data -and $metric.Data.Count -gt 0) {
-                                            $usedBytes = $metric.Data[-1].Average
-                                            if (-not $usedBytes) { $usedBytes = 0 }
-                                        } else {
-                                            Write-CVLog "No usage metric data available for NetApp volume" -Level Debug -Source 'NetApp' -Scope @{ Subscription = $sub.Name; Volume = $volumeName }
-                                        }
-                                    } catch {
-                                        Write-CVLog "Could not get usage metrics for NetApp volume: $($_.Exception.Message)" -Level Warning -Source 'NetApp' -Scope @{ Subscription = $sub.Name; Volume = $volumeName }
+                                    $volMetric = Get-CVAzMetricValue -ResourceId $vol.Id -MetricName 'VolumeLogicalSize' -AggregationType Average
+                                    if ($volMetric.Status -eq 'Ok' -and $null -ne $volMetric.Value) {
+                                        $usedBytes = $volMetric.Value
+                                    } elseif ($volMetric.Status -eq 'NoDatapoint') {
+                                        Write-CVLog "No usage metric data available for NetApp volume" -Level Debug -Source 'NetApp' -Scope @{ Subscription = $sub.Name; Volume = $volumeName }
+                                    } else {
+                                        Write-CVLog "Could not get usage metrics for NetApp volume: $($volMetric.Status)" -Level Warning -Source 'NetApp' -Scope @{ Subscription = $sub.Name; Volume = $volumeName }
                                     }
                                     
                                     $netAppObj = [ordered] @{}
@@ -1344,7 +1340,7 @@ foreach ($sub in $subs) {
                         Write-CVLog "Error getting NetApp pools/volumes: $($_.Exception.Message)" -Level Warning -Source 'NetApp' -Scope @{ Subscription = $sub.Name; Account = $account.Name }
                     }
                 }
-                Write-Progress -Id 6 -Activity "Processing NetApp Volumes" -Completed
+                Complete-CVProgress -Id 'netapp'
             } else {
                 Write-Host "No NetApp Files accounts found in subscription $($sub.Name)" -ForegroundColor Yellow
             }
@@ -1364,7 +1360,7 @@ foreach ($sub in $subs) {
                 foreach ($sqlMI in $sqlMIList) {
                     $sqlMICount++
                     $sqlMIPercentComplete = [math]::Round(($sqlMICount / $sqlMIList.Count) * 100, 1)
-                    Write-Progress -Id 7 -ParentId 1 -Activity "Processing SQL Managed Instances" -Status "Processing SQL MI $sqlMICount of $($sqlMIList.Count) - $sqlMIPercentComplete% complete" -PercentComplete $sqlMIPercentComplete
+                    Update-CVProgress -Id 'sqlmi' -ParentId 'subscriptions' -Activity "Processing SQL Managed Instances" -Status "Processing SQL MI $sqlMICount of $($sqlMIList.Count) - $sqlMIPercentComplete% complete" -PercentComplete $sqlMIPercentComplete
                     
                     try {
                         # Get storage metrics for SQL MI. $null - not 0 - is the "we did not measure it" value:
@@ -1383,34 +1379,29 @@ foreach ($sub in $subs) {
                             # BOTH metric names must be requested. The switch below has always had a
                             # reserved_storage_mb case, but the request asked for storage_space_used_mb only -
                             # so that case was unreachable and StorageAllocatedGB was 0 on every row.
-                            $storageMetrics = Get-AzMetric -ResourceId $sqlMI.Id -StartTime (Get-Date).ToUniversalTime().AddHours(-(Get-CVAzMetricWindowHours 'storage_space_used_mb')) -MetricNames @("storage_space_used_mb", "reserved_storage_mb") -AggregationType Maximum -WarningAction SilentlyContinue
+                            # Through the shared wrapper, which queries each metric INDEPENDENTLY. The single
+                            # multi-name Get-AzMetric call this replaces meant one unsupported metric name
+                            # blanked the other, and its own result-matching switch is what made
+                            # reserved_storage_mb unreachable for so long.
+                            $miMetrics = Get-CVAzMetricValueSet -ResourceId $sqlMI.Id -AggregationType Maximum `
+                                            -MetricName @('storage_space_used_mb', 'reserved_storage_mb')
 
-                            if ($storageMetrics) {
-                                foreach ($metric in $storageMetrics) {
-                                    if ($metric.Data -and $metric.Data.Count -gt 0) {
-                                        $latestValue = $metric.Data[-1].Maximum
-                                        if ($null -eq $latestValue) { continue }   # no datapoint: leave the column blank
-                                        switch ($metric.Name.Value) {
-                                            "storage_space_used_mb" {
-                                                $valueMiB = [double]$latestValue
-                                                $storageUsedMB = $valueMiB
-                                                $valueBytes = $valueMiB * 1048576.0    # 1 MiB = 1,048,576 bytes (IEC)
-                                                # Decimal GB (SI): 1 GB = 1,000,000,000 bytes
-                                                $storageUsedGB = [math]::Round($valueBytes / 1000000000.0, 2)
-                                                # Binary TiB (IEC): 1 TiB = 1024^4 bytes
-                                                $storageUsedTiBBinary = [math]::Round($valueBytes / 1099511627776.0, 4)
-                                            }
-                                            "reserved_storage_mb" {
-                                                $valueMiB = [double]$latestValue
-                                                $valueBytes = $valueMiB * 1048576.0
-                                                $storageAllocatedGB = [math]::Round($valueBytes / 1000000000.0, 2)
-                                                $storageAllocatedTiBBinary = [math]::Round($valueBytes / 1099511627776.0, 4)
-                                            }
-                                        }
-                                    }
-                                }
-                                Write-Verbose "Retrieved storage metrics for SQL MI $($sqlMI.ManagedInstanceName) - Used: $storageUsedGB GB, Allocated: $storageAllocatedGB GB"
+                            # 1 MiB = 1,048,576 bytes (IEC); decimal GB (SI) = 1,000,000,000 bytes;
+                            # binary TiB (IEC) = 1024^4 bytes. $null stays $null - never a measured 0.
+                            $used = $miMetrics['storage_space_used_mb']
+                            if ($used.Status -eq 'Ok' -and $null -ne $used.Value) {
+                                $valueBytes = [double]$used.Value * 1048576.0
+                                $storageUsedMB        = [double]$used.Value
+                                $storageUsedGB        = [math]::Round($valueBytes / 1000000000.0, 2)
+                                $storageUsedTiBBinary = [math]::Round($valueBytes / 1099511627776.0, 4)
                             }
+                            $reserved = $miMetrics['reserved_storage_mb']
+                            if ($reserved.Status -eq 'Ok' -and $null -ne $reserved.Value) {
+                                $valueBytes = [double]$reserved.Value * 1048576.0
+                                $storageAllocatedGB        = [math]::Round($valueBytes / 1000000000.0, 2)
+                                $storageAllocatedTiBBinary = [math]::Round($valueBytes / 1099511627776.0, 4)
+                            }
+                            Write-Verbose "Retrieved storage metrics for SQL MI $($sqlMI.ManagedInstanceName) - Used: $storageUsedGB GB, Allocated: $storageAllocatedGB GB"
                         } catch {
                             Write-CVLog "Could not get storage metrics for SQL Managed Instance: $($_.Exception.Message)" -Level Warning -Source 'SQL' -Scope @{ Subscription = $sub.Name; Instance = $sqlMI.ManagedInstanceName }
                         }
@@ -1497,7 +1488,7 @@ foreach ($sub in $subs) {
                         Write-CVLog "Error processing SQL Managed Instance: $($_.Exception.Message)" -Level Warning -Source 'SQL' -Scope @{ Subscription = $sub.Name; Instance = $sqlMI.ManagedInstanceName }
                     }
                 }
-                Write-Progress -Id 7 -Activity "Processing SQL Managed Instances" -Completed
+                Complete-CVProgress -Id 'sqlmi'
             } else {
                 Write-Host "No SQL Managed Instances found in subscription $($sub.Name)" -ForegroundColor Yellow
             }
@@ -1521,7 +1512,7 @@ foreach ($sub in $subs) {
                 $sqlServerIdx = 0
                 foreach ($sqlServer in $sqlServers) {
                     $sqlServerIdx++
-                    Write-Progress -Id 8 -ParentId 1 -Activity "Processing SQL Servers" -Status "Server $sqlServerIdx of $($sqlServers.Count) - $($sqlServer.ServerName)" -PercentComplete ([math]::Round(($sqlServerIdx / $sqlServers.Count) * 100,1))
+                    Update-CVProgress -Id 'sqlservers' -ParentId 'subscriptions' -Activity "Processing SQL Servers" -Status "Server $sqlServerIdx of $($sqlServers.Count) - $($sqlServer.ServerName)" -PercentComplete ([math]::Round(($sqlServerIdx / $sqlServers.Count) * 100,1))
                     try {
                         $sqlDBs = Get-AzSqlDatabase -ServerName $sqlServer.ServerName -ResourceGroupName $sqlServer.ResourceGroupName -ErrorAction Stop
                     } catch {
@@ -1583,23 +1574,13 @@ foreach ($sub in $subs) {
                         try {
                             # Single call for both metrics reduces API calls and keeps timing/aggregation identical.
                             # 48h window - the comment below used to claim 24h while the code asked for 1h.
-                            $metrics = Get-AzMetric -ResourceId $sqlDB.ResourceId -MetricNames @("allocated_data_storage","storage") -AggregationType Maximum -StartTime (Get-Date).ToUniversalTime().AddHours(-(Get-CVAzMetricWindowHours 'storage')) -WarningAction SilentlyContinue
-
-                            # Map returned metrics back to the named variables for compatibility with existing logic
-                            $allocatedMetric = $null
-                            $usedMetric = $null
-                            if ($metrics) {
-                                $allocatedMetric = $metrics | Where-Object { $_.Name.Value -eq "allocated_data_storage" } | Select-Object -First 1
-                                $usedMetric = $metrics | Where-Object { $_.Name.Value -eq "storage" } | Select-Object -First 1
-                            }
-
-                            if ($allocatedMetric -and $allocatedMetric.Data -and $allocatedMetric.Data.Count -gt 0) {
-                                # pick the last non-null Maximum datapoint
-                                $allocatedVal = ($allocatedMetric.Data | ForEach-Object { $_.Maximum } | Where-Object { $_ -ne $null } | Select-Object -Last 1)
-                            }
-                            if ($usedMetric -and $usedMetric.Data -and $usedMetric.Data.Count -gt 0) {
-                                $usedVal = ($usedMetric.Data | ForEach-Object { $_.Maximum } | Where-Object { $_ -ne $null } | Select-Object -Last 1)
-                            }
+                            # Through the shared wrapper: one call per metric, so an unsupported name on one does
+                            # not blank the other, and NoDatapoint comes back as $null instead of 0. Replaces a
+                            # single multi-name call plus hand-rolled result matching.
+                            $dbMetrics = Get-CVAzMetricValueSet -ResourceId $sqlDB.ResourceId -AggregationType Maximum `
+                                            -MetricName @('allocated_data_storage', 'storage')
+                            $allocatedVal = $(if ($dbMetrics['allocated_data_storage'].Status -eq 'Ok') { $dbMetrics['allocated_data_storage'].Value })
+                            $usedVal      = $(if ($dbMetrics['storage'].Status              -eq 'Ok') { $dbMetrics['storage'].Value })
                         } catch {
                             # leave as $null if metrics fail
                             $allocatedVal = $null
@@ -1664,7 +1645,7 @@ foreach ($sub in $subs) {
                         $SqlDbInventory += New-Object -TypeName PSObject -Property $sqlObj
                     }
                 }
-                Write-Progress -Id 8 -Activity "Processing SQL Servers" -Completed
+                Complete-CVProgress -Id 'sqlservers'
             }
         } catch {
             Write-CVLog "Error processing SQL servers/databases: $($_.Exception.Message)" -Level Warning -Source 'SQL' -Scope @{ Subscription = $sub.Name }
@@ -1678,7 +1659,7 @@ foreach ($sub in $subs) {
             
             try {
                 # Get all MySQL flexible servers at subscription level
-                Write-Progress -Id 10 -ParentId 1 -Activity "Discovering MySQL Servers" -Status "Getting MySQL Flexible Servers..." -PercentComplete 25
+                Update-CVProgress -Id 'mysql-discover' -ParentId 'subscriptions' -Activity "Discovering MySQL Servers" -Status "Getting MySQL Flexible Servers..." -PercentComplete 25
                 # -Force on the Add-Member calls below is load-bearing. Observed live: "Cannot add a member with
                 # the name ResourceGroupName because a member with that name already exists" - some Az.MySql /
                 # Az.PostgreSql builds already surface that property on the server object. Add-Member throws
@@ -1695,7 +1676,7 @@ foreach ($sub in $subs) {
                 
                 # Get all MySQL single servers at subscription level. Azure MySQL Single Server is retired and the
                 # Get-AzMySqlServer cmdlet was removed in Az.MySql v2+, so only call it if it still exists.
-                Write-Progress -Id 10 -ParentId 1 -Activity "Discovering MySQL Servers" -Status "Getting MySQL Single Servers..." -PercentComplete 50
+                Update-CVProgress -Id 'mysql-discover' -ParentId 'subscriptions' -Activity "Discovering MySQL Servers" -Status "Getting MySQL Single Servers..." -PercentComplete 50
                 $mysqlSingleServers = if (Get-Command Get-AzMySqlServer -ErrorAction SilentlyContinue) { Get-AzMySqlServer -ErrorAction SilentlyContinue } else { $null }
                 if ($mysqlSingleServers) {
                     $allMySQLServers += $mysqlSingleServers | ForEach-Object {
@@ -1707,16 +1688,16 @@ foreach ($sub in $subs) {
                 Write-CVLog "Unable to collect MySQL information: $($_.Exception.Message)" -Level Warning -Source 'SQL' -Scope @{ Subscription = $sub.Name }
             }
             
-            Write-Progress -Id 10 -Activity "Discovering MySQL Servers" -Status "Discovery Complete" -PercentComplete 100
+            Update-CVProgress -Id 'mysql-discover' -Activity "Discovering MySQL Servers" -Status "Discovery Complete" -PercentComplete 100
             Start-Sleep -Milliseconds 100  # Brief pause to ensure progress bar displays properly
-            Write-Progress -Id 10 -Activity "Discovering MySQL Servers" -Completed
+            Complete-CVProgress -Id 'mysql-discover'
             
             if ($allMySQLServers -and $allMySQLServers.Count -gt 0) {
                 $mysqlCount = 0
                 foreach ($mysqlServer in $allMySQLServers) {
                         $mysqlCount++
                         $mysqlPercentComplete = [math]::Round(($mysqlCount / $allMySQLServers.Count) * 100, 1)
-                        Write-Progress -Id 11 -ParentId 1 -Activity "Processing MySQL Servers" -Status "Processing MySQL $mysqlCount of $($allMySQLServers.Count) - $mysqlPercentComplete% complete" -PercentComplete $mysqlPercentComplete
+                        Update-CVProgress -Id 'mysql' -ParentId 'subscriptions' -Activity "Processing MySQL Servers" -Status "Processing MySQL $mysqlCount of $($allMySQLServers.Count) - $mysqlPercentComplete% complete" -PercentComplete $mysqlPercentComplete
                         
                         try {
                             # Build MySQL object
@@ -1839,7 +1820,7 @@ foreach ($sub in $subs) {
                             $MySQLServers += New-Object -TypeName PSObject -Property $mysqlObj
                     }
                 }
-                Write-Progress -Id 11 -ParentId 1 -Activity "Processing MySQL Servers" -Completed
+                Complete-CVProgress -Id 'mysql'
             } else {
                 Write-Host "No MySQL servers found in subscription $($sub.Name)" -ForegroundColor Yellow
             }
@@ -1856,7 +1837,7 @@ foreach ($sub in $subs) {
             
             try {
                 # Get all PostgreSQL flexible servers at subscription level
-                Write-Progress -Id 12 -ParentId 1 -Activity "Discovering PostgreSQL Servers" -Status "Getting PostgreSQL Flexible Servers..." -PercentComplete 25
+                Update-CVProgress -Id 'postgres-discover' -ParentId 'subscriptions' -Activity "Discovering PostgreSQL Servers" -Status "Getting PostgreSQL Flexible Servers..." -PercentComplete 25
                 $postgresFlexibleServers = Get-AzPostgreSqlFlexibleServer -ErrorAction SilentlyContinue
                 if ($postgresFlexibleServers) {
                     $allPostgreSQLServers += $postgresFlexibleServers | ForEach-Object {
@@ -1867,7 +1848,7 @@ foreach ($sub in $subs) {
                 
                 # Get all PostgreSQL single servers at subscription level. Azure PostgreSQL Single Server is retired
                 # and Get-AzPostgreSqlServer was removed in Az.PostgreSql v2+, so only call it if it still exists.
-                Write-Progress -Id 12 -ParentId 1 -Activity "Discovering PostgreSQL Servers" -Status "Getting PostgreSQL Single Servers..." -PercentComplete 50
+                Update-CVProgress -Id 'postgres-discover' -ParentId 'subscriptions' -Activity "Discovering PostgreSQL Servers" -Status "Getting PostgreSQL Single Servers..." -PercentComplete 50
                 $postgresSingleServers = if (Get-Command Get-AzPostgreSqlServer -ErrorAction SilentlyContinue) { Get-AzPostgreSqlServer -ErrorAction SilentlyContinue } else { $null }
                 if ($postgresSingleServers) {
                     $allPostgreSQLServers += $postgresSingleServers | ForEach-Object {
@@ -1879,16 +1860,16 @@ foreach ($sub in $subs) {
                 Write-CVLog "Unable to collect PostgreSQL information: $($_.Exception.Message)" -Level Warning -Source 'SQL' -Scope @{ Subscription = $sub.Name }
             }
             
-            Write-Progress -Id 12 -Activity "Discovering PostgreSQL Servers" -Status "Discovery Complete" -PercentComplete 100
+            Update-CVProgress -Id 'postgres-discover' -Activity "Discovering PostgreSQL Servers" -Status "Discovery Complete" -PercentComplete 100
             Start-Sleep -Milliseconds 100  # Brief pause to ensure progress bar displays properly
-            Write-Progress -Id 12 -Activity "Discovering PostgreSQL Servers" -Completed
+            Complete-CVProgress -Id 'postgres-discover'
             
             if ($allPostgreSQLServers -and $allPostgreSQLServers.Count -gt 0) {
                 $postgresCount = 0
                 foreach ($postgresServer in $allPostgreSQLServers) {
                         $postgresCount++
                         $postgresPercentComplete = [math]::Round(($postgresCount / $allPostgreSQLServers.Count) * 100, 1)
-                        Write-Progress -Id 13 -ParentId 1 -Activity "Processing PostgreSQL Servers" -Status "Processing PostgreSQL $postgresCount of $($allPostgreSQLServers.Count) - $postgresPercentComplete% complete" -PercentComplete $postgresPercentComplete
+                        Update-CVProgress -Id 'postgres' -ParentId 'subscriptions' -Activity "Processing PostgreSQL Servers" -Status "Processing PostgreSQL $postgresCount of $($allPostgreSQLServers.Count) - $postgresPercentComplete% complete" -PercentComplete $postgresPercentComplete
                         
                         try {
                             # Build PostgreSQL object
@@ -1983,7 +1964,7 @@ foreach ($sub in $subs) {
                             $PostgreSQLServers += New-Object -TypeName PSObject -Property $postgresObj
                     }
                 }
-                Write-Progress -Id 13 -ParentId 1 -Activity "Processing PostgreSQL Servers" -Completed
+                Complete-CVProgress -Id 'postgres'
             } else {
                 Write-Host "No PostgreSQL servers found in subscription $($sub.Name)" -ForegroundColor Yellow
             }
@@ -2012,7 +1993,7 @@ foreach ($sub in $subs) {
             # Iterate through each resource group to find CosmosDB accounts
             foreach ($rg in $subRgList) {
                 $rgCount++
-                Write-Progress -Id 8 -ParentId 1 -Activity "Scanning Resource Groups for CosmosDB" -Status "Resource Group $rgCount of $($subRgList.Count): $($rg.ResourceGroupName)" -PercentComplete ([math]::Round(($rgCount / $subRgList.Count) * 100, 1))
+                Update-CVProgress -Id 'cosmos-rg' -ParentId 'subscriptions' -Activity "Scanning Resource Groups for CosmosDB" -Status "Resource Group $rgCount of $($subRgList.Count): $($rg.ResourceGroupName)" -PercentComplete ([math]::Round(($rgCount / $subRgList.Count) * 100, 1))
                 
                 try {
                     $cosmosAccountsInRG = Get-AzCosmosDBAccount -ResourceGroupName $rg.ResourceGroupName -ErrorAction SilentlyContinue
@@ -2026,14 +2007,14 @@ foreach ($sub in $subs) {
                 }
             }
             
-            Write-Progress -Id 8 -Activity "Scanning Resource Groups for CosmosDB" -Completed
+            Complete-CVProgress -Id 'cosmos-rg'
             
             if ($allCosmosAccounts -and $allCosmosAccounts.Count -gt 0) {
                 $cosmosCount = 0
                 foreach ($cosmosAccount in $allCosmosAccounts) {
                     $cosmosCount++
                     $cosmosPercentComplete = [math]::Round(($cosmosCount / $allCosmosAccounts.Count) * 100, 1)
-                    Write-Progress -Id 9 -ParentId 1 -Activity "Processing CosmosDB Accounts" -Status "Processing CosmosDB $cosmosCount of $($allCosmosAccounts.Count) - $cosmosPercentComplete% complete" -PercentComplete $cosmosPercentComplete
+                    Update-CVProgress -Id 'cosmos' -ParentId 'subscriptions' -Activity "Processing CosmosDB Accounts" -Status "Processing CosmosDB $cosmosCount of $($allCosmosAccounts.Count) - $cosmosPercentComplete% complete" -PercentComplete $cosmosPercentComplete
                     
                     try {
                         # Build CosmosDB object following the reference file pattern
@@ -2129,7 +2110,7 @@ foreach ($sub in $subs) {
                         $CosmosDBs += New-Object -TypeName PSObject -Property $cosmosObj
                     }
                 }
-                Write-Progress -Id 9 -ParentId 1 -Activity "Processing CosmosDB Accounts" -Completed
+                Complete-CVProgress -Id 'cosmos'
             } else {
                 Write-Host "No CosmosDB accounts found in subscription $($sub.Name)" -ForegroundColor Yellow
             }
@@ -2148,7 +2129,7 @@ foreach ($sub in $subs) {
                 foreach ($cluster in $AKSClustersFromAzure) {
                     $aksCount++
                     $aksPercentComplete = [math]::Round(($aksCount / $AKSClustersFromAzure.Count) * 100, 1)
-                    Write-Progress -Id 9 -ParentId 1 -Activity "Processing AKS Clusters" -Status "Processing cluster $aksCount of $($AKSClustersFromAzure.Count) - $aksPercentComplete% complete" -PercentComplete $aksPercentComplete
+                    Update-CVProgress -Id 'aks' -ParentId 'subscriptions' -Activity "Processing AKS Clusters" -Status "Processing cluster $aksCount of $($AKSClustersFromAzure.Count) - $aksPercentComplete% complete" -PercentComplete $aksPercentComplete
                     
                     try {
                         # Get resource group name - handle different possible property names
@@ -2278,7 +2259,7 @@ foreach ($sub in $subs) {
                         $AKSClusters += $AKSCluster
                     }
                 }
-                Write-Progress -Id 9 -ParentId 1 -Activity "Processing AKS Clusters" -Completed
+                Complete-CVProgress -Id 'aks'
             } else {
                 Write-Host "No AKS clusters found in subscription $($sub.Name)" -ForegroundColor Yellow
             }
@@ -2505,7 +2486,7 @@ finally {
 }
 
 # Complete subscription progress
-Write-Progress -Id 1 -Activity "Processing Azure Subscriptions" -Completed
+Complete-CVProgress -Id 'subscriptions'
 Write-CVSection "Subscription Processing Complete"
 
 # ---------------------------------------------------------------------------
@@ -2595,10 +2576,15 @@ if ($Selected.AKS) { Write-Host "Total AKS Persistent Volume Claims found: $($AK
 }   # end of the Data Protection pipeline (-SkipDataProtection wrap)
 
 # ============================================================
-# CYBER RESILIENCE POSTURE REPORT  (skip with -SkipResilienceReport)
-# Scores each resource's CURRENT NATIVE Azure configuration against the Cloud Resilience Control Catalog.
-# Runs before the CSV exports so Ctl_* columns land on every per-service CSV. Unknown signals are excluded
-# from the score (never failing), and per-row failures are isolated. Empty environment -> "nothing to assess".
+# CYBER RESILIENCE SIGNAL EXPORT  (skip with -SkipResilienceReport)
+# Publishes each resource's CURRENT NATIVE Azure configuration as raw values in
+# azure_resilience_signals_<date>.csv - one row per resource of an assessed type. NOTHING is scored here and no
+# verdict is written: the backend owns thresholds and weighting so they can be re-tuned without reissuing
+# reports. A blank cell means the value was not collected; see CYBER_RESILIENCE_SIGNALS.md.
+#
+# The parameter is still named -SkipResilienceReport even though no report is computed any more - it is
+# referenced by the k8s entrypoints and by users' own wrappers, so renaming it would be a breaking change for
+# no benefit.
 # ============================================================
 if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
   try {
@@ -2612,7 +2598,8 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
     # Azure Files is SSE-encrypted at rest by default.
     foreach ($fsh in @($FileShares)) { if ($fsh) { Add-Member -InputObject $fsh -NotePropertyName EncryptedAtRest -NotePropertyValue $true -Force } }
 
-    # Evaluate each resource type; append Ctl_*/ResilienceScore/ResilienceGaps onto the inventory rows.
+    # Which inventory collection backs each resource type. Nothing is evaluated - the control sets are
+    # consulted only for WHICH fields are signals; see the CVSizing.Resilience.ps1 header.
     $collections = @(
         @{ Type='VM';        Set=$azControls.VM;        Rows=@($VMs) }
         @{ Type='Disk';      Set=$azControls.Disk;      Rows=@($UnmanagedDiskItems) }
@@ -2751,70 +2738,70 @@ if (-not $SkipCloudRewind) {
 }
 
 # Write all resources to CSV files
-Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing CSV files..." -PercentComplete 0
+Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing CSV files..." -PercentComplete 0
 
 if ($Selected.VM -and $VMs.Count) { 
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing VMs CSV..." -PercentComplete 25
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing VMs CSV..." -PercentComplete 25
     $VMs | Export-CVCsv -Path (Join-Path $outdir "azure_vm_info_$dateStr.csv")
     Write-Host "azure_vm_info_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.STORAGE -and $StorageAccounts.Count) { 
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing Storage Accounts CSV..." -PercentComplete 50
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing Storage Accounts CSV..." -PercentComplete 50
     $StorageAccounts | Export-CVCsv -Path (Join-Path $outdir "azure_storage_accounts_info_$dateStr.csv")
     Write-Host "azure_storage_accounts_info_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.FILESHARE -and $FileShares.Count) { 
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing File Shares CSV..." -PercentComplete 60
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing File Shares CSV..." -PercentComplete 60
     $FileShares | Export-CVCsv -Path (Join-Path $outdir "azure_file_shares_info_$dateStr.csv")
     Write-Host "azure_file_shares_info_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.NETAPP -and $NetAppVolumes.Count) { 
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing NetApp Files CSV..." -PercentComplete 70
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing NetApp Files CSV..." -PercentComplete 70
     $NetAppVolumes | Export-CVCsv -Path (Join-Path $outdir "azure_netapp_volumes_info_$dateStr.csv")
     Write-Host "azure_netapp_volumes_info_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.SQL -and $SqlInstancesInventory.Count) { 
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing SQL Instances CSV..." -PercentComplete 75
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing SQL Instances CSV..." -PercentComplete 75
     $SqlInstancesInventory | Export-CVCsv -Path (Join-Path $outdir "azure_sql_managed_instances_$dateStr.csv")
     Write-Host "azure_sql_managed_instances_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.SQL -and $SqlDbInventory.Count) {
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing SQL Databases CSV..." -PercentComplete 80
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing SQL Databases CSV..." -PercentComplete 80
     $SqlDbInventory | Export-CVCsv -Path (Join-Path $outdir "azure_sql_databases_inventory_$dateStr.csv")
     Write-Host "azure_sql_databases_inventory_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.SQL -and $SqlMIDbInventory.Count) {
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing SQL MI Databases CSV..." -PercentComplete 82
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing SQL MI Databases CSV..." -PercentComplete 82
     $SqlMIDbInventory | Export-CVCsv -Path (Join-Path $outdir "azure_sql_mi_databases_$dateStr.csv")
     Write-Host "azure_sql_mi_databases_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.COSMOS -and $CosmosDBs.Count) {
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing CosmosDB CSV..." -PercentComplete 85
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing CosmosDB CSV..." -PercentComplete 85
     $CosmosDBs | Export-CVCsv -Path (Join-Path $outdir "azure_cosmosdb_accounts_$dateStr.csv")
     Write-Host "azure_cosmosdb_accounts_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.SQL -and $MySQLServers.Count) {
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing MySQL CSV..." -PercentComplete 90
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing MySQL CSV..." -PercentComplete 90
     $MySQLServers | Export-CVCsv -Path (Join-Path $outdir "azure_mysql_servers_$dateStr.csv")
     Write-Host "azure_mysql_servers_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.SQL -and $PostgreSQLServers.Count) {
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing PostgreSQL CSV..." -PercentComplete 92
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing PostgreSQL CSV..." -PercentComplete 92
     $PostgreSQLServers | Export-CVCsv -Path (Join-Path $outdir "azure_postgresql_servers_$dateStr.csv")
     Write-Host "azure_postgresql_servers_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.AKS -and $AKSClusters.Count) {
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing AKS Clusters CSV..." -PercentComplete 94
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing AKS Clusters CSV..." -PercentComplete 94
     $AKSClusters | Export-CVCsv -Path (Join-Path $outdir "azure_aks_clusters_$dateStr.csv")
     Write-Host "azure_aks_clusters_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.AKS -and $AKSPersistentVolumes.Count) {
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing AKS Persistent Volumes CSV..." -PercentComplete 96
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing AKS Persistent Volumes CSV..." -PercentComplete 96
     $AKSPersistentVolumes | Export-CVCsv -Path (Join-Path $outdir "azure_aks_persistent_volumes_$dateStr.csv")
     Write-Host "azure_aks_persistent_volumes_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
 if ($Selected.AKS -and $AKSPersistentVolumeClaims.Count) {
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing AKS Persistent Volume Claims CSV..." -PercentComplete 98
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing AKS Persistent Volume Claims CSV..." -PercentComplete 98
     $AKSPersistentVolumeClaims | Export-CVCsv -Path (Join-Path $outdir "azure_aks_persistent_volume_claims_$dateStr.csv")
     Write-Host "azure_aks_persistent_volume_claims_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
@@ -2862,7 +2849,7 @@ $summaryRows = @(Get-CVAzureInventorySummary -Selected $Selected -Subscriptions 
 
 # Export summary if we have any rows (Data Protection artifact - skip entirely in a Cloud-Rewind-only run).
 if ($summaryRows.Count -and -not $SkipDataProtection) {
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing comprehensive summary..." -PercentComplete 75
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing comprehensive summary..." -PercentComplete 75
     $summaryRows | Export-CVCsv -Path (Join-Path $outdir "azure_inventory_summary_$dateStr.csv")
     Write-Host "azure_inventory_summary_$dateStr.csv file has been written to $outdir" -ForegroundColor Cyan
 }
@@ -2873,7 +2860,7 @@ Write-Host "`n=== All Output Files Created Successfully ===" -ForegroundColor Gr
 # JSON EXPORT (when OutputFormat is json or both)
 # ============================================================
 if (($OutputFormat -eq "json" -or $OutputFormat -eq "both") -and -not $SkipDataProtection) {
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing JSON output..." -PercentComplete 80
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing JSON output..." -PercentComplete 80
 
     # Build standardized summary block from $summaryRows
     $jsonSummary = @{}
@@ -2927,7 +2914,7 @@ if (($OutputFormat -eq "json" -or $OutputFormat -eq "both") -and -not $SkipDataP
     Write-Host "azure_sizing_$dateStr.json written to $outdir" -ForegroundColor Cyan
 }
 
-Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Creating ZIP archive..." -PercentComplete 90
+Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Creating ZIP archive..." -PercentComplete 90
 
 # Aggregated diagnostics summary (warning/error counts + which services/subscriptions were skipped and why).
 Write-CVSummary -Title 'Azure Sizing Run Summary'
@@ -2939,7 +2926,7 @@ Add-Type -AssemblyName System.IO.Compression.FileSystem
 [IO.Compression.ZipFile]::CreateFromDirectory($outdir, $zipfile)  
 
 # Complete all progress indicators
-Write-Progress -Id 5 -Activity "Generating Output Files" -Completed
+Complete-CVProgress -Id 'output'
 
 # The per-run output folder is kept under Output/ (loose CSVs/JSON) alongside the ZIP - nothing is deleted.
   

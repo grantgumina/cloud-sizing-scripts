@@ -565,7 +565,10 @@ function Update-CVProgress {
         [string]$Activity,
         [string]$Status = '',
         [int]$PercentComplete = -1,
-        [switch]$Increment
+        [switch]$Increment,
+        # Optional nesting, so a caller that never calls Start-CVProgress can still render a child bar. Without
+        # this, migrating a nested Write-Progress -ParentId call would silently flatten the display.
+        [string]$ParentId
     )
     if (-not (Test-CVOwnerThread) -or -not $script:CVConsole) { return }
     if ($script:CVConsole.Tier -eq 'Plain-Headless') { return }
@@ -587,6 +590,7 @@ function Update-CVProgress {
 
     $p = @{ Id = $intId; Activity = ($Activity ? $Activity : ($script:CVConsole.Title ? $script:CVConsole.Title : 'Working')); PercentComplete = $PercentComplete }
     if ($Status) { $p['Status'] = $Status } else { $p['Status'] = "$($state.Count)$([string]($state.Total ? "/$($state.Total)" : '')) ($PercentComplete%)" }
+    if ($ParentId) { $p['ParentId'] = Resolve-CVProgressIntId -Id $ParentId }
     Write-Progress @p
 }
 
