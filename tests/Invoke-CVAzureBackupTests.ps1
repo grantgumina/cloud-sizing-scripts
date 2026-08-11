@@ -11,6 +11,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..' 'src' 'common' 'CVSizing.Resilience.ps1')
 . (Join-Path $PSScriptRoot '..' 'src' 'common' 'CVSizing.Resilience.Azure.ps1')
 . (Join-Path $PSScriptRoot '..' 'src' 'common' 'CVSizing.Backup.Azure.ps1')
+. (Join-Path $PSScriptRoot 'CVTestControlEvaluator.ps1')   # control Tests are not executed in production
 
 $script:Pass = 0; $script:Fail = 0
 function Assert-CV { param([string]$Name, $Actual, $Expected)
@@ -84,7 +85,7 @@ Assert-CV 'counted as unknown, not gap'      $sum.UnknownBackupCount 1
 $vmControls = (Get-CVAzureResilienceControls).VM
 $ev = Invoke-CVResilience -Resource $vms[0] -Controls $vmControls
 Assert-CV 'vm-backup outcome = Unknown'      (($ev.Results | Where-Object Id -eq 'vm-backup').Outcome) 'Unknown'
-Assert-CV 'no gaps recorded'                 (@($ev.Gaps).Count) 0
+Assert-CV 'no gaps recorded'                 $ev.GapCount 0
 
 Write-Host "`n[6] -Types without Backup is also Unknown, not 0% coverage"
 Reset-CVCollectionStatus

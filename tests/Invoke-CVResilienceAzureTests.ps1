@@ -4,6 +4,7 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..' 'src' 'common' 'CVSizing.Resilience.ps1')
 . (Join-Path $PSScriptRoot '..' 'src' 'common' 'CVSizing.Resilience.Azure.ps1')
+. (Join-Path $PSScriptRoot 'CVTestControlEvaluator.ps1')
 
 $script:Pass = 0; $script:Fail = 0
 function Assert-CV { param([string]$Name, $Actual, $Expected)
@@ -23,7 +24,6 @@ Write-Host "`n[2] VM - backup enabled from inventory, cross-region unknown"
 $e = Invoke-CVResilience -Resource ([pscustomobject]@{ BackupEnabled=$true }) -Controls $ctl.VM
 Assert-CV 'vm-backup Met'          (Outcome $e 'vm-backup') 'Met'
 Assert-CV 'vm-xregion Unknown'     (Outcome $e 'vm-xregion') 'Unknown'
-Assert-CV 'score 100 (only backup assessed)' $e.Score 100
 
 Write-Host "`n[3] Azure SQL - PITR/retention from inventory"
 $sqlGood = [pscustomobject]@{ PITR_Days=35; LTRWeeklyRetention='P4W'; LTRMonthlyRetention=''; LTRYearlyRetention='' }
@@ -71,8 +71,9 @@ Assert-CV 'null server -> null'               ($null -eq (Resolve-CVAzureFlexSer
 Assert-CV 'fx-cmek unreadable -> Unknown' (Outcome (Invoke-CVResilience -Resource ([pscustomobject]@{ CmkEncrypted=(Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ Name='srv1' })) }) -Controls $ctl.FlexDB) 'fx-cmek') 'Unknown'
 Assert-CV 'fx-cmek CMK -> Met'            (Outcome (Invoke-CVResilience -Resource ([pscustomobject]@{ CmkEncrypted=(Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ DataEncryptionType='AzureKeyVault' })) }) -Controls $ctl.FlexDB) 'fx-cmek') 'Met'
 
-Write-Host "`n[6] Empty environment + no Clean Recovery controls"
-Assert-CV 'empty summary null'  ($null -eq (Get-CVResilienceSummary -Results @()).OverallScore) $true
+Write-Host "`n[6] No Clean Recovery controls"
+# The empty-environment score assertion that used to live here went with the scoring engine: an overall score is
+# the backend's to compute, so this repo no longer has a contract to pin.
 $cats = ($ctl.Values | ForEach-Object { $_ } | ForEach-Object { $_.Category }) | Sort-Object -Unique
 Assert-CV 'no CleanRecovery for Azure' ($cats -contains 'CleanRecovery') $false
 

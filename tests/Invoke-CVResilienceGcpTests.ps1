@@ -4,6 +4,7 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..' 'src' 'common' 'CVSizing.Resilience.ps1')
 . (Join-Path $PSScriptRoot '..' 'src' 'common' 'CVSizing.Resilience.GCP.ps1')
+. (Join-Path $PSScriptRoot 'CVTestControlEvaluator.ps1')
 
 $script:Pass = 0; $script:Fail = 0
 function Assert-CV { param([string]$Name, $Actual, $Expected)
@@ -13,16 +14,15 @@ function Assert-CV { param([string]$Name, $Actual, $Expected)
 $ctl = Get-CVGcpResilienceControls
 function Outcome { param($ev,$id) (@($ev.Results | Where-Object Id -eq $id)[0]).Outcome }
 
-Write-Host "`n[1] Cloud SQL - fully protected -> 100, no gaps"
+Write-Host "`n[1] Cloud SQL - fully protected -> every control Met"
 $good = [pscustomobject]@{ BackupEnabled=$true; RetainedBackups=35; TxLogRetentionDays=7; PitrEnabled=$true; HasReplica=$true; CmkEncrypted=$true; DeletionProtection=$true; PublicIPs='' }
 $e = Invoke-CVResilience -Resource $good -Controls $ctl.Database
-Assert-CV 'score 100' $e.Score 100
-Assert-CV 'no gaps'   $e.Gaps.Count 0
+Assert-CV 'no control reports a gap' $e.GapCount 0
+Assert-CV 'every control assessed'   $e.UnknownCount 0
 
-Write-Host "`n[2] Cloud SQL - unprotected -> low score, correct gaps"
+Write-Host "`n[2] Cloud SQL - unprotected -> correct gaps"
 $bad = [pscustomobject]@{ BackupEnabled=$false; RetainedBackups=7; TxLogRetentionDays=1; PitrEnabled=$false; HasReplica=$false; CmkEncrypted=$false; DeletionProtection=$false; PublicIPs='34.1.2.3' }
 $e = Invoke-CVResilience -Resource $bad -Controls $ctl.Database
-Assert-CV 'score 0'                 $e.Score 0
 Assert-CV 'backup is a gap'         (Outcome $e 'db-backup') 'Gap'
 Assert-CV 'retention <35 is a gap'  (Outcome $e 'db-retention') 'Gap'
 Assert-CV 'public exposure is gap'  (Outcome $e 'db-notpublic') 'Gap'
@@ -36,7 +36,7 @@ Assert-CV 'tx-log 35 days -> Met' (Outcome $rTx 'db-retention') 'Met'
 Write-Host "`n[4] Missing signals -> Unknown -> excluded (AlloyDB-style row: no fields)"
 $alloy = [pscustomobject]@{ Type='alloydbcluster'; Name='c1' }
 $e = Invoke-CVResilience -Resource $alloy -Controls $ctl.Database
-Assert-CV 'all unknown -> null score' ($null -eq $e.Score) $true
+Assert-CV 'nothing assessed -> no gaps invented' $e.GapCount 0
 Assert-CV 'db-backup unknown'         (Outcome $e 'db-backup') 'Unknown'
 
 Write-Host "`n[5] Storage bucket - mixed posture; missing field is Unknown"
@@ -45,8 +45,10 @@ $e = Invoke-CVResilience -Resource $b -Controls $ctl.Storage
 Assert-CV 'versioning met'      (Outcome $e 'gcs-versioning') 'Met'
 Assert-CV 'multiregion gap'     (Outcome $e 'gcs-xregion') 'Gap'
 Assert-CV 'softdelete unknown'  (Outcome $e 'gcs-softdelete') 'Unknown'
-# 3 Met (High=2 each=6) / (3 Met + 2 Gap[gcs-xregion,gcs-lock]=4 -> 10) = 60
-Assert-CV 'score excludes unknown = 60' $e.Score 60
+# The weighted score this used to assert (60) is now the backend's to compute. What matters here is that the
+# absent field is excluded rather than counted against the bucket: 3 Met, 2 Gap, 1 Unknown.
+Assert-CV 'unknown excluded, not counted as gap' $e.UnknownCount 1
+Assert-CV 'two real gaps'                        $e.GapCount 2
 
 Write-Host "`n[6] Disk cross-region + no Clean Recovery control exists for GCP"
 $e = Invoke-CVResilience -Resource ([pscustomobject]@{ XRegionBackup=$true }) -Controls @($ctl.Disk | Where-Object Id -eq 'pd-xregion')

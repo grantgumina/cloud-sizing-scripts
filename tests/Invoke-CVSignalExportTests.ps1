@@ -165,6 +165,42 @@ foreach ($dead in @('RiskWeight','ResilienceScore','GapCount','WorstSeverity')) 
     Assert-CV "doc no longer presents '$dead' as a column" ([bool]($doc -match ('\|\s*`' + [regex]::Escape($dead) + '`\s*\|'))) $false
 }
 
+Write-Host "`n[11] Get-CVFirstProperty - the probe the cross-cloud field variation relies on"
+# Used by New-CVSignalRow to resolve region/resource-group/id across collections that name them differently, and
+# by Resolve-CVAzureFlexServerCmk to cope with Az modules that move a property between versions.
+$probe = [pscustomobject]@{ Region = ''; Location = 'eastus2'; Zone = $null; Count = 0 }
+Assert-CV 'skips empty string, takes next candidate' (Get-CVFirstProperty -Resource $probe -Name @('Region','Location')) 'eastus2'
+Assert-CV 'skips $null, takes next candidate'        (Get-CVFirstProperty -Resource $probe -Name @('Zone','Location'))  'eastus2'
+Assert-CV 'first non-empty wins'                     (Get-CVFirstProperty -Resource $probe -Name @('Location','Region')) 'eastus2'
+Assert-CV 'absent property -> null'  ($null -eq (Get-CVFirstProperty -Resource $probe -Name @('NoSuchField')))            $true
+Assert-CV 'all candidates empty -> null' ($null -eq (Get-CVFirstProperty -Resource $probe -Name @('Region','Zone')))      $true
+Assert-CV 'no candidates -> null'    ($null -eq (Get-CVFirstProperty -Resource $probe -Name @()))                         $true
+# 0 is a real value, not emptiness - the same measured-zero-vs-not-measured distinction the export depends on.
+Assert-CV 'zero is returned, not skipped' (Get-CVFirstProperty -Resource $probe -Name @('Count')) 0
+
+Write-Host "`n[12] The scoring engine is gone from src/ and stays gone"
+# Deleted once all three clouds moved to the signals export; it had no production callers in any of them. A
+# test-only evaluator lives in tests/CVTestControlEvaluator.ps1 so the per-cloud outcome assertions still run.
+$engineText = Get-Content -Raw (Join-Path $repoRoot 'src' 'common' 'CVSizing.Resilience.ps1')
+foreach ($gone in 'Invoke-CVResilience', 'Get-CVControlScore', 'Get-CVResilienceSummary',
+                  'ConvertTo-CVOutcome', 'ConvertTo-CVResilienceColumns', 'Get-CVControlCatalog') {
+    Assert-CV "$gone is not defined in src/" ([bool]($engineText -match "function\s+$([regex]::Escape($gone))\b")) $false
+}
+# And nothing in src/ CALLS them, which is what made the deletion safe in the first place. This must be an AST
+# walk, not a text match: the engine's own header comment names all six functions to explain why they went, and
+# a regex over the raw text reports those prose mentions as call sites.
+$srcCalls = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($f in Get-ChildItem -Path (Join-Path $repoRoot 'src') -Recurse -Filter *.ps1) {
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($f.FullName, [ref]$null, [ref]$null)
+    $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+        ForEach-Object { $n = $_.GetCommandName(); if ($n) { [void]$srcCalls.Add($n) } }
+}
+Assert-CV 'AST call index is populated' ([bool]($srcCalls.Contains('New-CVSignalRow'))) $true
+foreach ($gone in 'Invoke-CVResilience', 'Get-CVControlScore', 'Get-CVResilienceSummary',
+                  'ConvertTo-CVOutcome', 'ConvertTo-CVResilienceColumns', 'Get-CVControlCatalog') {
+    Assert-CV "nothing in src/ calls $gone" $srcCalls.Contains($gone) $false
+}
+
 Write-Host ("`n======  {0} passed, {1} failed  ======`n" -f $script:Pass, $script:Fail) `
            -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 if ($script:Fail) { exit 1 }

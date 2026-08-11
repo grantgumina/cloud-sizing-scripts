@@ -682,11 +682,10 @@ function Write-AWSResilienceReport {
     if ($SkipResilienceReport) { return }
     try {
         Write-CVSection 'Cyber Resilience Posture'
-        # No score is printed - the export is judgement-free; scoring is the backend's.
-        Write-CVLog ("Overall native resilience score: {0}/100  ({1} controls assessed, {2} not assessed)" -f $summary.OverallScore, $summary.Assessed, $summary.Excluded) -Level Success -Source 'Resilience'
-        foreach ($cat in $summary.ByCategory) {
-            Write-CVLog ("  {0,-14} {1,3}% met ({2}/{3})" -f $cat.Category, $cat.PercentMet, $cat.ControlsMet, $cat.ControlsTotal) -Level Info -Source 'Resilience'
-        }
+        # No score is printed - the export is judgement-free; scoring is the backend's. Two lines here used to
+        # print one anyway, off a $summary variable that was never assigned: the run emitted "Overall native
+        # resilience score: /100  (0 controls assessed, 0 not assessed)" on every AWS run, directly contradicting
+        # the comment above it, and the per-category loop iterated nothing.
         # One file: every resource with a gap or an incomplete assessment, ranked. The static control catalog and
         # the per-category rollup are no longer written - neither named the resources to go look at.
         if ($script:ResilienceSignalRows.Count) {

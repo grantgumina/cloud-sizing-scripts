@@ -9,6 +9,7 @@
 $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..' 'src' 'common' 'CVSizing.Resilience.ps1')
 . (Join-Path $PSScriptRoot '..' 'src' 'common' 'CVSizing.Resilience.AWS.ps1')
+. (Join-Path $PSScriptRoot 'CVTestControlEvaluator.ps1')
 
 $script:Pass = 0; $script:Fail = 0
 function Assert-CV { param([string]$Name, $Actual, $Expected)
@@ -67,9 +68,8 @@ Assert-CV 'efs-backup met'     (Outcome $C.EFS 'efs-backup' ([pscustomobject]@{ 
 Assert-CV 'efs-backup gap'     (Outcome $C.EFS 'efs-backup' ([pscustomobject]@{ BackupPolicyStatus='DISABLED' })) 'Gap'
 Assert-CV 'efs-backup unknown' (Outcome $C.EFS 'efs-backup' ([pscustomobject]@{ BackupPolicyStatus='Unknown' }))  'Unknown'
 
-Write-Host "`n[7] Empty AWS environment -> null score, no error"
-$empty = Get-CVResilienceSummary -Results @()
-Assert-CV 'empty summary OverallScore null' ($null -eq $empty.OverallScore) $true
+# [7] used to assert that an empty AWS environment produced a null overall score. It went with the scoring
+# engine - an overall score is the backend's to compute, so there is no contract here to pin.
 
 Write-Host ("`n======  {0} passed, {1} failed  ======`n" -f $script:Pass, $script:Fail) `
            -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })

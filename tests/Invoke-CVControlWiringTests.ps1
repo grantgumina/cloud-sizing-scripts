@@ -21,6 +21,7 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = Split-Path -Parent (Join-Path $PSScriptRoot '..' 'src')
 . (Join-Path $repoRoot 'src' 'common' 'CVSizing.Resilience.ps1')
+. (Join-Path $PSScriptRoot 'CVTestControlEvaluator.ps1')   # control Tests are not executed in production
 
 $script:Pass = 0; $script:Fail = 0
 function Assert-CV { param([string]$Name, $Actual, $Expected)
