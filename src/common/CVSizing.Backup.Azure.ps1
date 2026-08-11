@@ -90,6 +90,12 @@ function Group-CVAzureBackupItems {
 
     $strict = @{}   # sub|rg|name  -> aggregate
     $loose  = @{}   # sub||name    -> aggregate (item name carried no resource group)
+    $shares = @{}   # sub|account|share -> aggregate (AzureFiles items, attributed to the SHARE not the account)
+
+    # Vault-level settings travel with the item rows because they are properties of the vault protecting the
+    # resource, not of the resource. Copied onto the aggregate only alongside a PROTECTED item - see below.
+    $vaultFields = @('VaultCrossRegionRestore', 'VaultImmutabilityState', 'VaultSoftDeleteState',
+                     'VaultSoftDeleteRetentionDays', 'VaultMultiUserAuth', 'VaultStorageRedundancy')
 
     foreach ($b in @($BackupItems)) {
         if (-not $b) { continue }
@@ -99,13 +105,14 @@ function Group-CVAzureBackupItems {
         $parsed = ConvertFrom-CVAzureBackupItemName $source
         if (-not $parsed.Name) { continue }
 
-        $isVmLevel = ("$($b.WorkloadType)" -eq 'AzureVM')
+        $workload  = "$($b.WorkloadType)"
+        $isVmLevel = ($workload -eq 'AzureVM')
         $key = Get-CVAzureBackupKey -Subscription $b.Subscription -ResourceGroup $parsed.ResourceGroup -Name $parsed.Name
         if (-not $key) { continue }
         $bucket = if ($parsed.HasResourceGroup) { $strict } else { $loose }
 
         if (-not $bucket.ContainsKey($key)) {
-            $bucket[$key] = [pscustomobject]@{
+            $row = [ordered]@{
                 Subscription     = $b.Subscription
                 ResourceGroup    = $parsed.ResourceGroup
                 Name             = $parsed.Name
@@ -120,12 +127,13 @@ function Group-CVAzureBackupItems {
                 DbItemCount      = 0
                 DbWorkloads      = @()
             }
+            foreach ($f in $vaultFields) { $row[$f] = $null }
+            $bucket[$key] = [pscustomobject]$row
         }
         $agg = $bucket[$key]
 
         if ($isVmLevel) {
             $agg.VmItemCount++
-            if (-not $agg.VaultName -and $b.VaultName) { $agg.VaultName = [string]$b.VaultName }
             if (Test-CVAzureBackupItemProtected $b) {
                 $agg.VmProtected = $true
                 # Prefer a protected item's policy/state over a stopped one's, rather than first-wins.
@@ -133,11 +141,24 @@ function Group-CVAzureBackupItems {
                 $agg.VmProtectionState  = [string]$b.ProtectionState
                 $agg.VmProtectionStatus = [string]$b.ProtectionStatus
                 $agg.VmLastBackupStatus = [string]$b.LastBackupStatus
+                # VaultName and the vault settings belong HERE, not first-wins outside this branch. A VM with a
+                # stale ProtectionStopped item in vault A and a live Protected item in vault B collides on one
+                # strict key: first-wins recorded vault A while the policy came from B. Harmless while VaultName
+                # was decorative, but immutability and cross-region-restore now hang off it, so that would have
+                # reported vault A's settings for a VM protected by vault B - confidently, and unfalsifiably.
+                $agg.VaultName = [string]$b.VaultName
+                foreach ($f in $vaultFields) {
+                    $p = $b.PSObject.Properties[$f]
+                    if ($p) { $agg.$f = $p.Value }
+                }
             } elseif (-not $agg.VmProtected) {
                 if (-not $agg.VmPolicy)           { $agg.VmPolicy           = [string]$b.PolicyName }
                 if (-not $agg.VmProtectionState)  { $agg.VmProtectionState  = [string]$b.ProtectionState }
                 if (-not $agg.VmProtectionStatus) { $agg.VmProtectionStatus = [string]$b.ProtectionStatus }
                 if (-not $agg.VmLastBackupStatus) { $agg.VmLastBackupStatus = [string]$b.LastBackupStatus }
+                # Still record the vault so an enrolled-but-stopped VM names one, but never overwrite a
+                # protected item's vault.
+                if (-not $agg.VaultName) { $agg.VaultName = [string]$b.VaultName }
             }
             $t = [datetime]::MinValue
             if ($b.LastBackupTime -and [datetime]::TryParse([string]$b.LastBackupTime, [ref]$t)) {
@@ -147,12 +168,119 @@ function Group-CVAzureBackupItems {
             # In-guest / PaaS workload sharing the container (SQL in VM, SAP HANA, Azure Files). Recorded so the
             # protection is visible, but it must NOT set VM-level BackupEnabled.
             $agg.DbItemCount++
-            $wl = "$($b.WorkloadType)"
-            if ($wl -and $agg.DbWorkloads -notcontains $wl) { $agg.DbWorkloads = @($agg.DbWorkloads) + $wl }
+            if ($workload -and $agg.DbWorkloads -notcontains $workload) { $agg.DbWorkloads = @($agg.DbWorkloads) + $workload }
+        }
+
+        # ---- Azure Files, attributed to the individual SHARE ------------------------------------------------
+        # The container names the storage ACCOUNT; the share name is the item's FriendlyName (its .Name is a
+        # hashed form). These items were already being collected and then discarded into DbItemCount, which is
+        # why FileShare rows never carried HasBackup at all.
+        if ($workload -eq 'AzureFiles') {
+            $shareName = "$($b.FriendlyName)"
+            if ([string]::IsNullOrWhiteSpace($shareName)) { $shareName = "$($b.ItemName)" }
+            $shareKey = Get-CVAzureBackupKey -Subscription $b.Subscription -ResourceGroup $parsed.Name -Name $shareName
+            if ($shareKey) {
+                if (-not $shares.ContainsKey($shareKey)) {
+                    $shares[$shareKey] = [pscustomobject]@{
+                        Subscription     = $b.Subscription
+                        StorageAccount   = $parsed.Name
+                        ShareName        = $shareName
+                        ItemCount        = 0
+                        Protected        = $false
+                        Policy           = ''
+                        ProtectionState  = ''
+                        ProtectionStatus = ''
+                        LastBackupStatus = ''
+                        LatestBackupUtc  = $null
+                        VaultName        = ''
+                        SourceResourceId = "$($b.SourceResourceId)"
+                    }
+                }
+                $sh = $shares[$shareKey]
+                $sh.ItemCount++
+                if (Test-CVAzureBackupItemProtected $b) {
+                    $sh.Protected        = $true
+                    $sh.Policy           = [string]$b.PolicyName
+                    $sh.ProtectionState  = [string]$b.ProtectionState
+                    $sh.ProtectionStatus = [string]$b.ProtectionStatus
+                    $sh.LastBackupStatus = [string]$b.LastBackupStatus
+                    $sh.VaultName        = [string]$b.VaultName
+                } elseif (-not $sh.Protected) {
+                    if (-not $sh.ProtectionState) { $sh.ProtectionState = [string]$b.ProtectionState }
+                    if (-not $sh.VaultName)       { $sh.VaultName       = [string]$b.VaultName }
+                }
+                $ts = [datetime]::MinValue
+                if ($b.LastBackupTime -and [datetime]::TryParse([string]$b.LastBackupTime, [ref]$ts)) {
+                    if ($null -eq $sh.LatestBackupUtc -or $ts -gt $sh.LatestBackupUtc) { $sh.LatestBackupUtc = $ts }
+                }
+            }
         }
     }
 
-    return @{ Strict = $strict; Loose = $loose }
+    return @{ Strict = $strict; Loose = $loose; Shares = $shares }
+}
+
+function Resolve-CVAzureFileShareBackup {
+    <#
+      .SYNOPSIS  Annotate Azure file-share rows with backup coverage, honouring collection status.
+      .DESCRIPTION
+        fs-backup reads $r.HasBackup, which nothing ever set on Azure - the field is populated only by the GCP
+        script for Filestore, and the cross-cloud wiring detector hid that. The data was already being collected:
+        the backup pass queries the AzureStorage/AzureFiles pair, so these items sit in $BackupItems and were
+        folded into the storage account's DbItemCount and dropped.
+
+        Matches on subscription + storage account + share name. Where the item exposes SourceResourceId (the
+        account's ARM id) it is used to corroborate via Test-CVArmScopeCovers, so a share whose name collides
+        across two accounts cannot inherit the wrong backup.
+      .PARAMETER Status  subscription -> @{ BACKUP = 'Ok'|'Failed'|'Skipped' }. Anything but Ok leaves HasBackup
+                         $null (Unknown) rather than $false.
+      .OUTPUTS  pscustomobject { ShareCount; ProtectedCount; UnknownCount }
+    #>
+    [CmdletBinding()]
+    param($Grouped, $FileShares, [hashtable]$Status = @{})
+
+    $shares = if ($Grouped -and $Grouped.Shares) { $Grouped.Shares } else { @{} }
+    $shareCount = 0; $protected = 0; $unknown = 0
+
+    foreach ($f in @($FileShares)) {
+        if (-not $f) { continue }
+        $shareCount++
+        $sub = "$($f.Subscription)"
+        $backupStatus = if ($Status.ContainsKey($sub) -and $Status[$sub].BACKUP) { $Status[$sub].BACKUP } else { 'Skipped' }
+
+        if ($backupStatus -ne 'Ok') {
+            $unknown++
+            Add-Member -InputObject $f -NotePropertyName HasBackup              -NotePropertyValue $null -Force
+            Add-Member -InputObject $f -NotePropertyName ShareBackupPolicy       -NotePropertyValue ''    -Force
+            Add-Member -InputObject $f -NotePropertyName ShareBackupVaultName    -NotePropertyValue ''    -Force
+            Add-Member -InputObject $f -NotePropertyName ShareProtectionState    -NotePropertyValue ''    -Force
+            Add-Member -InputObject $f -NotePropertyName ShareLastBackupTimeUtc  -NotePropertyValue ''    -Force
+            Add-Member -InputObject $f -NotePropertyName BackupDataStatus        -NotePropertyValue $backupStatus -Force
+            continue
+        }
+
+        $key = Get-CVAzureBackupKey -Subscription $f.Subscription -ResourceGroup $f.StorageAccount -Name $f.Name
+        $agg = if ($key -and $shares.ContainsKey($key)) { $shares[$key] } else { $null }
+
+        # Corroborate with the ARM id when both sides carry one: the account id must be an ancestor of the share.
+        if ($agg -and $agg.SourceResourceId -and $f.ResourceId -and
+            -not (Test-CVArmScopeCovers -Scope $agg.SourceResourceId -ResourceId $f.ResourceId)) {
+            $agg = $null
+        }
+
+        $isProt = if ($agg) { [bool]$agg.Protected } else { $false }
+        if ($isProt) { $protected++ }
+        $lastUtc = if ($agg -and $agg.LatestBackupUtc) { $agg.LatestBackupUtc.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { '' }
+
+        Add-Member -InputObject $f -NotePropertyName HasBackup             -NotePropertyValue $isProt -Force
+        Add-Member -InputObject $f -NotePropertyName ShareBackupPolicy      -NotePropertyValue ([string]$(if ($agg) { $agg.Policy } else { '' })) -Force
+        Add-Member -InputObject $f -NotePropertyName ShareBackupVaultName   -NotePropertyValue ([string]$(if ($agg) { $agg.VaultName } else { '' })) -Force
+        Add-Member -InputObject $f -NotePropertyName ShareProtectionState   -NotePropertyValue ([string]$(if ($agg) { $agg.ProtectionState } else { '' })) -Force
+        Add-Member -InputObject $f -NotePropertyName ShareLastBackupTimeUtc -NotePropertyValue $lastUtc -Force
+        Add-Member -InputObject $f -NotePropertyName BackupDataStatus       -NotePropertyValue 'Ok' -Force
+    }
+
+    return [pscustomobject]@{ ShareCount = $shareCount; ProtectedCount = $protected; UnknownCount = $unknown }
 }
 
 function Group-CVAzureSnapshotsByDisk {
@@ -230,6 +358,11 @@ function Resolve-CVAzureBackupAttribution {
         $sub = "$($v.Subscription)"
         $backupStatus   = if ($Status.ContainsKey($sub) -and $Status[$sub].BACKUP)   { $Status[$sub].BACKUP }   else { 'Skipped' }
         $snapshotStatus = if ($Status.ContainsKey($sub) -and $Status[$sub].SNAPSHOT) { $Status[$sub].SNAPSHOT } else { 'Skipped' }
+        # Tracked separately from BACKUP: item enumeration and the vault-posture read can fail independently, so
+        # without its own status a failed posture read would leave the vault columns blank while BackupDataStatus
+        # said 'Ok' - the status column lying by omission.
+        $vaultSettingsStatus = if ($Status.ContainsKey($sub) -and $Status[$sub].VAULTSETTINGS) { $Status[$sub].VAULTSETTINGS } else { 'Skipped' }
+        Add-Member -InputObject $v -NotePropertyName VaultSettingsDataStatus -NotePropertyValue $vaultSettingsStatus -Force
 
         # ---- Backup coverage -------------------------------------------------------------------------------
         if ($backupStatus -ne 'Ok') {
@@ -247,6 +380,15 @@ function Resolve-CVAzureBackupAttribution {
             Add-Member -InputObject $v -NotePropertyName DbBackupWorkloads   -NotePropertyValue ''    -Force
             Add-Member -InputObject $v -NotePropertyName BackupDataStatus    -NotePropertyValue $backupStatus -Force
             Add-Member -InputObject $v -NotePropertyName AmbiguousNameMatch  -NotePropertyValue $false -Force
+            # Vault-derived signals: blank, because we never established which vault (if any) protects this VM.
+            # Spelled out one per line rather than looped over a name list: the wiring guard detects populated
+            # fields by scanning source text, and `-NotePropertyName $f` hides the field name from it.
+            Add-Member -InputObject $v -NotePropertyName BackupCrossRegionRestore           -NotePropertyValue $null -Force
+            Add-Member -InputObject $v -NotePropertyName BackupImmutabilityState            -NotePropertyValue $null -Force
+            Add-Member -InputObject $v -NotePropertyName BackupVaultSoftDeleteState         -NotePropertyValue $null -Force
+            Add-Member -InputObject $v -NotePropertyName BackupVaultSoftDeleteRetentionDays -NotePropertyValue $null -Force
+            Add-Member -InputObject $v -NotePropertyName BackupVaultMultiUserAuth           -NotePropertyValue $null -Force
+            Add-Member -InputObject $v -NotePropertyName BackupVaultStorageRedundancy       -NotePropertyValue $null -Force
         } else {
             $strictKey = Get-CVAzureBackupKey -Subscription $v.Subscription -ResourceGroup $v.ResourceGroup -Name $v.VMName
             $looseKey  = Get-CVAzureBackupKey -Subscription $v.Subscription -ResourceGroup $null            -Name $v.VMName
@@ -278,6 +420,21 @@ function Resolve-CVAzureBackupAttribution {
             # 10-minute-old backup read as an unexplained offset.
             $lastUtc = if ($agg -and $agg.LatestBackupUtc) { $agg.LatestBackupUtc.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { '' }
             Add-Member -InputObject $v -NotePropertyName LastBackupTimeUtc -NotePropertyValue $lastUtc -Force
+
+            # Vault-derived signals. Raw Azure enum strings, published verbatim - 'Disabled'/'Unlocked'/'Locked'
+            # for immutability, 'Enabled'/'Disabled' for cross-region restore. Only 'Locked' is actually WORM.
+            #
+            # A VM with no backup item has no vault, so these stay $null. That is INAPPLICABLE rather than
+            # unread, and the pair (BackupDataStatus = Ok, BackupEnabled = FALSE) is what tells the two apart -
+            # see CYBER_RESILIENCE_SIGNALS.md.
+            # One line per field, not a loop over a name map: `-NotePropertyName $dest` would hide these names
+            # from the wiring guard that checks each control's field is actually populated for its resource type.
+            Add-Member -InputObject $v -NotePropertyName BackupCrossRegionRestore           -NotePropertyValue $(if ($agg) { $agg.VaultCrossRegionRestore }      else { $null }) -Force
+            Add-Member -InputObject $v -NotePropertyName BackupImmutabilityState            -NotePropertyValue $(if ($agg) { $agg.VaultImmutabilityState }       else { $null }) -Force
+            Add-Member -InputObject $v -NotePropertyName BackupVaultSoftDeleteState         -NotePropertyValue $(if ($agg) { $agg.VaultSoftDeleteState }         else { $null }) -Force
+            Add-Member -InputObject $v -NotePropertyName BackupVaultSoftDeleteRetentionDays -NotePropertyValue $(if ($agg) { $agg.VaultSoftDeleteRetentionDays } else { $null }) -Force
+            Add-Member -InputObject $v -NotePropertyName BackupVaultMultiUserAuth           -NotePropertyValue $(if ($agg) { $agg.VaultMultiUserAuth }           else { $null }) -Force
+            Add-Member -InputObject $v -NotePropertyName BackupVaultStorageRedundancy       -NotePropertyValue $(if ($agg) { $agg.VaultStorageRedundancy }       else { $null }) -Force
         }
 
         # ---- Snapshot coverage -----------------------------------------------------------------------------

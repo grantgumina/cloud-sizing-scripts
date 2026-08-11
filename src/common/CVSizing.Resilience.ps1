@@ -170,7 +170,18 @@ $script:CVSignalIdentityColumns = @(
 
 # Collection status, where a cloud script records it. These explain WHY a signal is blank - a fact about the
 # collection, not a judgement about the resource - so a blank can be read as "denied"/"skipped" vs "absent".
-$script:CVSignalStatusColumns = @('BackupDataStatus','SnapshotDataStatus')
+#
+# This list is CLOUD-AGNOSTIC and every cloud's export gets every column, so the Azure-specific ones below appear
+# (blank) in the AWS and GCP files too. That is a deliberate trade: a fixed schema was chosen over per-cloud
+# status plumbing. The doc marks which are Azure-only, because a blank LockDataStatus in an AWS export would
+# otherwise read as "we did not look for locks" in a cloud that has no equivalent.
+$script:CVSignalStatusColumns = @(
+    'BackupDataStatus', 'SnapshotDataStatus',
+    'LockDataStatus',          # Azure: resource-lock read (deletion protection)
+    'VaultSettingsDataStatus', # Azure: Recovery Services vault posture read
+    'LtrDataStatus',           # Azure: SQL long-term-retention policy read
+    'AksBackupDataStatus'      # Azure: DataProtection backup-instance read
+)
 
 function Get-CVFirstProperty {
     <# .SYNOPSIS  First non-empty value among candidate property names. Collections disagree on field naming. #>

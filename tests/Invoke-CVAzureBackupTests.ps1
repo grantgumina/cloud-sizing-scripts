@@ -19,11 +19,18 @@ function Assert-CV { param([string]$Name, $Actual, $Expected)
     else { $script:Fail++; Write-Host "  FAIL  $Name (expected '$Expected', got '$Actual')" -ForegroundColor Red } }
 
 # Realistic Azure name shapes. Verified against the documented forms for each workload.
-function New-Item2 { param($Sub,$Wl,$Container,$ItemName,$State='Protected',$Status='Healthy',$Policy='DefaultPolicy',$Last,$Vault='vault1')
+function New-Item2 { param($Sub,$Wl,$Container,$ItemName,$State='Protected',$Status='Healthy',$Policy='DefaultPolicy',$Last,$Vault='vault1',
+                          $Xregion,$Immutability,$SoftDelete,$Mua,$Redundancy,$Friendly,$SourceId)
     [pscustomobject]@{ Subscription=$Sub; WorkloadType=$Wl; ContainerName=$Container; ItemName=$ItemName
                        ProtectionState=$State; ProtectionStatus=$Status; PolicyName=$Policy
-                       LastBackupStatus='Completed'; LastBackupTime=$Last; VaultName=$Vault } }
+                       LastBackupStatus='Completed'; LastBackupTime=$Last; VaultName=$Vault
+                       # Vault-level settings ride along on the item row - they describe the vault protecting it.
+                       VaultCrossRegionRestore=$Xregion; VaultImmutabilityState=$Immutability
+                       VaultSoftDeleteState=$SoftDelete; VaultMultiUserAuth=$Mua; VaultStorageRedundancy=$Redundancy
+                       # Azure Files: the share name is FriendlyName; .Name/.ItemName is a hashed form.
+                       FriendlyName=$Friendly; SourceResourceId=$SourceId } }
 function New-Vm { param($Sub,$Rg,$Name) [pscustomobject]@{ Subscription=$Sub; ResourceGroup=$Rg; VMName=$Name } }
+function New-Share { param($Sub,$Account,$Name,$Id) [pscustomobject]@{ Subscription=$Sub; StorageAccount=$Account; Name=$Name; ResourceId=$Id } }
 
 Write-Host "`n[1] Name parsing across workload shapes"
 $c = ConvertFrom-CVAzureBackupItemName 'iaasvmcontainerv2;RG-A;VM1'
@@ -162,6 +169,101 @@ Reset-CVCollectionStatus
 Set-CVCollectionStatus -Scope 'IT Prod' -Signal BACKUP -Status Ok
 $m = Get-CVCollectionStatusMap
 Assert-CV 'status map lookup is case-insensitive' $m['it prod'].BACKUP 'Ok'
+
+Write-Host "`n[13] Vault settings follow the vault that ACTUALLY protects the VM"
+<#
+    VaultName used to be assigned first-wins, outside the protected-wins branch. A VM with a stale
+    ProtectionStopped item in vault A and a live Protected item in vault B collides on one strict key, so the row
+    named vault A while its policy came from vault B. That was cosmetic while VaultName was decorative. It stops
+    being cosmetic the moment immutability and cross-region-restore hang off it: the row would assert vault A's
+    posture for a VM that vault B protects.
+#>
+Reset-CVCollectionStatus
+Set-CVCollectionStatus -Scope 'IT Prod' -Signal BACKUP -Status Ok
+$items = @(
+    # Stale item in vaultA, listed FIRST so first-wins would take it. Deliberately opposite settings.
+    New-Item2 -Sub 'IT Prod' -Wl AzureVM -Container 'iaasvmcontainerv2;RG-A;VM1' -ItemName 'VM;iaasvmcontainerv2;RG-A;VM1' `
+              -State 'ProtectionStopped' -Vault 'vaultA' -Xregion 'Disabled' -Immutability 'Disabled' -Redundancy 'LocallyRedundant'
+    # The live one, in vaultB.
+    New-Item2 -Sub 'IT Prod' -Wl AzureVM -Container 'iaasvmcontainerv2;RG-A;VM1' -ItemName 'VM;iaasvmcontainerv2;RG-A;VM1' `
+              -State 'Protected' -Vault 'vaultB' -Xregion 'Enabled' -Immutability 'Locked' -Redundancy 'GeoRedundant'
+)
+$vms = @( (New-Vm 'IT Prod' 'RG-A' 'VM1') )
+$null = Resolve-CVAzureBackupAttribution -BackupItems $items -VMs $vms -Status (Get-CVCollectionStatusMap)
+Assert-CV 'protected item wins the vault'        $vms[0].BackupVaultName 'vaultB'
+Assert-CV 'cross-region from the PROTECTING vault' $vms[0].BackupCrossRegionRestore 'Enabled'
+Assert-CV 'immutability from the protecting vault' $vms[0].BackupImmutabilityState 'Locked'
+Assert-CV 'redundancy from the protecting vault'   $vms[0].BackupVaultStorageRedundancy 'GeoRedundant'
+Assert-CV 'and it is still reported protected'     $vms[0].BackupEnabled $true
+
+# Raw enum strings are published verbatim - no collapsing to a boolean here.
+Assert-CV 'immutability is a string, not a bool' ($vms[0].BackupImmutabilityState -is [string]) $true
+
+# A VM we looked at but which has no backup item has no vault: inapplicable, so blank.
+Reset-CVCollectionStatus
+Set-CVCollectionStatus -Scope 'IT Prod' -Signal BACKUP -Status Ok
+$vms = @( (New-Vm 'IT Prod' 'RG-A' 'Lonely') )
+$null = Resolve-CVAzureBackupAttribution -BackupItems @() -VMs $vms -Status (Get-CVCollectionStatusMap)
+Assert-CV 'unprotected VM: measured FALSE backup'  $vms[0].BackupEnabled $false
+Assert-CV 'unprotected VM: vault signal blank'     ($null -eq $vms[0].BackupImmutabilityState) $true
+Assert-CV 'and status says we DID look'            $vms[0].BackupDataStatus 'Ok'
+
+# Never collected -> both the backup verdict and the vault signals stay blank.
+Reset-CVCollectionStatus
+$vms = @( (New-Vm 'IT Prod' 'RG-A' 'VM1') )
+$null = Resolve-CVAzureBackupAttribution -BackupItems @() -VMs $vms -Status (Get-CVCollectionStatusMap)
+Assert-CV 'not collected: BackupEnabled null'      ($null -eq $vms[0].BackupEnabled) $true
+Assert-CV 'not collected: vault signal null'       ($null -eq $vms[0].BackupCrossRegionRestore) $true
+
+Write-Host "`n[14] Azure Files backup attributed to the SHARE, not the storage account"
+<#
+    fs-backup reads $r.HasBackup, which nothing on the Azure side ever set - only the GCP script sets it, for
+    Filestore, and the cross-cloud wiring detector hid that. The items were already collected (the backup pass
+    queries AzureStorage/AzureFiles) and then folded into the account's DbItemCount and dropped.
+#>
+$acctId  = '/subscriptions/S1/resourceGroups/RG-B/providers/Microsoft.Storage/storageAccounts/sa1'
+$shareId = "$acctId/fileServices/default/shares/share1"
+Reset-CVCollectionStatus
+Set-CVCollectionStatus -Scope 'IT Prod' -Signal BACKUP -Status Ok
+$items = @(
+    New-Item2 -Sub 'IT Prod' -Wl AzureFiles -Container 'StorageContainer;ClusterStorage;RG-B;sa1' `
+              -ItemName 'AzureFileShare;abc123hash' -Friendly 'share1' -SourceId $acctId -Vault 'vaultFS' -Last '2026-08-11T02:00:00Z'
+)
+$grouped = Group-CVAzureBackupItems $items
+$shares  = @( (New-Share 'IT Prod' 'sa1' 'share1' $shareId), (New-Share 'IT Prod' 'sa1' 'share2' "$acctId/fileServices/default/shares/share2") )
+$sum = Resolve-CVAzureFileShareBackup -Grouped $grouped -FileShares $shares -Status (Get-CVCollectionStatusMap)
+Assert-CV 'protected share -> HasBackup true'   $shares[0].HasBackup $true
+Assert-CV 'protected share -> vault named'      $shares[0].ShareBackupVaultName 'vaultFS'
+Assert-CV 'protected share -> UTC ISO-8601'     $shares[0].ShareLastBackupTimeUtc '2026-08-11T02:00:00Z'
+Assert-CV 'unbacked share in same account -> FALSE' $shares[1].HasBackup $false
+Assert-CV 'summary counts one protected'        $sum.ProtectedCount 1
+
+# The share name alone must not carry across storage accounts.
+$otherShare = @( (New-Share 'IT Prod' 'sa2' 'share1' '/subscriptions/S1/resourceGroups/RG-B/providers/Microsoft.Storage/storageAccounts/sa2/fileServices/default/shares/share1') )
+$null = Resolve-CVAzureFileShareBackup -Grouped $grouped -FileShares $otherShare -Status (Get-CVCollectionStatusMap)
+Assert-CV 'same share name, different account -> FALSE' $otherShare[0].HasBackup $false
+
+# A stopped share backup is enrolment we cannot count on.
+$stopped = Group-CVAzureBackupItems @(
+    New-Item2 -Sub 'IT Prod' -Wl AzureFiles -Container 'StorageContainer;ClusterStorage;RG-B;sa1' `
+              -ItemName 'AzureFileShare;h' -Friendly 'share1' -SourceId $acctId -State 'ProtectionStopped' )
+$sh = @( (New-Share 'IT Prod' 'sa1' 'share1' $shareId) )
+$null = Resolve-CVAzureFileShareBackup -Grouped $stopped -FileShares $sh -Status (Get-CVCollectionStatusMap)
+Assert-CV 'ProtectionStopped share -> FALSE' $sh[0].HasBackup $false
+
+# Not collected -> Unknown, never a fabricated "no backup".
+Reset-CVCollectionStatus
+$sh = @( (New-Share 'IT Prod' 'sa1' 'share1' $shareId) )
+$null = Resolve-CVAzureFileShareBackup -Grouped $grouped -FileShares $sh -Status (Get-CVCollectionStatusMap)
+Assert-CV 'backup not collected -> HasBackup null' ($null -eq $sh[0].HasBackup) $true
+Assert-CV 'and the status is recorded'             $sh[0].BackupDataStatus 'Skipped'
+
+# An AzureFiles item must still not set any VM's BackupEnabled.
+Reset-CVCollectionStatus
+Set-CVCollectionStatus -Scope 'IT Prod' -Signal BACKUP -Status Ok
+$vms = @( (New-Vm 'IT Prod' 'RG-B' 'sa1') )   # a VM that happens to share the account's name
+$null = Resolve-CVAzureBackupAttribution -BackupItems $items -VMs $vms -Status (Get-CVCollectionStatusMap)
+Assert-CV 'AzureFiles item does not protect a VM' $vms[0].BackupEnabled $false
 
 Write-Host ("`n======  {0} passed, {1} failed  ======`n" -f $script:Pass, $script:Fail) `
            -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })

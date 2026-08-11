@@ -21,10 +21,29 @@ of an assessed type with the relevant configuration values read from the cloud A
 | `SizeGB` / `SizeTB` | Size. **Blank means unmeasured, not zero** — a resource we could not size is not a small one |
 | `BackupDataStatus` | Whether backup collection succeeded for this scope: `Ok` / `Failed` / `Skipped` |
 | `SnapshotDataStatus` | Same for snapshot collection |
+| `LockDataStatus` | **Azure only.** Resource-lock read (deletion protection). Blank column on AWS/GCP |
+| `VaultSettingsDataStatus` | **Azure only.** Recovery Services vault posture read — tracked apart from `BackupDataStatus` because listing backup *items* and reading vault *settings* can fail independently |
+| `LtrDataStatus` | **Azure only.** SQL long-term-retention policy read |
+| `AksBackupDataStatus` | **Azure only.** DataProtection backup-instance read (Backup for AKS) |
 | *signal columns* | The raw configuration values, named exactly as collected. See the tables below |
 
 **A blank signal means the value was not collected** — the API was not reachable, permission was denied, the
 service was not requested via `-Types`, or the signal does not apply to that resource type. `FALSE` and blank are distinct.
+
+Because blank carries that single meaning, **a measured absence is written as the token `None`**, never as an empty
+cell. `ResourceLockLevel = None` means "we read the locks and none apply"; blank means we could not read them.
+
+### Not applicable vs not collected
+
+Some signals describe a *parent* the resource may not have. A VM's `BackupImmutabilityState` comes from the
+Recovery Services vault protecting it, so an unprotected VM has no vault to describe. Read the pair:
+
+| `BackupDataStatus` | `BackupEnabled` | Vault signal blank because… |
+|---|---|---|
+| `Ok` | `FALSE` | **Not applicable** — we looked, the VM has no backup vault |
+| `Failed` / `Skipped` | blank | **Not collected** — we could not look |
+
+Treating the first row as unassessed will overstate how much of the estate went unevaluated.
 
 **The schema is fixed.** Every column below is emitted on every run regardless of what resource type, so the
 header is identical between runs. Because one file contains information for every resource type, most cells are blank
@@ -38,8 +57,11 @@ by design — e.g. a VM row populates only the VM signals.
 | Resource type | Signal | Collected | Values / meaning |
 |---|---|---|---|
 | **VM** | `BackupEnabled` | ✅ | `TRUE`/`FALSE` — protected by a Recovery Services vault backup item |
-| | `BackupCrossRegion` | ❌ not yet | Needs the vault's cross-region-restore setting |
-| | `BackupImmutable` | ❌ not yet | Needs the vault's immutability setting |
+| | `BackupCrossRegionRestore` | ✅ | `Enabled` / `Disabled` — from the vault that actually protects this VM. Blank when the VM has no vault (see *not applicable* above) |
+| | `BackupImmutabilityState` | ✅ | `Disabled` / `Unlocked` / `Locked`. **Only `Locked` is WORM** — an `Unlocked` policy can simply be removed, the same standard `ImmutabilityLocked` applies to storage |
+| | `BackupVaultSoftDeleteState` | ✅ | `Enabled` / `Disabled` / `AlwaysON`. `AlwaysON` cannot be turned off, so it is the strongest state |
+| | `BackupVaultMultiUserAuth` | ✅ | Resource Guard state. This is the control that stops an attacker holding vault permissions from shortening retention and then deleting backups |
+| | `BackupVaultStorageRedundancy` | ✅ | `GeoRedundant` / `ZoneRedundant` / `LocallyRedundant` |
 | **Disk** | `CmkEncrypted` | ✅ | `TRUE`/`FALSE` — from `Encryption.Type`; both `…WithCustomerKey` and `…WithPlatformAndCustomerKeys` count as CMK. Blank if the disk exposes no encryption block |
 | **Storage** | `BlobVersioning` | ✅ | `TRUE`/`FALSE` — prior blob versions survive overwrite |
 | | `SoftDeleteEnabled` | ✅ | `TRUE`/`FALSE` — deleted blobs are recoverable |
@@ -47,24 +69,50 @@ by design — e.g. a VM row populates only the VM signals.
 | | `StorageAccountSkuName` | ✅ | e.g. `Standard_LRS`, `Standard_GRS`, `Standard_RAGRS`, `Standard_GZRS` — `GRS`/`GZRS` indicate geo-redundancy |
 | | `CmkEncrypted` | ✅ | `TRUE`/`FALSE` |
 | | `PublicAccessBlocked` | ✅ | `TRUE` = public blob access is disabled (note the polarity) |
-| **FileShare** | `HasBackup` | ✅ | `TRUE`/`FALSE` — share enrolled in a backup plan |
+| **FileShare** | `HasBackup` | ✅ | `TRUE`/`FALSE` — this **share** is enrolled in a Recovery Services backup plan. Attributed per share, not per storage account, so two shares in one account report independently |
 | | `StorageAccountSkuName` | ✅ | As above, for the parent account |
 | | `EncryptedAtRest` | ✅ | `TRUE`/`FALSE` (Azure Files is SSE-encrypted by default) |
 | **SQL** | `PITR_Days` | ✅ | Integer days of point-in-time recovery. `0`/blank means none |
 | | `LTRWeeklyRetention` / `LTRMonthlyRetention` | ✅ | ISO-8601 durations, e.g. `P4W`, `P12M` |
-| | `LTRYearlyRetention` | ❌ not yet | The cmdlet returns it; the inventory row does not capture it |
+| | `LTRYearlyRetention` | ✅ | ISO-8601 duration, e.g. `P1Y`. Was always fetched and discarded before being captured |
+| | `LTRTimeBasedImmutability` | ✅ | Long-term-retention backup immutability, from the same policy object |
 | | `BackupStorageRedundancy` | ✅ | `Local` / `Zone` / `Geo` / `GeoZone` |
 | | `CmkEncrypted` | ✅ | `TRUE`/`FALSE` — TDE protector is a **server**-level setting (`AzureKeyVault` vs `ServiceManaged`), so every database on a server carries the same value |
-| | `DeletionProtected` | ❌ not yet | Needs `Get-AzResourceLock` |
+| | `ResourceLockLevel` | ✅ | `CanNotDelete` / `ReadOnly` / `None`, `;`-joined when locks at several scopes apply. Locks **inherit downward**, so a lock on the server, resource group or subscription protects the database. See the caveat below |
 | **FlexDB** (MySQL / PostgreSQL) | `BackupRetentionDays` | ✅ | Integer days |
 | | `GeoRedundantBackup` | ✅ | `Enabled` / `Disabled` |
 | | `CmkEncrypted` | ⚠️ module-dependent | `TRUE`/`FALSE` where the installed `Az.MySql`/`Az.PostgreSql` exposes data encryption (`DataEncryptionType` or `DataEncryption.Type`), **blank where it does not** — several current versions expose no encryption property on the flexible-server model at all. Blank means unread, not platform-key |
 | **Cosmos** | `BackupPolicyBackupType` | ✅ | `Periodic` / `Continuous` — continuous is PITR |
 | | `BackupPolicyBackupStorageRedundancy` | ✅ | `Local` / `Zone` / `Geo`. Blank on continuous-backup accounts, where it does not apply |
 | | `CmkEncrypted` | ✅ | `TRUE`/`FALSE` — derived from `KeyVaultKeyUri`, which is present only for CMK accounts |
-| | `DeletionProtected` | ❌ not yet | Needs `Get-AzResourceLock` |
-| **AKS** | `HasBackupPlan` | ✅ | `TRUE`/`FALSE` — persistent volumes enrolled in a backup plan |
-| | `SecretsEncryptionCmk` | ❌ not yet | Needs `SecurityProfile.AzureKeyVaultKms` |
+| | `ResourceLockLevel` | ✅ | As for SQL above |
+| **AKS** | `HasBackupPlan` | ✅ | `TRUE`/`FALSE` — a DataProtection **Backup vault** backup instance targets this cluster. A subscription with zero Backup vaults is a conclusive `FALSE`, not a guess |
+| | `SecretsEncryptionCmk` | ✅ | `TRUE`/`FALSE` — `SecurityProfile.AzureKeyVaultKms.Enabled`. `FALSE` means **no customer-managed key**; AKS always encrypts etcd with a platform key, so it does not mean "unencrypted" |
+| | `NodeDiskEncryptionSetId` | ✅ | Disk-encryption-set ARM ID, or `None` when node disks use platform keys |
+
+#### `ResourceLockLevel = None` does not mean "deletable"
+
+Azure blocks deletion by several mechanisms and only one of them is a lock. **Deny assignments** (from Blueprints
+or managed applications) and Azure Policy **`DenyAction`** both prevent deletion with no lock present, and neither
+appears here. Read `None` as "no resource lock applies", not as "this resource can be deleted".
+
+Note also that Azure's real delete behaviour cascades: deleting a SQL server whose *database* carries
+`CanNotDelete` fails. The export therefore publishes `ResourceLockScope` (the scope each matched lock is defined
+at) and `ResourceLockCount` alongside the level, so ancestor, self and descendant locks can be told apart rather
+than collapsed into one verdict here.
+
+#### Azure permissions these signals need
+
+All reads, all covered by the built-in **Reader** role at subscription scope. Nothing needs write access and
+nothing needs a custom role. Where a permission is missing the run records it and leaves the column blank — it
+never reports a gap it could not verify.
+
+| Operation | Signals it feeds | Narrower built-in role that also covers it |
+|---|---|---|
+| `Microsoft.Authorization/locks/read` | `ResourceLockLevel` (SQL, Cosmos) | none — Reader, or a custom role |
+| `Microsoft.RecoveryServices/vaults/read` | `BackupImmutabilityState`, `BackupCrossRegionRestore`, `BackupVault*` | Backup Reader |
+| `Microsoft.DataProtection/backupVaults/read` and `.../backupInstances/read` | `HasBackupPlan` (AKS) | Backup Reader |
+| `Microsoft.ContainerService/managedClusters/read` | `SecretsEncryptionCmk`, `NodeDiskEncryptionSetId` | already required |
 
 ### AWS
 

@@ -253,6 +253,7 @@ $cvRequired  = @(
     'CVSizing.Resilience.Azure.ps1'   # Azure control definitions
     'CVSizing.Backup.Azure.ps1'       # Azure backup attribution
     'CVSizing.Metrics.Azure.ps1'      # Azure Monitor metric wrapper
+    'CVSizing.Arm.Azure.ps1'          # ARM REST list helper (HTTP status drives the tri-state)
     'CVSizing.Kubectl.ps1'            # cross-platform kubectl provisioning (Install-CVKubectl, used by AKS)
     'CVSizing.CloudRewind.ps1'        # provider-neutral Cloud Rewind engine
     'CVSizing.CloudRewind.Azure.ps1'  # Azure billable taxonomy + inclusion rules
@@ -672,8 +673,11 @@ $ResourceTypeModules = @{
     STORAGE        = @('Az.Accounts', 'Az.Storage', 'Az.Monitor')
     FILESHARE      = @('Az.Accounts', 'Az.Storage')
     NETAPP         = @('Az.Accounts', 'Az.NetAppFiles', 'Az.Monitor', 'Az.Resources')
-    SQL            = @('Az.Accounts', 'Az.Sql', 'Az.MySql', 'Az.PostgreSql', 'Az.Monitor')
-    COSMOS         = @('Az.Accounts', 'Az.CosmosDB', 'Az.Monitor')
+    # Az.Resources is needed for Get-AzResourceLock (deletion-protection signal). It is a fatal module so it is
+    # always INSTALLED, but -Types SQL,COSMOS -SkipCloudRewind never IMPORTED it, and the note below about
+    # letting modules resolve themselves mid-run applies: an implicit load is how the assembly conflict happens.
+    SQL            = @('Az.Accounts', 'Az.Sql', 'Az.MySql', 'Az.PostgreSql', 'Az.Monitor', 'Az.Resources')
+    COSMOS         = @('Az.Accounts', 'Az.CosmosDB', 'Az.Monitor', 'Az.Resources')
     AKS            = @('Az.Accounts', 'Az.Aks', 'Az.Resources')
     BACKUP         = @('Az.Accounts', 'Az.RecoveryServices')
     UNMANAGEDDISKS = @('Az.Accounts', 'Az.Compute')
@@ -798,12 +802,75 @@ foreach ($sub in $subs) {
     try {
         Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop | Out-Null
     } catch {
-        foreach ($sig in @('BACKUP','SNAPSHOT')) { Set-CVCollectionStatus -Scope $sub.Name -Signal $sig -Status Failed }
+        foreach ($sig in @('BACKUP','SNAPSHOT','LOCK')) { Set-CVCollectionStatus -Scope $sub.Name -Signal $sig -Status Failed }
         Write-CVLog "Could not select subscription - skipping it: $($_.Exception.Message)" -Level Error -Source 'Auth' -Scope @{ Subscription = $sub.Name; Category = 'ContextFailed' }
         continue
     }
 
-    # VMs  
+    # ---------------------------------------------------------------
+    # RESOURCE LOCKS (deletion protection for SQL databases and Cosmos accounts)
+    # ---------------------------------------------------------------
+    # ONE subscription-wide call, before the SQL and Cosmos builders that consume it. Locks inherit downward, so
+    # a lock at subscription or resource-group scope protects everything beneath it and per-resource calls are
+    # unnecessary - measured at 17 locks in 245 ms for a whole subscription.
+    #
+    # Deliberately NO per-resource-group fallback on failure. A per-RG retry returns that RG and below, so it
+    # would MISS an inherited subscription-scope lock and emit 'None' for a resource that is in fact locked -
+    # a fabricated finding, which is worse than a blank column. Partial lock data is not usable.
+    $subLocks = $null
+    if ($Selected.SQL -or $Selected.COSMOS) {
+        # Its own try/catch: the subscription loop is try/finally with NO catch and $ErrorActionPreference='Stop',
+        # so an unguarded 403 here would abandon every remaining subscription and all exports.
+        try {
+            $subLocks = @(Get-AzResourceLock -ErrorAction Stop)
+            # A lock whose scope cannot be derived means we cannot claim a complete picture for this subscription.
+            $badScopes = @($subLocks | Where-Object { $_ -and -not (Get-CVAzureLockScope ([string]$_.ResourceId)) })
+            if ($badScopes.Count) {
+                $subLocks = $null
+                Set-CVCollectionStatus -Scope $sub.Name -Signal LOCK -Status Failed
+                Write-CVLog "$($badScopes.Count) resource lock(s) had an unparseable scope - deletion protection will report Unknown rather than a guess." `
+                            -Level Warning -Source 'Locks' -Scope @{ Subscription = $sub.Name; Category = 'LockScopeParse' }
+            } else {
+                Set-CVCollectionStatus -Scope $sub.Name -Signal LOCK -Status Ok
+            }
+        } catch {
+            $subLocks = $null
+            Set-CVCollectionStatus -Scope $sub.Name -Signal LOCK -Status Failed
+            Write-CVLog "Could not read resource locks - deletion protection will report Unknown, not 'no lock'. Grant Microsoft.Authorization/locks/read: $($_.Exception.Message)" `
+                        -Level Warning -Source 'Locks' -Scope @{ Subscription = $sub.Name; Category = 'LocksDenied' }
+        }
+    } else {
+        Set-CVCollectionStatus -Scope $sub.Name -Signal LOCK -Status Skipped
+    }
+    $lockStatus = Get-CVCollectionStatus -Scope $sub.Name -Signal LOCK
+
+    # ---------------------------------------------------------------
+    # BACKUP FOR AKS (Microsoft.DataProtection backup instances)
+    # ---------------------------------------------------------------
+    # AKS backup lives in a DataProtection BACKUP VAULT, not a Recovery Services vault, so the Recovery Services
+    # pass above cannot see it. Read over ARM REST via Invoke-AzRestMethod (Az.Accounts, already required) rather
+    # than adding Az.DataProtection - and rather than Resource Graph, whose zero-row result cannot distinguish
+    # "this type is not indexed" from "none exist".
+    #
+    # The HTTP status is what makes HasBackupPlan honest: 200 with zero backup vaults is conclusive (no vault, so
+    # no AKS backup), while a 403 must leave the signal blank.
+    $aksBackupInstances = $null
+    if ($Selected.AKS) {
+        $dp = Get-CVAzureDataProtectionInstances -SubscriptionId $sub.Id
+        if ($dp.Ok) {
+            $aksBackupInstances = @($dp.Instances)
+            Set-CVCollectionStatus -Scope $sub.Name -Signal AKSBACKUP -Status Ok
+        } else {
+            Set-CVCollectionStatus -Scope $sub.Name -Signal AKSBACKUP -Status Failed
+            Write-CVLog "Could not read DataProtection backup instances (HTTP $($dp.StatusCode)) - AKS backup coverage will report Unknown, not 'not backed up'. Needs Microsoft.DataProtection/backupVaults/read: $($dp.Error)" `
+                        -Level Warning -Source 'AKS' -Scope @{ Subscription = $sub.Name; Category = 'AksBackupDenied' }
+        }
+    } else {
+        Set-CVCollectionStatus -Scope $sub.Name -Signal AKSBACKUP -Status Skipped
+    }
+    $aksBackupStatus = Get-CVCollectionStatus -Scope $sub.Name -Signal AKSBACKUP
+
+    # VMs
     # ---------------------------------------------------------------
     # ENVIRONMENT TAG FILTER: log filter status once per subscription
     # ---------------------------------------------------------------
@@ -1501,6 +1568,13 @@ foreach ($sub in $subs) {
                         $sqlObj.Add("DatabaseId", $sqlDB.DatabaseId)
                         $sqlObj.Add("Status", $sqlDB.Status)
                         $sqlObj.Add("CmkEncrypted", $sqlTdeCmk)   # server-level TDE protector, resolved above
+                        # db-delprot. A lock on the SERVER (or the RG, or the subscription) covers the database,
+                        # which is why this is an ARM-ancestor match rather than an id equality check.
+                        $dbLock = Resolve-CVAzureResourceLock -Locks $subLocks -ResourceId $sqlDB.ResourceId
+                        $sqlObj.Add("ResourceLockLevel", $dbLock.Level)
+                        $sqlObj.Add("ResourceLockScope", $dbLock.Scope)
+                        $sqlObj.Add("ResourceLockCount", $dbLock.Count)
+                        $sqlObj.Add("LockDataStatus",    $lockStatus)
 
                         # Get allocated and used storage metrics (Maximum over last 24h)
                         $allocatedVal = $null
@@ -1567,8 +1641,23 @@ foreach ($sub in $subs) {
                         try {
                             $str = Get-AzSqlDatabaseBackupShortTermRetentionPolicy -ServerName $sqlDB.ServerName -DatabaseName $sqlDB.DatabaseName -ResourceGroupName $sqlDB.ResourceGroupName -ErrorAction SilentlyContinue
                         } catch { $str = $null }
-                        $sqlObj.Add("LTRWeeklyRetention", ($ltr.WeeklyRetention -as [string]))
+                        # On success the cmdlet ALWAYS returns a policy object - with empty / PT0S retentions when
+                        # nothing is configured - so a $null result is a reliable "we could not read it".
+                        #
+                        # That distinction matters more than the new column: db-retention combines PITR_Days with
+                        # the LTR fields, so with PITR = 7 and LTR merely UNREAD it returned $false and reported
+                        # "retention below 35 days" about a database whose long-term retention we were forbidden
+                        # to see. LtrDataStatus makes the difference visible instead of silently scoring it.
+                        $ltrStatus = if ($null -eq $ltr) { 'Failed' } else { 'Ok' }
+                        $sqlObj.Add("LTRWeeklyRetention",  ($ltr.WeeklyRetention  -as [string]))
                         $sqlObj.Add("LTRMonthlyRetention", ($ltr.MonthlyRetention -as [string]))
+                        # Was fetched all along and thrown away; db-retention already reads it.
+                        $sqlObj.Add("LTRYearlyRetention",  ($ltr.YearlyRetention  -as [string]))
+                        $sqlObj.Add("LTRWeekOfYear",       $ltr.WeekOfYear)
+                        # LTR backup immutability - from the same policy object, nothing extra to call.
+                        $sqlObj.Add("LTRTimeBasedImmutability",     ($ltr.TimeBasedImmutability     -as [string]))
+                        $sqlObj.Add("LTRTimeBasedImmutabilityMode", ($ltr.TimeBasedImmutabilityMode -as [string]))
+                        $sqlObj.Add("LtrDataStatus", $ltrStatus)
                         $sqlObj.Add("PITR_Days", ($str.RetentionDays -as [string]))
 
                         $SqlDbInventory += New-Object -TypeName PSObject -Property $sqlObj
@@ -1966,6 +2055,13 @@ foreach ($sub in $subs) {
                             "CmkEncrypted" = [bool]$cosmosAccount.KeyVaultKeyUri
                             "KeyVaultKeyUri" = $cosmosAccount.KeyVaultKeyUri
                         }
+                        # cos-delprot. The Cosmos row carries the ARM id under "Id" (New-CVSignalRow's candidate
+                        # probe resolves that for the export), so match on it directly here.
+                        $cosLock = Resolve-CVAzureResourceLock -Locks $subLocks -ResourceId $cosmosAccount.Id
+                        $cosmosObj["ResourceLockLevel"] = $cosLock.Level
+                        $cosmosObj["ResourceLockScope"] = $cosLock.Scope
+                        $cosmosObj["ResourceLockCount"] = $cosLock.Count
+                        $cosmosObj["LockDataStatus"]    = $lockStatus
 
                         # Get metrics following the reference file pattern
                         $id = $cosmosAccount.Id
@@ -2088,6 +2184,24 @@ foreach ($sub in $subs) {
                             Write-CVLog "Skipping PV/PVC collection due to access error: $($pvInfo.AccessError)" -Level Warning -Source 'AKS' -Scope @{ Subscription = $sub.Name; Cluster = $cluster.Name }
                         }
                         
+                        # aks-secretenc. Azure omits the azureKeyVaultKms block entirely when KMS was never
+                        # configured, so its absence is a MEASURED "off", not an unknown.
+                        #
+                        # Verified against the ARM payload rather than assumed: for a cluster with no security
+                        # features set, ARM returns "securityProfile": {} - the block is present but empty, and
+                        # azureKeyVaultKms is simply not a key. So a non-null SecurityProfile does reflect the
+                        # wire, and a null AzureKeyVaultKms underneath it means not-configured.
+                        #
+                        # An earlier version demanded a non-null sibling (Defender / ImageCleaner / ...) as
+                        # corroboration before concluding. On a real cluster every sibling is null too, so that
+                        # guard could never conclude and left the column permanently blank - reintroducing the
+                        # very defect this change exists to fix. Requiring evidence the API does not emit is not
+                        # caution, it is a broken signal.
+                        $secProfile = $cluster.SecurityProfile
+                        $kmsEnabled = if ($null -eq $secProfile) { $null }                       # cluster shape unreadable
+                                      elseif ($null -eq $secProfile.AzureKeyVaultKms) { $false }  # measured: not configured
+                                      else { [bool]$secProfile.AzureKeyVaultKms.Enabled }
+
                         $AKSCluster = [PSCustomObject]@{
                             ClusterName = $cluster.Name
                             ResourceId = $cluster.Id
@@ -2098,6 +2212,41 @@ foreach ($sub in $subs) {
                             PersistentVolumeClaimCount = if ($pvInfo.AccessError) { $null } else { $pvInfo.TotalPVCCount }
                             PersistentVolumeCapacityGB = if ($pvInfo.AccessError) { $null } else { [math]::Round($pvInfo.TotalCapacityGB, 2) }
                             PersistentVolumeAccessError = $pvInfo.AccessError
+                            SecretsEncryptionCmk = $kmsEnabled
+                            KmsKeyVaultResourceId = "$($secProfile.AzureKeyVaultKms.KeyVaultResourceId)"
+                            # aks-backup. $null when the DataProtection read failed; otherwise a measured verdict,
+                            # including the conclusive "subscription has no backup vault at all" case.
+                            HasBackupPlan = $(
+                                if ($null -eq $aksBackupInstances) { $null }
+                                else {
+                                    [bool](@($aksBackupInstances | Where-Object {
+                                        Test-CVArmScopeCovers -Scope $_.DataSourceId -ResourceId $cluster.Id
+                                    }).Count)
+                                }
+                            )
+                            AksBackupVaultName = $(
+                                if ($null -eq $aksBackupInstances) { '' }
+                                else {
+                                    (@($aksBackupInstances | Where-Object { Test-CVArmScopeCovers -Scope $_.DataSourceId -ResourceId $cluster.Id } |
+                                        ForEach-Object { $_.VaultName } | Sort-Object -Unique) -join ';')
+                                }
+                            )
+                            AksBackupProtectionState = $(
+                                if ($null -eq $aksBackupInstances) { '' }
+                                else {
+                                    (@($aksBackupInstances | Where-Object { Test-CVArmScopeCovers -Scope $_.DataSourceId -ResourceId $cluster.Id } |
+                                        ForEach-Object { $_.ProtectionState } | Sort-Object -Unique) -join ';')
+                                }
+                            )
+                            AksBackupDataStatus = $aksBackupStatus
+                            # aks-diskcmek. 'None' is the measured-absent token, so blank keeps meaning unread.
+                            # Named NodeDiskEncryptionSetId, not DiskEncryptionSetId: the disk rows already use
+                            # that name and the export's column dictionary is case-insensitive, so whichever
+                            # resource type sorted first would win the header casing.
+                            NodeDiskEncryptionSetId = $(if ($cluster.PSObject.Properties['DiskEncryptionSetID']) {
+                                                            if ([string]::IsNullOrWhiteSpace("$($cluster.DiskEncryptionSetID)")) { 'None' }
+                                                            else { "$($cluster.DiskEncryptionSetID)" }
+                                                        } else { $null })
                         }
                         
                         $AKSClusters += $AKSCluster
@@ -2164,6 +2313,23 @@ foreach ($sub in $subs) {
         try {
             Write-Host "Processing Azure Backup coverage in subscription $($sub.Name)" -ForegroundColor Green
 
+            # Vault POSTURE (immutability, cross-region restore, soft delete, MUA, storage redundancy), read over
+            # ARM REST rather than off the cmdlet's .Properties. Whether the list form of Get-AzRecoveryServicesVault
+            # hydrates the nested settings blocks could not be verified - no vault existed in any reachable
+            # subscription - and a design resting on unverified hydration silently emits blank columns. REST gives
+            # the authoritative JSON plus an HTTP status, so a failure is recordable rather than indistinguishable
+            # from "no immutability configured".
+            $vaultSettings = @{}
+            $vsRes = Get-CVAzureVaultSettingsMap -SubscriptionId $sub.Id
+            if ($vsRes.Ok) {
+                $vaultSettings = $vsRes.Settings
+                Set-CVCollectionStatus -Scope $sub.Name -Signal VAULTSETTINGS -Status Ok
+            } else {
+                Set-CVCollectionStatus -Scope $sub.Name -Signal VAULTSETTINGS -Status Failed
+                Write-CVLog "Could not read Recovery Services vault settings (HTTP $($vsRes.StatusCode)) - vault immutability and cross-region restore will report Unknown, not a gap. Needs Microsoft.RecoveryServices/vaults/read: $($vsRes.Error)" `
+                            -Level Warning -Source 'Backup' -Scope @{ Subscription = $sub.Name; Category = 'VaultSettings' }
+            }
+
             # Vault discovery. A subscription-scope list needs read at subscription scope; under resource-group
             # scoped RBAC it returns 403, which used to be swallowed by -ErrorAction SilentlyContinue and then
             # reported as the confident "No Recovery Services vaults found". Distinguish the two, and fall back
@@ -2203,6 +2369,11 @@ foreach ($sub in $subs) {
                             # is process-wide state that fights the per-subscription Set-AzContext above.
                             $items = @(Get-AzRecoveryServicesBackupItem -VaultId $vault.ID `
                                         -BackupManagementType $pair.Mgmt -WorkloadType $pair.Workload -ErrorAction Stop)
+                            # Vault posture for THIS vault, joined by ARM id. Rides along on each item row so the
+                            # attribution pass can stamp it onto the protected resource - these describe the vault
+                            # protecting the resource, not the resource, and only the vault that ACTUALLY protects
+                            # it may contribute (see Group-CVAzureBackupItems).
+                            $vs = $vaultSettings[([string]$vault.ID).ToLower()]
                             foreach ($item in $items) {
                                 $BackupItems += [PSCustomObject]@{
                                     Subscription         = $sub.Name
@@ -2212,6 +2383,10 @@ foreach ($sub in $subs) {
                                     BackupManagementType = $pair.Mgmt
                                     WorkloadType         = $pair.Workload
                                     ItemName             = $item.Name
+                                    # Azure Files items name the share here; .Name is a hashed form. Needed to
+                                    # attribute a share backup to the share rather than the storage account.
+                                    FriendlyName         = $item.FriendlyName
+                                    SourceResourceId     = $item.SourceResourceId
                                     ContainerName        = $item.ContainerName
                                     ProtectionStatus     = $item.ProtectionStatus
                                     ProtectionState      = $item.ProtectionState
@@ -2219,6 +2394,12 @@ foreach ($sub in $subs) {
                                     LastBackupTime       = $item.LastBackupTime
                                     PolicyName           = $item.ProtectionPolicyName
                                     DiskSizeGB           = if ($item.DiskSizeGB) { $item.DiskSizeGB } else { 'N/A' }
+                                    VaultCrossRegionRestore      = $vs.VaultCrossRegionRestore
+                                    VaultImmutabilityState       = $vs.VaultImmutabilityState
+                                    VaultSoftDeleteState         = $vs.VaultSoftDeleteState
+                                    VaultSoftDeleteRetentionDays = $vs.VaultSoftDeleteRetentionDays
+                                    VaultMultiUserAuth           = $vs.VaultMultiUserAuth
+                                    VaultStorageRedundancy       = $vs.VaultStorageRedundancy
                                 }
                             }
                         } catch {
@@ -2382,6 +2563,21 @@ if ($protectionSummary.UnknownBackupCount -gt 0) {
 if ($protectionSummary.AmbiguousCount -gt 0) {
     Write-CVLog ("{0} VM(s) matched a backup item only by name (no resource group in the item name) while sharing that name with another VM - see AmbiguousNameMatch." -f $protectionSummary.AmbiguousCount) `
                 -Level Warning -Source 'Protection' -Scope @{ Category = 'AmbiguousMatch' }
+}
+
+# Azure Files shares. fs-backup reads HasBackup, which nothing on the Azure side ever set - the field is only
+# populated by the GCP script for Filestore, and the wiring detector's cross-cloud text blob hid that. The items
+# were already collected here (the AzureStorage/AzureFiles pair above) and then folded into the storage account's
+# DbItemCount and dropped, so this is a join rather than new collection.
+if ($FileShares.Count) {
+    $shareSummary = Resolve-CVAzureFileShareBackup -Grouped (Group-CVAzureBackupItems $BackupItems) `
+                        -FileShares $FileShares -Status (Get-CVCollectionStatusMap)
+    Write-CVLog ("File share backup coverage: {0}/{1} shares enrolled in a backup plan" -f $shareSummary.ProtectedCount, $shareSummary.ShareCount) `
+                -Level Info -Source 'Protection'
+    if ($shareSummary.UnknownCount -gt 0) {
+        Write-CVLog ("{0} file share(s) have UNKNOWN backup coverage - their subscription's Recovery Services data could not be collected." -f $shareSummary.UnknownCount) `
+                    -Level Warning -Source 'Protection' -Scope @{ Category = 'ShareCoverageUnknown' }
+    }
 }
 if ($Selected.VM) { Write-Host "Total VMs found: $($VMs.Count)" -ForegroundColor Cyan }
 if ($Selected.STORAGE) { Write-Host "Total Storage Accounts found: $($StorageAccounts.Count)" -ForegroundColor Cyan }

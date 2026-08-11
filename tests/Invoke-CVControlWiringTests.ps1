@@ -35,17 +35,10 @@ function Assert-CV { param([string]$Name, $Actual, $Expected)
     control that cannot be evaluated inflates UnassessedControls and makes the report look broken.
 #>
 $script:KnownUnwired = @{
-    # These two were exposed the moment the detector became per-cloud: both fields are set ONLY by the GCP
-    # script, so the old cross-cloud text blob reported them as wired for Azure while the columns shipped blank
-    # and CYBER_RESILIENCE_SIGNALS.md claimed both were collected. Both are being collected now; these entries
-    # exist so the suite stays green in between, and the stale-entry check below forces their removal.
-    'Azure/aks-backup'    = 'HasBackupPlan set only by GCP; Azure needs DataProtection backup instances'
-    'Azure/fs-backup'     = 'HasBackup set only by GCP; Azure Files items are collected but not attributed to shares'
-    'Azure/aks-secretenc' = 'needs AKS SecurityProfile / KMS etcd-encryption lookup'
-    'Azure/cos-delprot'   = 'needs Get-AzResourceLock per Cosmos account'
-    'Azure/db-delprot'    = 'needs Get-AzResourceLock per SQL database'
-    'Azure/vm-xregion'    = 'needs Recovery Services vault cross-region-restore setting'
-    'Azure/vm-immutable'  = 'needs Recovery Services vault immutability setting'
+    # Every Azure entry that used to live here is now collected - vault immutability and cross-region restore
+    # from the vault posture read, deletion protection from resource locks, AKS KMS from SecurityProfile, AKS
+    # backup from DataProtection backup instances, and Azure Files backup by attributing items already collected
+    # to the individual share. Only GCP entries remain.
     'GCP/pd-schedule'     = 'needs gcloud compute disks describe -> resourcePolicies (snapshot schedules)'
     'GCP/pd-nodelete'     = 'needs the instance attachment autoDelete flag'
     'GCP/fs-xregion'      = 'needs Filestore backup location vs instance location comparison'
@@ -90,9 +83,10 @@ foreach ($cloud in $script:CVCloudScript.Keys) {
 foreach ($cloud in @('Azure','AWS','GCP')) {
     Assert-CV "per-cloud source text built for $cloud" ([bool]($script:CVCloudText[$cloud].Length -gt 10000)) $true
 }
-# And prove the isolation is real, using the leak that motivated it.
-Assert-CV 'GCP sees HasBackupPlan'        ([bool]($script:CVCloudText['GCP']   -match '-NotePropertyName\s+HasBackupPlan\b')) $true
-Assert-CV 'Azure does NOT see it (leak closed)' ([bool]($script:CVCloudText['Azure'] -match '-NotePropertyName\s+HasBackupPlan\b')) $false
+# Prove the isolation is real. HasBackupPlan was the field that exposed the leak, but Azure now collects it, so
+# the isolation proof uses XRegionBackup - a GCP-only field with no Azure equivalent.
+Assert-CV 'GCP sees XRegionBackup'              ([bool]($script:CVCloudText['GCP']   -match 'XRegionBackup')) $true
+Assert-CV 'Azure does NOT see it (leak closed)' ([bool]($script:CVCloudText['Azure'] -match 'XRegionBackup')) $false
 
 function Test-CVFieldIsPopulated {
     <#
@@ -117,9 +111,13 @@ Assert-CV 'finds an .Add() key'          (Test-CVFieldIsPopulated 'BackupStorage
 Assert-CV 'finds a quoted hashtable key' (Test-CVFieldIsPopulated 'BackupPolicyBackupType'  -Cloud Azure) $true
 Assert-CV 'finds an Add-Member field'    (Test-CVFieldIsPopulated 'XRegionBackup'           -Cloud GCP)   $true
 Assert-CV 'misses a field nobody sets'   (Test-CVFieldIsPopulated 'TotallyFakeFieldXyz'     -Cloud Azure) $false
-# The isolation itself, at the detector level: GCP sets HasBackupPlan, Azure does not.
-Assert-CV 'GCP: HasBackupPlan populated'   (Test-CVFieldIsPopulated 'HasBackupPlan' -Cloud GCP)   $true
-Assert-CV 'Azure: HasBackupPlan NOT populated' (Test-CVFieldIsPopulated 'HasBackupPlan' -Cloud Azure) $false
+# The isolation itself, at the detector level: GCP sets XRegionBackup, Azure has no equivalent.
+Assert-CV 'GCP: XRegionBackup populated'       (Test-CVFieldIsPopulated 'XRegionBackup' -Cloud GCP)   $true
+Assert-CV 'Azure: XRegionBackup NOT populated' (Test-CVFieldIsPopulated 'XRegionBackup' -Cloud Azure) $false
+# HasBackupPlan is now populated by BOTH clouds - Azure via DataProtection backup instances - so it no longer
+# demonstrates isolation. Asserted here because it is the field whose leak motivated the whole per-cloud split.
+Assert-CV 'GCP: HasBackupPlan populated'       (Test-CVFieldIsPopulated 'HasBackupPlan' -Cloud GCP)   $true
+Assert-CV 'Azure: HasBackupPlan now populated' (Test-CVFieldIsPopulated 'HasBackupPlan' -Cloud Azure) $true
 
 Write-Host "`n[1] Every control reads at least one field it could actually be given"
 $unwired = @()
@@ -265,7 +263,7 @@ function Get-CVBuilderFields {
 $enriched = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 [regex]::Matches($script:CVCloudText['Azure'], '-NotePropertyName\s+[''"]?([A-Za-z_][A-Za-z0-9_]*)') |
     ForEach-Object { [void]$enriched.Add($_.Groups[1].Value) }
-Assert-CV 'enriched set is Azure-scoped (excludes GCP HasBackupPlan)' ([bool]$enriched.Contains('HasBackupPlan')) $false
+Assert-CV 'enriched set is Azure-scoped (excludes GCP-only XRegionBackup)' ([bool]$enriched.Contains('XRegionBackup')) $false
 
 Assert-CV 'builder-field extraction works (vmObj has VMName)' ([bool](Get-CVBuilderFields 'vmObj').Contains('VMName')) $true
 Assert-CV 'builder-field extraction is scoped (vmObj lacks DiskName)' ([bool](Get-CVBuilderFields 'vmObj').Contains('DiskName')) $false
