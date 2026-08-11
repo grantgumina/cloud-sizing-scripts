@@ -1,61 +1,46 @@
-# Cyber Resilience Gap Report
+# Cloud Resilience Control Catalog
 
-Reference for the resilience posture assessment produced by the AWS, Azure and Google Cloud
-sizing scripts — how to read the report, how it is scored, and what every control checks.
+Reference for the native-protection signals the AWS, Azure and Google Cloud sizing scripts collect, and how they
+roll up into the raw `protection` data in the sizing output.
 
 See [README.md](README.md) for installation and how to run the scripts.
 
-Alongside the inventory, every run scores each discovered resource against the **Cloud Resilience Control Catalog** and writes `Output/<cloud>_<timestamp>/<cloud>_resilience_gaps_<timestamp>.csv` — one row per resource that has at least one gap, or that could not be fully assessed.
+Every run evaluates each discovered resource against this control catalog and records **raw protection data** —
+the customer's current native cloud configuration, as-is. It is not a Commvault plan state and says nothing about
+what Commvault would do; it describes what exists today. All scoring, gap-severity ranking, and interpretation are
+owned by the downstream **report generator**, so the sizing deliverables stay raw and stable.
 
-This measures the customer's **current native cloud configuration**, as-is. It is not a Commvault plan state and says nothing about what Commvault would do; it describes the exposure that exists today.
+## What the output carries
 
-## Reading the file
+Each resource carries the raw protection fields **that apply to its workload type** — flat columns on the
+inventory CSV/Excel rows and a nested `protection` object in `<cloud>_sizing_<timestamp>.json`:
 
-Each row is a resource. Each control is a column named `Gap_<id>`, and those columns are **three-valued**:
+| Field | Type | Derived from (control category) | Applies to |
+|---|---|---|---|
+| `backup_enabled` | bool / null | enrolled in a native backup/snapshot plan (RecoveryReady) | backup-capable types |
+| `backup_retention_days` | int / null | retention of that backup, when the API reports a day count | types with a retention concept (mostly DBs) |
+| `backup_immutable` | bool / null | recovery target is locked — vault immutability / object-lock / bucket-lock (Immutability) | types with a lock/vault control |
+| `pitr_enabled` | bool / null | point-in-time recovery available (RecoveryReady) | **DB types only** |
+| `public_access_blocked` | bool / null | resource is **not** publicly reachable (DataExposure) | **object storage / DBs only** |
+| `cross_region_backup` | bool / null | backups reach a second region, surviving a regional outage (Availability) | types with a cross-region control |
 
-| Value | Meaning |
-|---|---|
-| `True` | Gap — we checked, and the control is not satisfied |
-| `False` | Clean — we checked, and the control is satisfied |
-| *(blank)* | **Not assessed** — we could not evaluate it, or it does not apply to that resource type |
+A field is emitted **only for workload types where it applies** — i.e. where the type's control catalog (below)
+defines a control feeding it. Inapplicable fields are **omitted entirely**, not shown as `null` (a VM has no
+`pitr_enabled`, a database server has no `public_access_blocked` only when its catalog lacks that control). A type
+with no applicable fields (e.g. an unattached EBS volume) gets no `protection` object at all.
 
-Blank is never a pass. A control goes blank when the signal was not collected — a permission the caller lacks, a disabled API, or a service simply not requested via `-Types`. Treating "we could not look" as "no problem found" would overstate the customer's posture, so those cells stay empty and are excluded from scoring rather than counted as either result.
+For an applicable field the values are raw: `true` = the control was satisfied, `false` = checked and not
+satisfied, `null` = **measured nothing** (the API call could not be made / the signal was not collected). `null`
+is never a negative — treating "we could not look" as "not protected" would overstate exposure, so an unmeasured
+applicable signal stays `null`, not `false`. There is no score, severity, or overall label in the output; the
+report generator derives those from these raw fields plus the control catalog below.
 
-Key columns:
+The catalog below is the reference for how each field is derived and which severity the report generator should
+attach. Controls fall into four categories: **RecoveryReady** (can you restore at all), **Availability** (does a
+regional failure take the data with it), **Immutability** (can it be deleted or encrypted by an attacker), and
+**DataExposure** (is it readable by the wrong people). A fifth, **CleanRecovery** (recovery points scanned for
+threats), has no native cloud signal — it is a Commvault capability, not scored here.
 
-| Column | What it tells you |
-|---|---|
-| `Status` | `Gap` (at least one control failed) or `NotAssessed` (nothing could be evaluated) |
-| `SizeGB` / `SizeTB` | Data at risk. **Blank means unmeasured, not zero** — a resource we could not size is not a small resource |
-| `WorstSeverity` | Highest severity among the gaps found |
-| `GapCount`, `CriticalGaps`, `HighGaps`, `MediumGaps` | Gap counts, total and by severity |
-| `GapCategories`, `GapTitles` | Human-readable summary of what failed, for pasting into a report |
-| `AssessedControls` | Controls that produced a verdict (non-blank `Gap_*` cells) |
-| `UnassessedControls` | Controls with no verdict (blank cells) — effectively a to-do list of permissions/APIs needed for a complete picture |
-| `AssessmentComplete` | `False` whenever `UnassessedControls > 0` |
-| `ResourceId` | ARM ID (Azure), ARN (AWS), or self-link (GCP). Blank where the resource type does not expose one |
-
-`AssessedControls` and `UnassessedControls` exist so `GapCount` is not misread as a complete audit. "1 gap of 3 controls checked" and "1 gap, 2 controls we could not evaluate" are very different findings.
-
-Note the **column set follows the estate**: a run with no storage accounts has no `Gap_st-*` columns. The order is fixed by catalog order, but two runs over different scopes are not necessarily column-for-column comparable.
-
-## Severity and scoring
-
-Each control carries a severity:
-
-| Severity | Weight |
-|---|---|
-| Critical | 3 |
-| High | 2 |
-| Medium | 1 |
-
-**The report does not publish a score or a risk weight.** Scoring is owned by the backend so the model can be tuned without reissuing reports; a number baked into the CSV would compete with it and go stale the moment the model changed. The file carries the raw observations instead — the per-control `Gap_<id>` results and the severity counts — which is everything needed to recompute any weighting downstream.
-
-Rows are still *ordered* severity-first, then by data at risk, so the top of the file is a usable priority list. That ordering is derived at write time from the severity counts; it is a presentation choice, not a published judgment.
-
-The console run summary still prints an overall score and a per-category breakdown for the operator watching the run. The same caveat applies to any such number: it is a percentage of what was **assessed**. A resource where only one control could be evaluated, and it passed, scores 100 — which is why `AssessedControls` / `UnassessedControls` matter more than any single figure. Unknown and N/A outcomes are excluded from both numerator and denominator, never counted as failures.
-
-Controls fall into four categories: **RecoveryReady** (can you restore at all), **Availability** (does a regional failure take the data with it), **Immutability** (can it be deleted or encrypted by an attacker), and **DataExposure** (is it readable by the wrong people). A fifth category, **CleanRecovery** (are recovery points scanned for threats), has no native signal in any cloud — it is a Commvault capability, so it is reported as "requires Commvault" and never scored.
 
 ## The controls
 
@@ -66,7 +51,6 @@ Controls fall into four categories: **RecoveryReady** (can you restore at all), 
 | VM | `vm-backup` | High | RecoveryReady | Enrolled in a Recovery Services vault backup plan |
 | VM | `vm-xregion` | High | Availability | Backups replicated to a secondary region |
 | VM | `vm-immutable` | High | Immutability | Vault immutability enabled, so recovery points cannot be deleted |
-| Disk | `disk-schedule` | High | RecoveryReady | Automated snapshot/backup schedule configured |
 | Disk | `disk-cmek` | High | DataExposure | Encrypted with a customer-managed key |
 | Storage | `st-versioning` | High | Immutability | Blob versioning on — prior versions survive overwrite |
 | Storage | `st-softdelete` | High | Immutability | Blob soft delete on — deletions are recoverable |
@@ -157,20 +141,6 @@ Controls fall into four categories: **RecoveryReady** (can you restore at all), 
 | GKE | `gke-xregion` | High | Availability | Backups stored in a secondary region |
 | GKE | `gke-secretenc` | High | DataExposure | Secrets encrypted at rest with CMEK |
 
-Control definitions live in `src/common/CVSizing.Resilience.{Azure,AWS,GCP}.ps1`; the shared scoring engine is `src/common/CVSizing.Resilience.ps1`. Adding a control there automatically adds a `Gap_<id>` column to the report. Skip the whole pass with `-SkipResilienceReport`.
+Control definitions live in `src/common/CVSizing.Resilience.{Azure,AWS,GCP}.ps1`; the shared engine is `src/common/CVSizing.Resilience.ps1`, where `Get-CVProtectionData` maps these control outcomes to the six raw fields (see [What the output carries](#what-the-output-carries)): `Met → true`, `Gap → false`, `Unknown`/`NA` → `null`. Skip the whole pass with `-SkipResilienceReport`.
 
-## JSON protection summary
-
-The sizing JSON (`<cloud>_sizing_<timestamp>.json`, written by default — see the OutputFormat note in the README) carries a **headline** view of the same controls, so a downstream cloud posture report can read protection without parsing every `Gap_<id>`. Every resource in `workloads` gets a `protection` object using one shared vocabulary across all workload types and clouds — a status **word**, not a bare flag:
-
-| Field | Category | Values |
-|---|---|---|
-| `backup` | RecoveryReady | `Protected` / `Unprotected` / `NotAssessed` |
-| `retention_days` | RecoveryReady | integer, or `null` when unmeasured |
-| `immutability` | Immutability | `Immutable` / `NotImmutable` / `NotAssessed` |
-| `pitr` | RecoveryReady | `Enabled` / `NotEnabled` / `NotAssessed` |
-| `public_exposure` | DataExposure | `Public` / `NotPublic` / `NotAssessed` |
-| `cross_region` | Availability | `Protected` / `NotProtected` / `NotAssessed` |
-| `overall` | — | `Protected` / `PartiallyProtected` / `Unprotected` / `NotAssessed` |
-
-The mapping from control outcome to label is fixed: a satisfied control (Clean) → the positive word, a failed control (Gap) → the negative word, and Unknown / not-applicable → `NotAssessed`. As in the CSV, **`NotAssessed` is never a pass** — a signal that does not apply to a type, or that could not be evaluated, is never reported as a negative. `overall` is `Unprotected` when there is no native backup, `Protected` when backup is present and no assessed signal is negative, and `PartiallyProtected` otherwise. A top-level `protection_summary` rolls these up per workload type and overall (`coverage_pct` counts only resources whose backup was actually assessed). This catalog remains the single source of truth for the terminology.
+The `Severity` column above is not emitted anywhere in the output — it is documentation for the report generator, which owns all scoring and severity ranking.

@@ -167,12 +167,12 @@ Outputs
 Files are written to the working directory with timestamps:
 - `<AccountId>_summary_YYYY-MM-DD_HHMMSS.xlsx` — per-account Excel summary & detail sheets (EC2, S3, RDS, FSx, EFS, DynamoDB, Redshift, EKS, Aurora, ElastiCache, AWS Backup)
 - `comprehensive_all_aws_accounts_summary_YYYY-MM-DD_HHMMSS.xlsx` — consolidated workbook
-- `aws_sizing_script_output_YYYY-MM-DD_HHMMSS.log` — execution log
-- `aws_sizing_results_YYYY-MM-DD_HHMMSS.zip` — ZIP archive
-- `aws_sizing_YYYY-MM-DD_HHMMSS.json` *(default; omit with `-OutputFormat csv`)* — structured JSON with `metadata`, `summary`, `protection_summary`, and per-service `workloads` arrays; the feed for the cloud posture report
+- `aws_sizing_script_output_YYYY-MM-DD_HHMMSS.log` — execution log (also included inside the ZIP)
+- `aws_sizing_results_YYYY-MM-DD_HHMMSS.zip` — ZIP archive (CSVs, Excel workbooks, JSON, **and the run log**)
+- `aws_sizing_YYYY-MM-DD_HHMMSS.json` *(default; omit with `-OutputFormat csv`)* — structured JSON with `metadata`, `summary`, and per-service `workloads` arrays; the feed for the cloud posture report
 
 ### JSON protection fields
-Every resource in `workloads` carries a `protection` object with a consistent, catalog-aligned status vocabulary — `backup`, `retention_days`, `immutability`, `pitr`, `public_exposure`, `cross_region`, and an `overall` label (see [CYBER_RESILIENCE_REPORT.md](../CYBER_RESILIENCE_REPORT.md#json-protection-summary)). A top-level `protection_summary` rolls these up per service and overall, with `coverage_pct` counted over resources whose backup was actually assessed.
+Every resource in `workloads` carries a nested `protection` object with the **raw** fields that apply to its type, drawn from `backup_enabled`, `backup_retention_days`, `backup_immutable`, `pitr_enabled`, `public_access_blocked`, `cross_region_backup` — each `true` / `false` / `null` (`null` = measured nothing). Fields that don't apply to a type are omitted (e.g. EC2 has no `pitr_enabled`; S3 has no `backup_enabled`). The same fields appear as flat columns on the per-service CSV/Excel rows. No score, severity, or rollup is emitted; the report generator derives those. See [CYBER_RESILIENCE_REPORT.md](../CYBER_RESILIENCE_REPORT.md).
 
 ### FetchAllAccountCreds.ps1
 Automatically fetches temporary credentials for all SSO-accessible AWS accounts and runs the sizing script across all of them in one pass, producing a combined JSON output.
@@ -184,6 +184,8 @@ Automatically fetches temporary credentials for all SSO-accessible AWS accounts 
 Required IAM Permissions
 -------
 The executing user/role must have the following IAM permissions for the script to run successfully.
+
+If the role is missing a per-service permission (e.g. `elasticache:DescribeCacheClusters`), that service is **skipped with a warning that names the missing action** — not a run-ending error — so a least-privilege role that intentionally omits services you don't use still completes cleanly. Grant the action to have that service inventoried.
 
 ```json
 {

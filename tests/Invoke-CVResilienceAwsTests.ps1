@@ -69,8 +69,8 @@ Assert-CV 'efs-backup met'     (Outcome $C.EFS 'efs-backup' ([pscustomobject]@{ 
 Assert-CV 'efs-backup gap'     (Outcome $C.EFS 'efs-backup' ([pscustomobject]@{ BackupPolicyStatus='DISABLED' })) 'Gap'
 Assert-CV 'efs-backup unknown' (Outcome $C.EFS 'efs-backup' ([pscustomobject]@{ BackupPolicyStatus='Unknown' }))  'Unknown'
 
-# [7] used to assert that an empty AWS environment produced a null overall score. It went with the scoring
-# engine - an overall score is the backend's to compute, so there is no contract here to pin.
+Write-Host "`n[7] Empty AWS environment -> null score, no error"
+Assert-CV 'empty score helper -> null' ($null -eq (Get-CVControlScore -Results @())) $true
 
 Write-Host ("`n======  {0} passed, {1} failed  ======`n" -f $script:Pass, $script:Fail) `
            -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })

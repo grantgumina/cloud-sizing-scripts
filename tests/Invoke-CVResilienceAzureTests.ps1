@@ -71,9 +71,8 @@ Assert-CV 'null server -> null'               ($null -eq (Resolve-CVAzureFlexSer
 Assert-CV 'fx-cmek unreadable -> Unknown' (Outcome (Invoke-CVResilience -Resource ([pscustomobject]@{ CmkEncrypted=(Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ Name='srv1' })) }) -Controls $ctl.FlexDB) 'fx-cmek') 'Unknown'
 Assert-CV 'fx-cmek CMK -> Met'            (Outcome (Invoke-CVResilience -Resource ([pscustomobject]@{ CmkEncrypted=(Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ DataEncryptionType='AzureKeyVault' })) }) -Controls $ctl.FlexDB) 'fx-cmek') 'Met'
 
-Write-Host "`n[6] No Clean Recovery controls"
-# The empty-environment score assertion that used to live here went with the scoring engine: an overall score is
-# the backend's to compute, so this repo no longer has a contract to pin.
+Write-Host "`n[6] Empty environment + no Clean Recovery controls"
+Assert-CV 'empty score helper -> null' ($null -eq (Get-CVControlScore -Results @())) $true
 $cats = ($ctl.Values | ForEach-Object { $_ } | ForEach-Object { $_.Category }) | Sort-Object -Unique
 Assert-CV 'no CleanRecovery for Azure' ($cats -contains 'CleanRecovery') $false
 

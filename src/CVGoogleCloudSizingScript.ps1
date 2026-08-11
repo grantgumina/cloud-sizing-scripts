@@ -310,17 +310,20 @@ if ($SkipDataProtection) { $Selected = @{} }
 # Helpers
 # -------------------------
 function Get-GcpProjects {
-    try {
-    # Added --quiet to suppress any interactive prompt
-    $json = gcloud --quiet projects list --format=json | ConvertFrom-Json
-        if (-not $json) { throw "No projects returned by gcloud." }
-        return $json.projectId
-    } catch {
-        Write-CVLog "Failed to list GCP projects. Ensure the gcloud SDK is installed and authenticated." -Level Error -Source 'Auth' -Exception $_
-        Write-CVSummary -Title 'GCP Sizing Run Summary (aborted)'
-        Stop-Transcript | Out-Null
-        exit 1
-    }
+    # Routed through Invoke-CVGcloudJson so a denial is classified (naming resourcemanager.projects.list) rather
+    # than surfacing as a confusing generic error. Listing projects is required, so this still aborts - but with a
+    # clear, actionable message. Pass -Projects to name projects explicitly and skip this call entirely.
+    $r = Invoke-CVGcloudJson -Arguments @('projects', 'list')
+    if ($r.Ok -and $r.Data) { return $r.Data.projectId }
+
+    $why = if ($r.PermissionIssue) { "permission denied ({0})" -f ($r.DeniedPermission ? "missing '$($r.DeniedPermission)'" : "missing resourcemanager.projects.list") }
+           elseif ($r.ApiDisabled)  { 'the Cloud Resource Manager API is disabled' }
+           elseif (-not $r.Ok)      { "gcloud reported: $($r.Error)" }
+           else                     { 'gcloud returned no projects' }
+    Write-CVLog "Cannot list GCP projects - $why. Ensure gcloud is authenticated, or pass -Projects to name them explicitly." -Level Error -Source 'Auth'
+    Write-CVSummary -Title 'GCP Sizing Run Summary (aborted)'
+    Stop-Transcript | Out-Null
+    exit 1
 }
 
 function Get-RegionFromZone {
@@ -361,23 +364,27 @@ function Invoke-CVGcloudJson {
     $text = ($raw | Out-String).Trim()
 
     if ($code -ne 0) {
+        # gcloud reports a disabled API as PERMISSION_DENIED/SERVICE_DISABLED - that is NOT a real permission
+        # problem, so ApiDisabled is decided first and PermissionIssue is only a denial that is not a disabled API.
+        $apiDisabled = [bool]($text -match 'SERVICE_DISABLED|has not been used in project|API .*not enabled|is disabled')
         return [pscustomobject]@{
-            Ok             = $false
-            Data           = $null
-            Error          = $text
-            # gcloud reports a disabled API as PERMISSION_DENIED/SERVICE_DISABLED - not a real permission problem.
-            ApiDisabled    = [bool]($text -match 'SERVICE_DISABLED|has not been used in project|API .*not enabled|is disabled')
-            CommandMissing = [bool]($text -match 'Invalid choice')
+            Ok               = $false
+            Data             = $null
+            Error            = $text
+            ApiDisabled      = $apiDisabled
+            CommandMissing   = [bool]($text -match 'Invalid choice')
+            PermissionIssue  = (-not $apiDisabled) -and (Test-CVPermissionError $text)
+            DeniedPermission = if (-not $apiDisabled) { Get-CVDeniedAction $text } else { $null }
         }
     }
     $data = $null
     if (-not [string]::IsNullOrWhiteSpace($text)) {
         try { $data = $text | ConvertFrom-Json }
         catch {
-            return [pscustomobject]@{ Ok=$false; Data=$null; Error="JSON parse failed: $($_.Exception.Message)"; ApiDisabled=$false; CommandMissing=$false }
+            return [pscustomobject]@{ Ok=$false; Data=$null; Error="JSON parse failed: $($_.Exception.Message)"; ApiDisabled=$false; CommandMissing=$false; PermissionIssue=$false; DeniedPermission=$null }
         }
     }
-    return [pscustomobject]@{ Ok=$true; Data=$data; Error=''; ApiDisabled=$false; CommandMissing=$false }
+    return [pscustomobject]@{ Ok=$true; Data=$data; Error=''; ApiDisabled=$false; CommandMissing=$false; PermissionIssue=$false; DeniedPermission=$null }
 }
 
 function Invoke-CVGcloudJsonAnyTrack {
@@ -2716,8 +2723,9 @@ function Get-GcpSnapshotInventory {
             # just lose a row - it downgrades every disk in the project to "no snapshots" in the resilience score.
             $res = Invoke-CVGcloudJson -Arguments @('compute','snapshots','list','--project',$proj)
             if (-not $res.Ok) {
-                Write-CVLog ("Snapshot listing failed - disks in this project will score snapshot coverage as Unknown: {0}" -f (($res.Error -split "`r?`n")[0])) `
-                            -Level Warning -Source 'Snapshot' -Scope @{ Project = $proj; Category = $(if ($res.ApiDisabled) { 'ApiDisabled' } else { 'LookupFailed' }) }
+                $why = if ($res.PermissionIssue) { "permission denied$($res.DeniedPermission ? " (missing '$($res.DeniedPermission)')" : '')" } elseif ($res.ApiDisabled) { 'API disabled' } else { ($res.Error -split "`r?`n")[0] }
+                Write-CVLog ("Snapshot listing failed - disks in this project will score snapshot coverage as Unknown: {0}" -f $why) `
+                            -Level Warning -Source 'Snapshot' -Scope @{ Project = $proj }
                 $script:SnapshotLookupFailed[$proj] = $true
                 continue
             }
@@ -2756,14 +2764,14 @@ if ($Selected.SNAPSHOT) {
 }
 
 # ============================================================
-# CYBER RESILIENCE POSTURE REPORT  (skip with -SkipResilienceReport)
-# Scores each resource's CURRENT NATIVE GCP configuration against the Cloud Resilience Control Catalog.
-# Runs BEFORE the CSV exports so control columns land on every per-service CSV. Any signal we cannot collect
-# (or a failed full-reach call) scores as Unknown and is excluded from the score - it never fails the run.
+# PROTECTION DATA (GCP)  (skip with -SkipResilienceReport)
+# Attaches the six raw protection fields to each resource's inventory row. Runs BEFORE the CSV/JSON exports
+# so the columns land on every per-service CSV and flow into the JSON. Any signal we cannot collect stays
+# null (never a fabricated negative); scoring/severity is owned by the downstream report generator.
 # ============================================================
 if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
   try {
-    Write-CVSection 'Cyber Resilience Posture'
+    Write-CVSection 'Protection Data'
     $gcpControls  = Get-CVGcpResilienceControls
 
     # Snapshot-derived signals (presence + cross-region) per source disk, from data already collected.
@@ -2802,20 +2810,25 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         Add-Member -InputObject $v -NotePropertyName XRegionBackup -NotePropertyValue $xr -Force
     }
 
-    # Full-reach enrichment (defensive: any failure leaves the field absent -> Unknown).
+    # Full-reach enrichment (defensive: any failure leaves the field absent -> Unknown). Routed through
+    # Invoke-CVGcloudJson so a 403 is classified: on permission denial the resilience signals stay Unknown AND
+    # a Permission warning is emitted (deduped per project) instead of the failure being silently swallowed.
+    $bucketDescribePermWarned = [System.Collections.Generic.HashSet[string]]::new()
     foreach ($b in @($invResults.StorageBuckets)) {
         if (-not $b -or -not $b.StorageBucket) { continue }
-        try {
-            $j = (& gcloud storage buckets describe "gs://$($b.StorageBucket)" --project $b.Project --format=json 2>$null) | ConvertFrom-Json
-            if ($j) {
-                Add-Member -InputObject $b -NotePropertyName Versioning          -NotePropertyValue ([bool]$j.versioning.enabled) -Force
-                Add-Member -InputObject $b -NotePropertyName PublicAccessBlocked -NotePropertyValue ("$($j.iamConfiguration.publicAccessPrevention)" -eq 'enforced') -Force
-                Add-Member -InputObject $b -NotePropertyName CmkEncrypted        -NotePropertyValue ([bool]$j.encryption.defaultKmsKeyName) -Force
-                Add-Member -InputObject $b -NotePropertyName RetentionLocked     -NotePropertyValue ([bool]$j.retentionPolicy.isLocked) -Force
-                Add-Member -InputObject $b -NotePropertyName SoftDeleteEnabled   -NotePropertyValue ([bool]([int]"$($j.softDeletePolicy.retentionDurationSeconds)" -gt 0)) -Force
-                Add-Member -InputObject $b -NotePropertyName MultiRegion         -NotePropertyValue ("$($j.locationType)" -in 'multi-region','dual-region') -Force
-            }
-        } catch {}
+        $r = Invoke-CVGcloudJson -Arguments @('storage','buckets','describe',"gs://$($b.StorageBucket)",'--project',$b.Project)
+        if ($r.Ok -and $r.Data) {
+            $j = $r.Data
+            Add-Member -InputObject $b -NotePropertyName Versioning          -NotePropertyValue ([bool]$j.versioning.enabled) -Force
+            Add-Member -InputObject $b -NotePropertyName PublicAccessBlocked -NotePropertyValue ("$($j.iamConfiguration.publicAccessPrevention)" -eq 'enforced') -Force
+            Add-Member -InputObject $b -NotePropertyName CmkEncrypted        -NotePropertyValue ([bool]$j.encryption.defaultKmsKeyName) -Force
+            Add-Member -InputObject $b -NotePropertyName RetentionLocked     -NotePropertyValue ([bool]$j.retentionPolicy.isLocked) -Force
+            Add-Member -InputObject $b -NotePropertyName SoftDeleteEnabled   -NotePropertyValue ([bool]([int]"$($j.softDeletePolicy.retentionDurationSeconds)" -gt 0)) -Force
+            Add-Member -InputObject $b -NotePropertyName MultiRegion         -NotePropertyValue ("$($j.locationType)" -in 'multi-region','dual-region') -Force
+        } elseif ($r.PermissionIssue -and $bucketDescribePermWarned.Add($b.Project)) {
+            Write-CVLog ("Storage bucket resilience details unreadable - permission denied ({0}). Versioning/public-access/CMEK/lock reported as Unknown." -f ($r.DeniedPermission ? "missing '$($r.DeniedPermission)'" : 'missing storage.buckets.get')) `
+                -Level Warning -Source 'Storage' -Scope @{ Project = $b.Project }
+        }
     }
     # Filestore backups. A project whose lookup FAILED must stay Unknown ($null) rather than $false - otherwise a
     # disabled Filestore API is scored as "no backups configured", which is a fabricated gap.
@@ -2825,8 +2838,9 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         $r = Invoke-CVGcloudJson -Arguments @('filestore','backups','list','--project',$p)
         if ($r.Ok) { $fsLookupOk[$p] = $true; $fsBackups[$p] = @($r.Data) }
         else {
-            Write-CVLog ("Filestore backup lookup unavailable ({0}) - HasBackup will read Unknown" -f $(if ($r.ApiDisabled) { 'API disabled' } else { 'lookup failed' })) `
-                        -Level Warning -Source 'Filestore' -Scope @{ Project = $p; Category = $(if ($r.ApiDisabled) { 'ApiDisabled' } else { 'LookupFailed' }) }
+            $why = if ($r.PermissionIssue) { "permission denied$($r.DeniedPermission ? " (missing '$($r.DeniedPermission)')" : '')" } elseif ($r.ApiDisabled) { 'API disabled' } else { 'lookup failed' }
+            Write-CVLog ("Filestore backup lookup unavailable ({0}) - HasBackup will read Unknown" -f $why) `
+                        -Level Warning -Source 'Filestore' -Scope @{ Project = $p }
         }
     }
     foreach ($f in @($invResults.FilestoreInstances)) {
@@ -2863,7 +2877,7 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         Add-Member -InputObject $g -NotePropertyName HasBackupPlan -NotePropertyValue $hasPlan -Force
     }
 
-    # Evaluate each resource type; append Ctl_*/ResilienceScore/ResilienceGaps columns onto the inventory rows.
+    # Attach the six raw protection fields to each resource's inventory row (signals collected above).
     $collections = @(
         @{ Type='Database';  Set=$gcpControls.Database;  Rows=@($invResults.Databases) }
         @{ Type='VM';        Set=$gcpControls.VM;        Rows=@($invResults.VMs) }
@@ -2872,52 +2886,27 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         @{ Type='Filestore'; Set=$gcpControls.Filestore; Rows=@($invResults.FilestoreInstances) }
         @{ Type='GKE';       Set=$gcpControls.GKE;       Rows=@($invResults.GKEClusters) }
     )
-    # Name and size are the only genuinely per-type fields; resource group/region/id are probed by New-CVSignalRow.
-    $gcpSignalFields = @{
-        Database  = @{ Name = 'InstanceName';  SizeGB = 'StorageGB' }
-        VM        = @{ Name = 'VMName';        SizeGB = 'VMDiskSizeGB' }
-        Disk      = @{ Name = 'DiskName';      SizeGB = 'SizeGB' }
-        Storage   = @{ Name = 'StorageBucket'; SizeGB = 'UsedCapacityGB' }
-        Filestore = @{ Name = 'ShareName';     SizeGB = 'CapacityGB'; Parent = 'InstanceName' }
-        GKE       = @{ Name = 'ClusterName';   SizeGB = 'PersistentVolumeCapacityGB' }
-    }
-    $gcpSignalMap = Get-CVSignalFieldMap -ControlSets $gcpControls
-    $signalRows   = New-Object System.Collections.Generic.List[psobject]
     $resilShownErr = $false
+    $rowCount = 0
     foreach ($c in $collections) {
         if (-not $c.Set) { continue }
         foreach ($row in $c.Rows) {
             if (-not $row) { continue }
-            # Isolate per-row failures so one problematic resource can't sink the whole report.
             try {
-                # No evaluation: controls declare WHICH fields are signals; thresholds belong to the backend.
-                # Ctl_*/ResilienceScore are no longer written onto the inventory rows either.
-                $signalRows.Add((New-CVSignalRow -Resource $row -ResourceType $c.Type `
-                                    -SignalFields $gcpSignalMap[$c.Type] -FieldMap $gcpSignalFields[$c.Type]))
+                $pd = Get-CVProtectionData -Resource $row -Cloud 'gcp' -ResourceType $c.Type -ControlSet $c.Set
+                foreach ($kv in $pd.GetEnumerator()) {
+                    Add-Member -InputObject $row -NotePropertyName $kv.Key -NotePropertyValue $kv.Value -Force
+                }
+                $rowCount++
             } catch {
                 if (-not $resilShownErr) {
                     $resilShownErr = $true
-                    Write-Host ("[Resilience] signal export error on a $($c.Type) row: $($_.Exception.GetType().Name): $($_.Exception.Message)") -ForegroundColor DarkYellow
+                    Write-Host ("[Protection] eval error on a $($c.Type) row: $($_.Exception.GetType().Name): $($_.Exception.Message) :: " + ($_.ScriptStackTrace -replace "`r?`n", ' <- ')) -ForegroundColor DarkYellow
                 }
             }
         }
     }
-
-    # No score is printed - a score is a judgement, and the export is deliberately judgement-free.
-
-    # One file: every resource with a gap or an incomplete assessment, ranked. The static control catalog and the
-    # per-category rollup are no longer written - neither told you WHICH resources to go look at.
-    if ($signalRows.Count) {
-        Sort-CVSignalRows -Rows $signalRows |
-            Export-CVCsv -Path (Join-Path $outDir ("gcp_resilience_signals_" + $dateStr + ".csv")) `
-                         -PreferredOrder (Get-CVSignalColumns -ControlSets $gcpControls) -KeepDeclaredColumns
-        Write-CVLog ("Resilience signals: {0} resource(s) exported across {1} resource type(s)." -f `
-                     $signalRows.Count, @($signalRows | Select-Object -ExpandProperty ResourceType -Unique).Count) `
-                    -Level Info -Source 'Resilience'
-        Write-Host "gcp_resilience_signals_$dateStr.csv written to $outDir" -ForegroundColor Cyan
-    } else {
-        Write-CVLog "No resources of an assessed type were found - no signals CSV written." -Level Info -Source 'Resilience'
-    }
+    Write-CVLog ("Protection data computed for {0} resource(s)." -f $rowCount) -Level Info -Source 'Resilience'
   } catch {
     Write-CVLog "Resilience report failed: $($_.Exception.Message)" -Level Warning -Source 'Resilience'
     # Surface the exact location (console-only mode has no structured log file; this reaches the transcript).
@@ -3774,35 +3763,38 @@ $summaryRows | Export-Csv -Path $summaryCsv -NoTypeInformation
 Write-Host "Inventory summary exported: $(Split-Path $summaryCsv -Leaf)" -ForegroundColor Green
 
 # ============================================================
-# JSON EXPORT (when OutputFormat is json or both)
+# STRUCTURED OUTPUT - JSON (default) + Excel workbook (always produced when there is inventory)
 # ============================================================
+Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing structured output..." -PercentComplete 72
+
+# workloadKey -> summary bucket (Type), resilience control set (PostureType), and GB field. Source the
+# real, resilience-mutated collections in $invResults; snapshots have no control set (posture -> NotAssessed).
+$gcpDisks = @(@($invResults.AttachedDisks) + @($invResults.UnattachedDisks) | Where-Object { $_ })
+$workloads = [ordered]@{}
+$gcpVMs = @($invResults.VMs | Where-Object { $_ })
+if ($gcpVMs.Count)   { $workloads["gcp_vms"]       = @{ Items = $gcpVMs;                        Type = 'VM';        PostureType = 'VM';        SizeField = 'VMDiskSizeGB' } }
+if ($gcpDisks.Count) { $workloads["gcp_disks"]     = @{ Items = $gcpDisks;                      Type = 'Disk';      PostureType = 'Disk';      SizeField = 'SizeGB' } }
+$gcpBuckets = @($invResults.StorageBuckets | Where-Object { $_ })
+if ($gcpBuckets.Count) { $workloads["gcp_storage"] = @{ Items = $gcpBuckets;                    Type = 'Storage';   PostureType = 'Storage';   SizeField = 'UsedCapacityGB' } }
+$gcpFs = @($invResults.FilestoreInstances | Where-Object { $_ })
+if ($gcpFs.Count)    { $workloads["gcp_filestore"] = @{ Items = $gcpFs;                          Type = 'Filestore'; PostureType = 'Filestore'; SizeField = 'CapacityGB' } }
+$gcpDbs = @($invResults.Databases | Where-Object { $_ })
+if ($gcpDbs.Count)   { $workloads["gcp_databases"] = @{ Items = $gcpDbs;                         Type = 'Database';  PostureType = 'Database';  SizeField = 'StorageGB' } }
+$gcpGke = @($invResults.GKEClusters | Where-Object { $_ })
+if ($gcpGke.Count)   { $workloads["gcp_gke"]       = @{ Items = $gcpGke;                         Type = 'GKE';       PostureType = 'GKE';       SizeField = 'PersistentVolumeCapacityGB' } }
+$gcpSnaps = @($invResults.DiskSnapshots | Where-Object { $_ })
+if ($gcpSnaps.Count) { $workloads["gcp_snapshots"] = @{ Items = $gcpSnaps;                       Type = 'Snapshot';  PostureType = $null;       SizeField = 'StorageGB' } }
+
 if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing JSON output..." -PercentComplete 72
-
-    # workloadKey -> summary bucket (Type), resilience control set (PostureType), and GB field. Source the
-    # real, resilience-mutated collections in $invResults; snapshots have no control set (posture -> NotAssessed).
-    $gcpDisks = @(@($invResults.AttachedDisks) + @($invResults.UnattachedDisks) | Where-Object { $_ })
-    $workloads = [ordered]@{}
-    $gcpVMs = @($invResults.VMs | Where-Object { $_ })
-    if ($gcpVMs.Count)   { $workloads["gcp_vms"]       = @{ Items = $gcpVMs;                        Type = 'VM';        PostureType = 'VM';        SizeField = 'VMDiskSizeGB' } }
-    if ($gcpDisks.Count) { $workloads["gcp_disks"]     = @{ Items = $gcpDisks;                      Type = 'Disk';      PostureType = 'Disk';      SizeField = 'SizeGB' } }
-    $gcpBuckets = @($invResults.StorageBuckets | Where-Object { $_ })
-    if ($gcpBuckets.Count) { $workloads["gcp_storage"] = @{ Items = $gcpBuckets;                    Type = 'Storage';   PostureType = 'Storage';   SizeField = 'UsedCapacityGB' } }
-    $gcpFs = @($invResults.FilestoreInstances | Where-Object { $_ })
-    if ($gcpFs.Count)    { $workloads["gcp_filestore"] = @{ Items = $gcpFs;                          Type = 'Filestore'; PostureType = 'Filestore'; SizeField = 'CapacityGB' } }
-    $gcpDbs = @($invResults.Databases | Where-Object { $_ })
-    if ($gcpDbs.Count)   { $workloads["gcp_databases"] = @{ Items = $gcpDbs;                         Type = 'Database';  PostureType = 'Database';  SizeField = 'StorageGB' } }
-    $gcpGke = @($invResults.GKEClusters | Where-Object { $_ })
-    if ($gcpGke.Count)   { $workloads["gcp_gke"]       = @{ Items = $gcpGke;                         Type = 'GKE';       PostureType = 'GKE';       SizeField = 'PersistentVolumeCapacityGB' } }
-    $gcpSnaps = @($invResults.DiskSnapshots | Where-Object { $_ })
-    if ($gcpSnaps.Count) { $workloads["gcp_snapshots"] = @{ Items = $gcpSnaps;                       Type = 'Snapshot';  PostureType = $null;       SizeField = 'StorageGB' } }
-
     $jsonPath = Export-CVSizingJson -Cloud 'gcp' -OutputDir $outDir -TimeStamp $dateStr `
         -Metadata ([ordered]@{ projects = @($activeProjects); script_version = "2.0" }) `
-        -Workloads $workloads `
-        -Controls (Get-CVGcpResilienceControls)
+        -Workloads $workloads
     Write-Host "gcp_sizing_$dateStr.json written to $outDir" -ForegroundColor Cyan
 }
+
+# Excel workbook (Summary + one sheet per service) - always produced so the customer bundle has a spreadsheet.
+$xlsxPath = Export-CVExcelWorkbook -Path (Join-Path $outDir "gcp_sizing_$dateStr.xlsx") -Workloads $workloads
+if ($xlsxPath) { Write-Host "gcp_sizing_$dateStr.xlsx written to $outDir" -ForegroundColor Cyan }
 
 # -------------------------
 # Finalize log, then ZIP

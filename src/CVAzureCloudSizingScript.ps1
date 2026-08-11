@@ -255,6 +255,7 @@ $cvRequired  = @(
     'CVSizing.Metrics.Azure.ps1'      # Azure Monitor metric wrapper
     'CVSizing.CloudRewind.ps1'        # provider-neutral Cloud Rewind engine
     'CVSizing.CloudRewind.Azure.ps1'  # Azure billable taxonomy + inclusion rules
+    'CVSizing.Kubectl.ps1'            # cross-platform kubectl provisioning (Install-CVKubectl, used by AKS)
 )
 $cvMissing = @($cvRequired | Where-Object { -not (Test-Path -LiteralPath (Join-Path $cvCommonDir $_) -PathType Leaf) })
 if ($cvMissing.Count) {
@@ -671,7 +672,7 @@ $ResourceTypeModules = @{
     COSMOS         = @('Az.Accounts', 'Az.CosmosDB', 'Az.Monitor')
     AKS            = @('Az.Accounts', 'Az.Aks', 'Az.Resources')
     BACKUP         = @('Az.Accounts', 'Az.RecoveryServices')
-    UNMANAGEDISKS  = @('Az.Accounts', 'Az.Compute')
+    UNMANAGEDDISKS = @('Az.Accounts', 'Az.Compute')
     AVS            = @('Az.Accounts', 'Az.VMware')
 }
 
@@ -699,9 +700,23 @@ if (-not $SkipCloudRewind) {
     }
 }
   
-# Subscription discovery  
-$allSubs = Get-AzSubscription  
-if ($allSubs -isnot [array]) { $allSubs = @($allSubs) }  
+# Subscription discovery. Unhandled, this was the one call that could abort the whole run with a raw stack -
+# a permission/auth failure here now produces a clear, classified message and a graceful exit.
+try {
+    $allSubs = Get-AzSubscription -ErrorAction Stop
+} catch {
+    if (Test-CVPermissionError $_) {
+        $act = Get-CVDeniedAction "$($_.Exception.Message)"
+        Write-CVLog ("Cannot list Azure subscriptions - permission denied ({0}). Grant Reader on the target subscriptions, or pass -Subscriptions to name them explicitly." -f ($act ? "missing '$act'" : 'Microsoft.Resources/subscriptions/read')) `
+            -Level Error -Source 'Auth' -Exception $_
+    } else {
+        Write-CVLog "Cannot list Azure subscriptions - $($_.Exception.Message). Run Connect-AzAccount, or pass -Subscriptions." -Level Error -Source 'Auth' -Exception $_
+    }
+    Write-CVSummary -Title 'Azure Sizing Run Summary (aborted)'
+    try { Stop-Transcript | Out-Null } catch { }
+    exit 1
+}
+if ($allSubs -isnot [array]) { $allSubs = @($allSubs) }
 
 # Filter subscriptions if specified
 if ($Subscriptions) {
@@ -794,7 +809,14 @@ foreach ($sub in $subs) {
         Set-AzContext -SubscriptionId $sub.Id -ErrorAction Stop | Out-Null
     } catch {
         foreach ($sig in @('BACKUP','SNAPSHOT')) { Set-CVCollectionStatus -Scope $sub.Name -Signal $sig -Status Failed }
-        Write-CVLog "Could not select subscription - skipping it: $($_.Exception.Message)" -Level Error -Source 'Auth' -Scope @{ Subscription = $sub.Name; Category = 'ContextFailed' }
+        # Skipping one subscription is not a run failure - a Warning (not red Error). A denial is classified.
+        if (Test-CVPermissionError $_) {
+            $act = Get-CVDeniedAction "$($_.Exception.Message)"
+            Write-CVLog ("Skipping subscription - permission denied{0}. Grant Reader on it to include it." -f ($act ? " (missing '$act')" : '')) `
+                -Level Warning -Source 'Auth' -Scope @{ Subscription = $sub.Name } -Exception $_
+        } else {
+            Write-CVLog "Could not select subscription - skipping it: $($_.Exception.Message)" -Level Warning -Source 'Auth' -Scope @{ Subscription = $sub.Name }
+        }
         continue
     }
 
@@ -1436,6 +1458,20 @@ foreach ($sub in $subs) {
                         continue
                     }
 
+                    # db-cmek reads CmkEncrypted, which nothing populated - so the TDE control was blank on every
+                    # SQL row. The TDE protector is a SERVER-level setting (Type: AzureKeyVault | ServiceManaged),
+                    # so it is fetched once here and applied to each of that server's databases below, rather than
+                    # once per database. A failure leaves it $null (Unknown), never $false.
+                    $sqlTdeCmk = $null
+                    try {
+                        $tde = Get-AzSqlServerTransparentDataEncryptionProtector -ResourceGroupName $sqlServer.ResourceGroupName -ServerName $sqlServer.ServerName -ErrorAction Stop
+                        if ($tde -and -not [string]::IsNullOrWhiteSpace("$($tde.Type)")) {
+                            $sqlTdeCmk = [bool]("$($tde.Type)" -match 'KeyVault')
+                        }
+                    } catch {
+                        Write-CVLog "Could not read TDE protector: $($_.Exception.Message)" -Level Warning -Source 'SQL' -Scope @{ Subscription = $sub.Name; Server = $sqlServer.ServerName }
+                    }
+
                     foreach ($sqlDB in $sqlDBs) {
                         # Skip system DBs
                         if ($sqlDB.SkuName -eq 'System') { continue }
@@ -1461,6 +1497,7 @@ foreach ($sub in $subs) {
                         $sqlObj.Add("Region", $sqlDB.Location)
                         $sqlObj.Add("DatabaseId", $sqlDB.DatabaseId)
                         $sqlObj.Add("Status", $sqlDB.Status)
+                        $sqlObj.Add("CmkEncrypted", $sqlTdeCmk)   # server-level TDE protector, resolved above
 
                         # Get allocated and used storage metrics (Maximum over last 24h)
                         $allocatedVal = $null
@@ -1520,13 +1557,21 @@ foreach ($sub in $subs) {
                         $sqlObj.Add("SizingGB", $sizingGB)
                         $sqlObj.Add("SizeBasis", $sizeBasis)
 
-                        # STR / LTR policies (best-effort; master & some instance types may not support)
+                        # STR / LTR policies (best-effort; master & some instance types may not support). -Stop so a
+                        # denial is catchable: on permission the value stays Unknown ($null) AND is announced, instead
+                        # of a silent null that hides a missing read permission behind "retention unknown".
                         try {
-                            $ltr = Get-AzSqlDatabaseBackupLongTermRetentionPolicy -ServerName $sqlDB.ServerName -DatabaseName $sqlDB.DatabaseName -ResourceGroupName $sqlDB.ResourceGroupName -ErrorAction SilentlyContinue
-                        } catch { $ltr = $null }
+                            $ltr = Get-AzSqlDatabaseBackupLongTermRetentionPolicy -ServerName $sqlDB.ServerName -DatabaseName $sqlDB.DatabaseName -ResourceGroupName $sqlDB.ResourceGroupName -ErrorAction Stop
+                        } catch {
+                            $ltr = $null
+                            if (Test-CVPermissionError $_) { Write-CVLog "SQL long-term retention unreadable - permission denied (Microsoft.Sql/.../backupLongTermRetentionPolicies/read); retention reported as Unknown." -Level Warning -Source 'SQL' -Scope @{ Subscription = $sub.Name; Database = $sqlDB.DatabaseName } -Exception $_ }
+                        }
                         try {
-                            $str = Get-AzSqlDatabaseBackupShortTermRetentionPolicy -ServerName $sqlDB.ServerName -DatabaseName $sqlDB.DatabaseName -ResourceGroupName $sqlDB.ResourceGroupName -ErrorAction SilentlyContinue
-                        } catch { $str = $null }
+                            $str = Get-AzSqlDatabaseBackupShortTermRetentionPolicy -ServerName $sqlDB.ServerName -DatabaseName $sqlDB.DatabaseName -ResourceGroupName $sqlDB.ResourceGroupName -ErrorAction Stop
+                        } catch {
+                            $str = $null
+                            if (Test-CVPermissionError $_) { Write-CVLog "SQL PITR (short-term retention) unreadable - permission denied; PITR reported as Unknown." -Level Warning -Source 'SQL' -Scope @{ Subscription = $sub.Name; Database = $sqlDB.DatabaseName } -Exception $_ }
+                        }
                         $sqlObj.Add("LTRWeeklyRetention", ($ltr.WeeklyRetention -as [string]))
                         $sqlObj.Add("LTRMonthlyRetention", ($ltr.MonthlyRetention -as [string]))
                         $sqlObj.Add("PITR_Days", ($str.RetentionDays -as [string]))
@@ -1552,8 +1597,8 @@ foreach ($sub in $subs) {
                 $mysqlFlexibleServers = Get-AzMySqlFlexibleServer -ErrorAction SilentlyContinue
                 if ($mysqlFlexibleServers) {
                     $allMySQLServers += $mysqlFlexibleServers | ForEach-Object {
-                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Flexible" -PassThru |
-                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -PassThru
+                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Flexible" -Force -PassThru |
+                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -Force -PassThru
                     }
                 }
                 
@@ -1563,8 +1608,8 @@ foreach ($sub in $subs) {
                 $mysqlSingleServers = if (Get-Command Get-AzMySqlServer -ErrorAction SilentlyContinue) { Get-AzMySqlServer -ErrorAction SilentlyContinue } else { $null }
                 if ($mysqlSingleServers) {
                     $allMySQLServers += $mysqlSingleServers | ForEach-Object {
-                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Single" -PassThru |
-                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -PassThru
+                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Single" -Force -PassThru |
+                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -Force -PassThru
                     }
                 }
             } catch {
@@ -1595,6 +1640,13 @@ foreach ($sub in $subs) {
                                 "Version" = $mysqlServer.Version
                                 "FullyQualifiedDomainName" = $mysqlServer.FullyQualifiedDomainName
                                 "BackupRetentionDays" = $mysqlServer.BackupRetentionDays
+                                # Needed by the fx-xregion control, which previously read a field nothing set.
+                                # Property naming varies by Az module version, same as BackupRetentionDay(s) below.
+                                "GeoRedundantBackup" = $(
+                                    if ($mysqlServer.BackupGeoRedundantBackup)      { $mysqlServer.BackupGeoRedundantBackup }
+                                    elseif ($mysqlServer.Backup.GeoRedundantBackup) { $mysqlServer.Backup.GeoRedundantBackup }
+                                    elseif ($mysqlServer.GeoRedundantBackup)        { $mysqlServer.GeoRedundantBackup }
+                                    else { $null })
                                 "StorageSku" = $mysqlServer.StorageSku
                                 "SkuName" = $mysqlServer.SkuName
                             }
@@ -1677,6 +1729,10 @@ foreach ($sub in $subs) {
                             }
 
                             
+                            # fx-cmek reads this. Probed, not assumed - see Resolve-CVAzureFlexServerCmk for why
+                            # $null (not $false) is correct when the module build exposes no encryption property.
+                            $mysqlObj.Add("CmkEncrypted", (Resolve-CVAzureFlexServerCmk -Server $mysqlServer))
+
                             $MySQLServers += New-Object -TypeName PSObject -Property $mysqlObj
                             Write-Verbose "Added MySQL server $($mysqlServer.Name)"
                         } catch {
@@ -1713,8 +1769,8 @@ foreach ($sub in $subs) {
                 $postgresFlexibleServers = Get-AzPostgreSqlFlexibleServer -ErrorAction SilentlyContinue
                 if ($postgresFlexibleServers) {
                     $allPostgreSQLServers += $postgresFlexibleServers | ForEach-Object {
-                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Flexible" -PassThru |
-                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -PassThru
+                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Flexible" -Force -PassThru |
+                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -Force -PassThru
                     }
                 }
                 
@@ -1724,8 +1780,8 @@ foreach ($sub in $subs) {
                 $postgresSingleServers = if (Get-Command Get-AzPostgreSqlServer -ErrorAction SilentlyContinue) { Get-AzPostgreSqlServer -ErrorAction SilentlyContinue } else { $null }
                 if ($postgresSingleServers) {
                     $allPostgreSQLServers += $postgresSingleServers | ForEach-Object {
-                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Single" -PassThru |
-                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -PassThru
+                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Single" -Force -PassThru |
+                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -Force -PassThru
                     }
                 }
             } catch {
@@ -1756,6 +1812,13 @@ foreach ($sub in $subs) {
                                 "Version" = $postgresServer.Version
                                 "FullyQualifiedDomainName" = $postgresServer.FullyQualifiedDomainName
                                 "BackupRetentionDays" = if ($postgresServer.BackupRetentionDays) { $postgresServer.BackupRetentionDays } elseif ($postgresServer.BackupRetentionDay) { $postgresServer.BackupRetentionDay } elseif ($postgresServer.StorageProfileBackupRetentionDay) { $postgresServer.StorageProfileBackupRetentionDay } else { $null }
+                                # Needed by the fx-xregion control, which previously read a field nothing set.
+                                # Property naming varies by Az module version, same as BackupRetentionDay(s) above.
+                                "GeoRedundantBackup" = $(
+                                    if ($postgresServer.BackupGeoRedundantBackup)      { $postgresServer.BackupGeoRedundantBackup }
+                                    elseif ($postgresServer.Backup.GeoRedundantBackup) { $postgresServer.Backup.GeoRedundantBackup }
+                                    elseif ($postgresServer.GeoRedundantBackup)        { $postgresServer.GeoRedundantBackup }
+                                    else { $null })
                                 "SkuName" = $postgresServer.SkuName
                             }
                             
@@ -1812,6 +1875,10 @@ foreach ($sub in $subs) {
                                 $postgresObj.Add("StoragePercent", $null)
                             }
                             
+                            # fx-cmek reads this. Probed, not assumed - see Resolve-CVAzureFlexServerCmk for why
+                            # $null (not $false) is correct when the module build exposes no encryption property.
+                            $postgresObj.Add("CmkEncrypted", (Resolve-CVAzureFlexServerCmk -Server $postgresServer))
+
                             $PostgreSQLServers += New-Object -TypeName PSObject -Property $postgresObj
                             Write-Verbose "Added PostgreSQL server $($postgresServer.Name)"
                         } catch {
@@ -1844,7 +1911,21 @@ foreach ($sub in $subs) {
             # Get all resource groups in the subscription.
             # NOTE: must NOT be named $resourceGroups - see the NetApp block above; that name aliases the
             # script's -ResourceGroups parameter and would silently scope the whole run to these objects.
-            $subRgList = Get-AzResourceGroup -ErrorAction SilentlyContinue
+            # -ErrorAction Stop (not SilentlyContinue): a denial here used to read as null -> the confident false
+            # "No resource groups found". Distinguish "couldn't look" (Unknown + warning) from a genuine empty.
+            $subRgList = $null
+            try {
+                $subRgList = @(Get-AzResourceGroup -ErrorAction Stop)
+            } catch {
+                if (Test-CVPermissionError $_) {
+                    $act = Get-CVDeniedAction "$($_.Exception.Message)"
+                    Write-CVLog ("Could not list resource groups - permission denied{0}; CosmosDB coverage reported as Unknown for this subscription." -f ($act ? " (missing '$act')" : '')) `
+                        -Level Warning -Source 'Cosmos' -Scope @{ Subscription = $sub.Name } -Exception $_
+                } else {
+                    Write-CVLog "Could not list resource groups: $($_.Exception.Message); CosmosDB coverage Unknown for this subscription." -Level Warning -Source 'Cosmos' -Scope @{ Subscription = $sub.Name }
+                }
+                continue
+            }
             if (-not $subRgList) {
                 Write-Host "No resource groups found in subscription $($sub.Name)" -ForegroundColor Yellow
                 continue
@@ -1859,13 +1940,19 @@ foreach ($sub in $subs) {
                 Write-Progress -Id 8 -ParentId 1 -Activity "Scanning Resource Groups for CosmosDB" -Status "Resource Group $rgCount of $($subRgList.Count): $($rg.ResourceGroupName)" -PercentComplete ([math]::Round(($rgCount / $subRgList.Count) * 100, 1))
                 
                 try {
-                    $cosmosAccountsInRG = Get-AzCosmosDBAccount -ResourceGroupName $rg.ResourceGroupName -ErrorAction SilentlyContinue
+                    $cosmosAccountsInRG = Get-AzCosmosDBAccount -ResourceGroupName $rg.ResourceGroupName -ErrorAction Stop
                     if ($cosmosAccountsInRG) {
-                        $allCosmosAccounts += $cosmosAccountsInRG | Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue $rg.ResourceGroupName -PassThru
+                        $allCosmosAccounts += $cosmosAccountsInRG | Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue $rg.ResourceGroupName -Force -PassThru
                     }
                 } catch {
-                    Write-Error "Unable to collect CosmosDB information for Resource Group $($rg.ResourceGroupName) in subscription: $($sub.Name)"
-                    Write-Error "Error: $_"
+                    # Route through Write-CVLog (categorized + deduped) instead of a raw red Write-Error.
+                    if (Test-CVPermissionError $_) {
+                        Write-CVLog "CosmosDB read denied - permission denied (Microsoft.DocumentDB/databaseAccounts/read); Cosmos coverage Unknown in this resource group." `
+                            -Level Warning -Source 'Cosmos' -Scope @{ Subscription = $sub.Name; ResourceGroup = $rg.ResourceGroupName } -Exception $_
+                    } else {
+                        Write-CVLog "Unable to collect CosmosDB for resource group $($rg.ResourceGroupName): $($_.Exception.Message)" `
+                            -Level Warning -Source 'Cosmos' -Scope @{ Subscription = $sub.Name; ResourceGroup = $rg.ResourceGroupName }
+                    }
                     Continue
                 }
             }
@@ -1894,6 +1981,11 @@ foreach ($sub in $subs) {
                             "BackupPolicyBackupType" = $cosmosAccount.BackupPolicy.BackupType
                             "BackupPolicyBackupStorageRedundancy" = $cosmosAccount.BackupPolicy.BackupStorageRedundancy
                             "MinimalTlsVersion" = $cosmosAccount.MinimalTlsVersion
+                            # cos-cmek reads this. Cosmos signals CMK by carrying a key-vault key URI; a
+                            # service-managed account leaves it empty. The property is always present on the
+                            # account model, so empty here genuinely means "not CMK" rather than "not collected".
+                            "CmkEncrypted" = [bool]$cosmosAccount.KeyVaultKeyUri
+                            "KeyVaultKeyUri" = $cosmosAccount.KeyVaultKeyUri
                         }
                         
                         # Get metrics following the reference file pattern
@@ -2191,6 +2283,11 @@ foreach ($sub in $subs) {
                         DiskState       = $disk.DiskState      # Unattached / Attached / Reserved
                         DiskSku         = $disk.Sku.Name
                         OsType          = $disk.OsType
+                        # disk-cmek reads this. Encryption.Type is one of EncryptionAtRestWithPlatformKey /
+                        # WithCustomerKey / WithPlatformAndCustomerKeys - the last two both involve a CMK. Absent
+                        # Encryption block stays $null (Unknown); it is not evidence of platform-key encryption.
+                        CmkEncrypted    = $(if (-not $disk.Encryption) { $null } else { [bool]("$($disk.Encryption.Type)" -match 'CustomerKey') })
+                        DiskEncryptionSetId = $disk.Encryption.DiskEncryptionSetId
                         AttachedToVM    = if ($disk.ManagedBy) { ($disk.ManagedBy -split '/')[-1] } else { 'Unattached' }
                         CreationTime    = $disk.TimeCreated
                     }
@@ -2322,25 +2419,19 @@ if ($Selected.AKS) { Write-Host "Total AKS Persistent Volume Claims found: $($AK
 }   # end of the Data Protection pipeline (-SkipDataProtection wrap)
 
 # ============================================================
-# CYBER RESILIENCE POSTURE REPORT  (skip with -SkipResilienceReport)
-# Scores each resource's CURRENT NATIVE Azure configuration against the Cloud Resilience Control Catalog.
-# Runs before the CSV exports so Ctl_* columns land on every per-service CSV. Unknown signals are excluded
-# from the score (never failing), and per-row failures are isolated. Empty environment -> "nothing to assess".
+# PROTECTION DATA  (skip with -SkipResilienceReport)
+# Attaches the six raw protection fields to each resource's inventory row. Runs before the CSV/JSON exports
+# so the columns land on every per-service CSV and flow into the JSON. Scoring/severity is owned downstream.
 # ============================================================
 if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
   try {
-    Write-CVSection 'Cyber Resilience Posture'
-    $azControls   = Get-CVAzureResilienceControls
-    $resilResults = New-Object System.Collections.Generic.List[psobject]
+    Write-CVSection 'Protection Data'
+    $azControls = Get-CVAzureResilienceControls
 
-    # Storage posture signals are collected inside the subscription loop now (see the storage block above), where
-    # the Az context already points at the right subscription. The post-loop pass that used to live here re-fetched
-    # each account with no -SubscriptionId, so it only ever worked for the last subscription processed.
-
+    # Storage posture signals are collected inside the subscription loop (see the storage block above).
     # Azure Files is SSE-encrypted at rest by default.
     foreach ($fsh in @($FileShares)) { if ($fsh) { Add-Member -InputObject $fsh -NotePropertyName EncryptedAtRest -NotePropertyValue $true -Force } }
 
-    # Evaluate each resource type; append Ctl_*/ResilienceScore/ResilienceGaps onto the inventory rows.
     $collections = @(
         @{ Type='VM';        Set=$azControls.VM;        Rows=@($VMs) }
         @{ Type='Disk';      Set=$azControls.Disk;      Rows=@($UnmanagedDiskItems) }
@@ -2351,71 +2442,30 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         @{ Type='FileShare'; Set=$azControls.FileShare; Rows=@($FileShares) }
         @{ Type='AKS';       Set=$azControls.AKS;       Rows=@($AKSClusters) }
     )
-    # Name and size are the only fields that differ meaningfully per type; resource group, region and resource id
-    # are probed from candidate lists inside New-CVGapRow.
-    $azGapFields = @{
-        VM        = @{ Name = 'VMName';         SizeGB = 'VMDiskSizeGB' }
-        Disk      = @{ Name = 'DiskName';       SizeGB = 'DiskSizeGB' }
-        Storage   = @{ Name = 'StorageAccount'; SizeGB = 'UsedCapacityGB' }
-        SQL       = @{ Name = 'Database';       SizeGB = 'SizingGB';   Parent = 'Server' }
-        FlexDB    = @{ Name = 'Name';           SizeGB = 'StorageGB' }
-        Cosmos    = @{ Name = 'Name';           SizeGB = 'DataUsageGB' }
-        FileShare = @{ Name = 'Name';           SizeGB = 'UsedCapacityGB'; Parent = 'StorageAccount' }
-        AKS       = @{ Name = 'ClusterName';    SizeGB = 'PersistentVolumeCapacityGB' }
-    }
-    $gapRows = New-Object System.Collections.Generic.List[psobject]
     $resilShownErr = $false
+    $rowCount = 0
     foreach ($c in $collections) {
         if (-not $c.Set) { continue }
         foreach ($row in $c.Rows) {
             if (-not $row) { continue }
             try {
-                $ev = Invoke-CVResilience -Resource $row -Controls $c.Set
-                foreach ($kv in (ConvertTo-CVResilienceColumns -Evaluation $ev).GetEnumerator()) {
+                $pd = Get-CVProtectionData -Resource $row -Cloud 'azure' -ResourceType $c.Type -ControlSet $c.Set
+                foreach ($kv in $pd.GetEnumerator()) {
                     Add-Member -InputObject $row -NotePropertyName $kv.Key -NotePropertyValue $kv.Value -Force
                 }
-                foreach ($res in $ev.Results) {
-                    Add-Member -InputObject $res -NotePropertyName ResourceType -NotePropertyValue $c.Type -Force
-                    $resilResults.Add($res)
-                }
-                $gr = New-CVGapRow -Resource $row -ResourceType $c.Type -Evaluation $ev -FieldMap $azGapFields[$c.Type]
-                if ($gr) { $gapRows.Add($gr) }
+                $rowCount++
             } catch {
                 if (-not $resilShownErr) {
                     $resilShownErr = $true
-                    Write-Host ("[Resilience] eval error on a $($c.Type) row: $($_.Exception.GetType().Name): $($_.Exception.Message) :: " + ($_.ScriptStackTrace -replace "`r?`n", ' <- ')) -ForegroundColor DarkYellow
+                    Write-Host ("[Protection] eval error on a $($c.Type) row: $($_.Exception.GetType().Name): $($_.Exception.Message) :: " + ($_.ScriptStackTrace -replace "`r?`n", ' <- ')) -ForegroundColor DarkYellow
                 }
             }
         }
     }
-
-    $resilSummary = Get-CVResilienceSummary -Results $resilResults
-    if ($null -ne $resilSummary.OverallScore) {
-        Write-CVLog ("Overall native resilience score: {0}/100  ({1} controls assessed, {2} not assessed)" -f $resilSummary.OverallScore, $resilSummary.Assessed, $resilSummary.Excluded) -Level Success -Source 'Resilience'
-        foreach ($cat in $resilSummary.ByCategory) { Write-CVLog ("  {0,-14} {1,3}% met ({2}/{3})" -f $cat.Category, $cat.PercentMet, $cat.ControlsMet, $cat.ControlsTotal) -Level Info -Source 'Resilience' }
-    } else {
-        Write-CVLog "No resilience controls could be assessed (no eligible resources or signals)." -Level Warning -Source 'Resilience'
-    }
-
-    # One file: every resource with a gap or an incomplete assessment, ranked. The control catalog (a static
-    # legend) and the per-category rollup are no longer written - the catalog said nothing about the estate, and
-    # the category percentages are in the console summary above and derivable from GapCategories here.
-    if ($gapRows.Count) {
-        Sort-CVGapRows -Rows $gapRows | Export-CVCsv -Path (Join-Path $outdir ("azure_resilience_gaps_$dateStr.csv")) `
-            -PreferredOrder (Get-CVGapReportColumns -ControlSets $azControls)
-        $withGaps    = @($gapRows | Where-Object { $_.Status -eq 'Gap' }).Count
-        $noneAssessed = @($gapRows | Where-Object { $_.Status -eq 'NotAssessed' }).Count
-$partial      = @($gapRows | Where-Object { $_.Status -eq 'Gap' -and -not $_.AssessmentComplete }).Count
-        $tbAtRisk    = [math]::Round((@($gapRows | Where-Object { $_.Status -eq 'Gap' -and $null -ne $_.SizeGB } |
-                            Measure-Object -Property SizeGB -Sum).Sum / 1000), 3)
-        Write-CVLog ("Resilience gaps: {0} resource(s) with at least one gap ({1} TB of sized data); {2} could not be assessed at all; {3} of the flagged resources were only partially assessed." -f $withGaps, $tbAtRisk, $noneAssessed, $partial) -Level Info -Source 'Resilience'
-        Write-Host "azure_resilience_gaps_$dateStr.csv written to $outdir" -ForegroundColor Cyan
-    } else {
-        Write-CVLog "No resilience gaps found (and nothing left unassessed) - no gap CSV written." -Level Info -Source 'Resilience'
-    }
+    Write-CVLog ("Protection data computed for {0} resource(s)." -f $rowCount) -Level Info -Source 'Resilience'
   } catch {
-    Write-CVLog "Resilience report failed: $($_.Exception.Message)" -Level Warning -Source 'Resilience'
-    Write-Host ("[Resilience] $($_.Exception.GetType().Name): $($_.Exception.Message) :: " + ($_.ScriptStackTrace -replace "`r?`n", ' <- ')) -ForegroundColor DarkYellow
+    Write-CVLog "Protection-data pass failed: $($_.Exception.Message)" -Level Warning -Source 'Resilience'
+    Write-Host ("[Protection] $($_.Exception.GetType().Name): $($_.Exception.Message) :: " + ($_.ScriptStackTrace -replace "`r?`n", ' <- ')) -ForegroundColor DarkYellow
   }
 }
 
@@ -3649,10 +3699,10 @@ if ($summaryRows.Count -and -not $SkipDataProtection) {
 Write-Host "`n=== All Output Files Created Successfully ===" -ForegroundColor Green
 
 # ============================================================
-# JSON EXPORT (when OutputFormat is json or both)
+# STRUCTURED OUTPUT - JSON (default) + Excel workbook (always produced when there is inventory)
 # ============================================================
-if (($OutputFormat -eq "json" -or $OutputFormat -eq "both") -and -not $SkipDataProtection) {
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing JSON output..." -PercentComplete 80
+if (-not $SkipDataProtection) {
+    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing structured output..." -PercentComplete 80
 
     # workloadKey -> summary bucket (Type), resilience control set (PostureType), and GB field.
     # MySQL/PostgreSQL share the FlexDB controls; NetApp/Backup/AVS have no control set (posture -> NotAssessed).
@@ -3663,6 +3713,8 @@ if (($OutputFormat -eq "json" -or $OutputFormat -eq "both") -and -not $SkipDataP
     if ($FileShares)         { $workloads["azure_file_shares"] = @{ Items = @($FileShares);         Type = 'FileShare';  PostureType = 'FileShare'; SizeField = 'UsedCapacityGB' } }
     if ($NetAppVolumes)      { $workloads["azure_netapp"]      = @{ Items = @($NetAppVolumes);      Type = 'NetApp';     PostureType = $null;      SizeField = 'UsedCapacityGB' } }
     if ($SqlDbInventory)     { $workloads["azure_sql"]         = @{ Items = @($SqlDbInventory);     Type = 'SQL';        PostureType = 'SQL';      SizeField = 'SizingGB' } }
+    if ($SqlInstancesInventory) { $workloads["azure_sql_mi"]     = @{ Items = @($SqlInstancesInventory); Type = 'SQLManagedInstance';   PostureType = $null; SizeField = 'StorageSizeGB' } }
+    if ($SqlMIDbInventory)      { $workloads["azure_sql_mi_dbs"] = @{ Items = @($SqlMIDbInventory);      Type = 'SQLManagedInstanceDB'; PostureType = $null; SizeField = $null } }
     if ($MySQLServers)       { $workloads["azure_mysql"]       = @{ Items = @($MySQLServers);       Type = 'MySQL';      PostureType = 'FlexDB';   SizeField = 'StorageGB' } }
     if ($PostgreSQLServers)  { $workloads["azure_postgresql"]  = @{ Items = @($PostgreSQLServers);  Type = 'PostgreSQL'; PostureType = 'FlexDB';   SizeField = 'StorageGB' } }
     if ($CosmosDBs)          { $workloads["azure_cosmos"]      = @{ Items = @($CosmosDBs);          Type = 'Cosmos';     PostureType = 'Cosmos';   SizeField = 'DataUsageGB' } }
@@ -3670,17 +3722,22 @@ if (($OutputFormat -eq "json" -or $OutputFormat -eq "both") -and -not $SkipDataP
     if ($BackupItems)        { $workloads["azure_backup"]      = @{ Items = @($BackupItems);        Type = 'Backup';     PostureType = $null;      SizeField = 'DiskSizeGB' } }
     if ($AVSClusters)        { $workloads["azure_avs"]         = @{ Items = @($AVSClusters);        Type = 'AVS';        PostureType = $null;      SizeField = $null } }
 
-    $jsonPath = Export-CVSizingJson -Cloud 'azure' -OutputDir $outdir -TimeStamp $dateStr `
-        -Metadata ([ordered]@{
-            tenant_id      = (Get-AzContext).Tenant.Id
-            subscriptions  = @($allSubscriptions | ForEach-Object { $_.Id })
-            script_version = "2.0"
-            env_tag_name   = $EnvTagName
-            env_tag_values = @($EnvTagValues)
-        }) `
-        -Workloads $workloads `
-        -Controls (Get-CVAzureResilienceControls)
-    Write-Host "azure_sizing_$dateStr.json written to $outdir" -ForegroundColor Cyan
+    if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
+        $jsonPath = Export-CVSizingJson -Cloud 'azure' -OutputDir $outdir -TimeStamp $dateStr `
+            -Metadata ([ordered]@{
+                tenant_id      = (Get-AzContext).Tenant.Id
+                subscriptions  = @($allSubscriptions | ForEach-Object { $_.Id })
+                script_version = "2.0"
+                env_tag_name   = $EnvTagName
+                env_tag_values = @($EnvTagValues)
+            }) `
+            -Workloads $workloads
+        Write-Host "azure_sizing_$dateStr.json written to $outdir" -ForegroundColor Cyan
+    }
+
+    # Excel workbook (Summary + one sheet per service) - always produced so the customer bundle has a spreadsheet.
+    $xlsxPath = Export-CVExcelWorkbook -Path (Join-Path $outdir "azure_sizing_$dateStr.xlsx") -Workloads $workloads
+    if ($xlsxPath) { Write-Host "azure_sizing_$dateStr.xlsx written to $outdir" -ForegroundColor Cyan }
 }
 
 Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Creating ZIP archive..." -PercentComplete 90
@@ -3689,10 +3746,18 @@ Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Creating ZIP a
 Write-CVSummary -Title 'Azure Sizing Run Summary'
 Stop-Transcript
 
-# Zip results (always include everything in outdir — CSVs + JSON if present)
-$zipfile = $runPaths.ZipPath  
-Add-Type -AssemblyName System.IO.Compression.FileSystem  
-[IO.Compression.ZipFile]::CreateFromDirectory($outdir, $zipfile)  
+# Stage the run log into the output folder so the ZIP actually contains it - the log is the whole point when a
+# customer sends the bundle back to explain a failed or partial run (transcript already stopped above).
+try {
+    if ($logFile -and (Test-Path -LiteralPath $logFile)) {
+        Copy-Item -LiteralPath $logFile -Destination (Join-Path $outdir (Split-Path $logFile -Leaf)) -Force -ErrorAction Stop
+    }
+} catch { Write-Warning "Could not stage the run log into the output folder: $($_.Exception.Message)" }
+
+# Zip results (always include everything in outdir — CSVs + JSON + Excel + log)
+$zipfile = $runPaths.ZipPath
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+[IO.Compression.ZipFile]::CreateFromDirectory($outdir, $zipfile)
 
 # Complete all progress indicators
 Write-Progress -Id 5 -Activity "Generating Output Files" -Completed

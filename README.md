@@ -26,7 +26,7 @@ Every run needs three things: **PowerShell 7**, the **cloud vendor's CLI/SDK** (
 |---|---|---|---|
 | PowerShell 7+ | Required | Required | Required |
 | Vendor CLI | **AWS CLI v2** — required (credential profiles, SSO, EKS kubeconfig) | Azure CLI **not** required — Azure runs on the Az PowerShell modules | **gcloud CLI** — required, including the `gsutil` and `bq` components |
-| PowerShell modules | `AWS.Tools.*`, `ImportExcel` | `Az.*` | none (beyond the shared console UI) |
+| PowerShell modules | `AWS.Tools.*`, `ImportExcel` | `Az.*`, `ImportExcel` | `ImportExcel` |
 | Interactive console UI | `PwshSpectreConsole` (not needed with `-NonInteractive`) | same | same |
 | `kubectl` | Auto-installed when needed | Auto-installed when needed | Auto-installed when needed |
 
@@ -97,10 +97,15 @@ Install-AWSToolsModule -Name AWS.Tools.Common,AWS.Tools.EC2,AWS.Tools.S3,AWS.Too
 
 **Azure**
 ```powershell
-Install-Module Az.Accounts,Az.Compute,Az.Storage,Az.Monitor,Az.Resources,Az.NetAppFiles,Az.CosmosDB,Az.Sql,Az.MySql,Az.PostgreSql,Az.Aks,Az.RecoveryServices,Az.VMware,Az.Network,Az.ResourceGraph -Scope CurrentUser -Force
+Install-Module Az.Accounts,Az.Compute,Az.Storage,Az.Monitor,Az.Resources,Az.NetAppFiles,Az.CosmosDB,Az.Sql,Az.MySql,Az.PostgreSql,Az.Aks,Az.RecoveryServices,Az.VMware,Az.Network,Az.ResourceGraph,ImportExcel -Scope CurrentUser -Force
 ```
 
-**Google Cloud** — no cloud-specific modules; the gcloud CLI from step 2 is all that is needed.
+**Google Cloud** — no cloud-specific modules beyond the gcloud CLI from step 2, plus `ImportExcel` for the Excel workbook:
+```powershell
+Install-Module ImportExcel -Scope CurrentUser -Force
+```
+
+`ImportExcel` powers the per-run `.xlsx` workbook on every cloud. It is optional — without it the run still produces CSV/JSON and just logs a warning that the workbook was skipped.
 
 The last module in each list covers the Cloud Rewind pass (`AWS.Tools.ResourceGroupsTaggingAPI`; `Az.Network` plus the optional `Az.ResourceGraph`). On GCP that pass instead needs the **Cloud Asset API** enabled per project — `gcloud services enable cloudasset.googleapis.com`. Pass `-SkipCloudRewind` to run without any of them.
 
@@ -153,28 +158,32 @@ Filters are `Key=Value` (union: a resource matches if it is in **any** listed re
 
 **Extra prerequisites for the Cloud Rewind pass:** AWS needs `AWS.Tools.ResourceGroupsTaggingAPI`; Azure needs `Az.Resources` + `Az.Network`; GCP needs the **Cloud Asset API** (`cloudasset.googleapis.com`) enabled. Add `-SkipCloudRewind` to run without them.
 
-## Cyber resilience gap report
+## Protection data (for the cloud posture report)
 
-Alongside the inventory, every run scores each discovered resource against the Cloud Resilience Control Catalog
-and writes `Output/<cloud>_<timestamp>/<cloud>_resilience_gaps_<timestamp>.csv` — one row per resource that has
-at least one gap, or that could not be fully assessed. It measures the customer's **current native cloud configuration, as-is** — it is not a Commvault plan state.
+Alongside the inventory, every run evaluates each discovered resource against the Cloud Resilience Control
+Catalog and records **raw protection data** — the customer's current native cloud configuration, as-is
+(not a Commvault plan state). Resources carry the raw fields **that apply to their workload type**, drawn from
+`backup_enabled`, `backup_retention_days`, `backup_immutable`, `pitr_enabled`, `public_access_blocked`,
+`cross_region_backup` — each `true` / `false` / `null` (`null` = measured nothing; never a negative). Fields that
+don't apply to a type are omitted (PITR only on DBs, public-access only on object storage / DBs, etc.). All
+scoring and gap-severity ranking are owned by the downstream **report generator**, so these outputs stay raw and stable.
 
-See **[CYBER_RESILIENCE_REPORT.md](CYBER_RESILIENCE_REPORT.md)** for how to read the file, how scoring works,
-and the full catalog of all 83 controls across the three clouds.
+See **[CYBER_RESILIENCE_REPORT.md](CYBER_RESILIENCE_REPORT.md)** for the six fields and the full catalog of all
+83 controls across the three clouds. Skip the pass entirely with `-SkipResilienceReport`.
 
-Skip the pass entirely with `-SkipResilienceReport`.
-
-## JSON output for the cloud posture report
+## JSON + Excel output for the cloud posture report
 
 Every AWS/Azure/GCP run also writes `<cloud>_sizing_<timestamp>.json` — the machine-readable feed for the
-downstream cloud posture report. It carries `metadata`, a per-service `summary`, a normalized
-`protection_summary` rollup, and `workloads` (one array per service). Each resource in `workloads` includes a
-`protection` object with a consistent, catalog-aligned status vocabulary — `backup`, `retention_days`,
-`immutability`, `pitr`, `public_exposure`, `cross_region`, and an `overall` label. The vocabulary and how it is
-derived are documented in **[CYBER_RESILIENCE_REPORT.md](CYBER_RESILIENCE_REPORT.md#json-protection-summary)**.
+downstream cloud posture report — and `<cloud>_sizing_<timestamp>.xlsx`, an Excel workbook with a Summary sheet
+plus one detail sheet per service. The JSON carries `metadata`, a per-service `summary`, and `workloads` (one
+array per service); each resource includes a nested `protection` object with the raw fields that apply to its
+type. The same fields appear as flat columns on the inventory CSV/Excel rows. There is no score, severity, or
+rollup — the report generator computes those.
 
-`-OutputFormat` now defaults to **`both`** (CSV + JSON) so the JSON is always produced; pass `-OutputFormat csv`
-for CSV only, or `json` for JSON only. The JSON is included in the run's ZIP for upload.
+`-OutputFormat` defaults to **`both`** (CSV + JSON), so the JSON is always produced; pass `-OutputFormat csv`
+for CSV only, or `json` for JSON only. **The Excel workbook is always produced** (independent of `-OutputFormat`)
+when `ImportExcel` is installed — if it isn't, the run logs a warning and skips only the workbook. The JSON, the
+Excel workbook, **and the run log** are all included in the run's ZIP for upload, so the bundle is self-contained.
 
 ## Repository layout
 

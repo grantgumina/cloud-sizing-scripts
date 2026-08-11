@@ -313,19 +313,12 @@ function Export-CVCsv {
 function Export-CVSizingJson {
     <#
       .SYNOPSIS  Single shared writer for the <cloud>_sizing_<ts>.json the posture report consumes.
-      .DESCRIPTION Replaces the per-script inline JSON blocks (which had drifted and, on GCP/Azure, read
-                   undefined variables). Blends a normalized `protection` label object onto every resource
-                   (Get-CVProtectionPosture), builds the `summary`, and emits a normalized `protection_summary`
-                   rollup counted by the same vocabulary. Includes whatever workloads the caller passes - no
-                   per-type allow-list - so coverage follows the estate.
-      .PARAMETER Workloads  Ordered map workloadKey -> @{ Items=[object[]]; Type='<summary bucket>';
-                            PostureType='<control-set key>'; SizeField='<GB prop>' }.
-                            `Type` names the summary / protection_summary bucket (a display name, e.g. 'Aurora');
-                            keys sharing a Type accumulate. `PostureType` (defaults to Type) is the resilience
-                            control-set key used for posture - so Aurora/DocumentDB can bucket separately yet share
-                            the RDS controls, and MySQL/PostgreSQL share FlexDB.
-      .PARAMETER Controls   The cloud's ResourceType -> controls hashtable, for posture fallback when the
-                            resilience pass did not run (no Ctl_* columns on the row).
+      .DESCRIPTION Builds `summary`, nests each resource's six RAW protection fields (already attached to the
+                   row by the protection-data pass) into a `protection` object, and writes metadata/summary/
+                   workloads. No scoring, severity, or rollups - all interpretation lives in the report generator.
+                   Includes whatever workloads the caller passes - no per-type allow-list - so coverage follows the estate.
+      .PARAMETER Workloads  Ordered map workloadKey -> @{ Items=[object[]]; Type='<summary bucket>'; SizeField='<GB prop>' }.
+                            `Type` names the summary bucket (a display name, e.g. 'Aurora'); keys sharing a Type accumulate.
       .OUTPUTS  The path written.
     #>
     [CmdletBinding()]
@@ -335,21 +328,18 @@ function Export-CVSizingJson {
         [Parameter(Mandatory)][string]$TimeStamp,
         [Parameter(Mandatory)][System.Collections.IDictionary]$Metadata,
         [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$Workloads,
-        [hashtable]$Controls,
-        [string]$SchemaVersion = '3.0'
+        [string]$SchemaVersion = '4.0'
     )
 
+    $protFields   = $script:CVProtectionFields
     $summary      = [ordered]@{}
-    $protSummary  = [ordered]@{}
     $workloadsOut = [ordered]@{}
 
     foreach ($key in @($Workloads.Keys)) {
         $entry     = $Workloads[$key]
         $items     = @($entry.Items | Where-Object { $null -ne $_ })
         $type      = if ($entry.Type) { $entry.Type } else { $key }
-        $postType  = if ($entry.PostureType) { $entry.PostureType } else { $type }
         $sizeField = $entry.SizeField
-        $ctrlSet   = if ($Controls -and $postType -and $Controls.ContainsKey($postType)) { $Controls[$postType] } else { $null }
 
         # Size total for this collection (skip non-numeric / missing values).
         $sumGb = 0.0
@@ -360,50 +350,25 @@ function Export-CVSizingJson {
             }
         }
 
-        # Attach the normalized protection label object to each resource; keep the postures for the rollup.
-        $postures = foreach ($it in $items) {
-            $p = Get-CVProtectionPosture -Resource $it -Cloud $Cloud -ResourceType $postType -ControlSet $ctrlSet
-            Add-Member -InputObject $it -NotePropertyName protection -NotePropertyValue $p -Force
-            $p
+        # Nest the raw protection fields the pass attached to the row (only the ones applicable to this type)
+        # under `protection`, and drop the flat copies from the top level - JSON is nested, CSV/XLS stay flat,
+        # neither duplicates. A type with no applicable fields gets no `protection` object.
+        $projected = foreach ($it in $items) {
+            $prot = [ordered]@{}
+            foreach ($f in $protFields) { $pp = $it.PSObject.Properties[$f]; if ($pp) { $prot[$f] = $pp.Value } }
+            $obj = $it | Select-Object -Property * -ExcludeProperty $protFields
+            if ($prot.Count) { Add-Member -InputObject $obj -NotePropertyName protection -NotePropertyValue $prot -Force }
+            $obj
         }
-        $workloadsOut[$key] = $items
+        $workloadsOut[$key] = @($projected)
 
-        # summary - accumulate by engine type so shared-type keys (FlexDB) sum rather than overwrite.
+        # summary - accumulate by type so shared-type keys (FlexDB) sum rather than overwrite.
         if (-not $summary.Contains($type)) { $summary[$type] = [ordered]@{ count = 0; total_storage_gb = 0.0; notes = '' } }
         $summary[$type].count            += $items.Count
         $summary[$type].total_storage_gb += $sumGb
-
-        # protection_summary - counted by the per-resource label vocabulary.
-        if (-not $protSummary.Contains($type)) {
-            $protSummary[$type] = [ordered]@{ total = 0; protected = 0; unprotected = 0; not_assessed = 0
-                                              immutable = 0; publicly_exposed = 0; pitr_enabled = 0; cross_region = 0 }
-        }
-        $ps = $protSummary[$type]
-        foreach ($p in @($postures)) {
-            $ps.total++
-            switch ($p.backup) { 'Protected' { $ps.protected++ } 'Unprotected' { $ps.unprotected++ } default { $ps.not_assessed++ } }
-            if ($p.immutability    -eq 'Immutable') { $ps.immutable++ }
-            if ($p.public_exposure -eq 'Public')    { $ps.publicly_exposed++ }
-            if ($p.pitr            -eq 'Enabled')   { $ps.pitr_enabled++ }
-            if ($p.cross_region    -eq 'Protected') { $ps.cross_region++ }
-        }
     }
 
     foreach ($t in @($summary.Keys)) { $summary[$t].total_storage_gb = [math]::Round([double]$summary[$t].total_storage_gb, 4) }
-
-    # Overall coverage over resources whose backup was actually assessed (NotAssessed excluded, never a failure).
-    $ovTotal = 0; $ovProt = 0; $ovUnprot = 0; $ovNA = 0
-    foreach ($t in @($protSummary.Keys)) {
-        $ovTotal += $protSummary[$t].total; $ovProt += $protSummary[$t].protected
-        $ovUnprot += $protSummary[$t].unprotected; $ovNA += $protSummary[$t].not_assessed
-    }
-    $protSummary['_overall'] = [ordered]@{
-        total        = $ovTotal
-        protected    = $ovProt
-        unprotected  = $ovUnprot
-        not_assessed = $ovNA
-        coverage_pct = if (($ovProt + $ovUnprot) -gt 0) { [math]::Round(100 * [double]$ovProt / ($ovProt + $ovUnprot), 1) } else { $null }
-    }
 
     $meta = [ordered]@{}
     foreach ($k in $Metadata.Keys) { $meta[$k] = $Metadata[$k] }
@@ -412,16 +377,94 @@ function Export-CVSizingJson {
     $meta['schema_version'] = $SchemaVersion
 
     $doc = [ordered]@{
-        metadata           = $meta
-        summary            = $summary
-        protection_summary = $protSummary
-        workloads          = $workloadsOut
+        metadata  = $meta
+        summary   = $summary
+        workloads = $workloadsOut
     }
 
     if (-not (Test-Path -LiteralPath $OutputDir)) { New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null }
     $jsonPath = Join-Path $OutputDir ("{0}_sizing_{1}.json" -f $Cloud, $TimeStamp)
     $doc | ConvertTo-Json -Depth 12 | Set-Content -Path $jsonPath -Encoding UTF8
     return $jsonPath
+}
+
+# Excel worksheet names must be <=31 chars and contain none of : \ / ? * [ ]
+function Get-CVExcelSheetName {
+    param([string]$Name)
+    $s = ($Name -replace '[:\\/\?\*\[\]]', '_')
+    if ($s.Length -gt 31) { $s = $s.Substring(0, 31) }
+    if ([string]::IsNullOrWhiteSpace($s)) { $s = 'Sheet' }
+    return $s
+}
+
+function Export-CVExcelWorkbook {
+    <#
+      .SYNOPSIS  Write a per-service Excel workbook (a Summary sheet + one detail sheet per type) from the same
+                 $Workloads map Export-CVSizingJson consumes. Shared by the Azure and GCP scripts.
+      .DESCRIPTION Best-effort: if ImportExcel is not installed it logs a Warning and returns $null (CSV/JSON are
+                   still produced). Applies the same ImportExcel hygiene as the AWS path: import once under a GLOBAL
+                   warning-suppression (the "Cannot Autosize" notice is a module-load Write-Warning that only a
+                   global preference silences), -AutoSize only on Windows (libgdiplus is unavailable on mac/Linux),
+                   and each sheet's rows projected through the UNION of their columns so heterogeneous Tag_* columns
+                   are not silently dropped (Export-Excel, like Export-Csv, derives its header from the first row).
+      .OUTPUTS  The workbook path, or $null when nothing was written.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][System.Collections.Specialized.OrderedDictionary]$Workloads
+    )
+
+    if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+        Write-CVLog "ImportExcel not installed - skipping the Excel workbook (CSV/JSON still written). Run: Install-Module ImportExcel -Scope CurrentUser" -Level Warning -Source 'Excel'
+        return $null
+    }
+    if (-not (Get-Module ImportExcel)) {
+        $prev = $global:WarningPreference
+        try { $global:WarningPreference = 'SilentlyContinue'; Import-Module ImportExcel -ErrorAction Stop } finally { $global:WarningPreference = $prev }
+    }
+
+    # One detail sheet per type (accumulate so shared types like FlexDB combine), plus a leading Summary
+    # aggregated by the same type so counts/sizes match the detail sheets.
+    $byType   = [ordered]@{}
+    $sumByType = [ordered]@{}
+    foreach ($key in @($Workloads.Keys)) {
+        $entry = $Workloads[$key]
+        $items = @($entry.Items | Where-Object { $null -ne $_ })
+        if (-not $items.Count) { continue }
+        $type = if ($entry.Type) { $entry.Type } else { $key }
+        if (-not $byType.Contains($type)) { $byType[$type] = [System.Collections.Generic.List[psobject]]::new() }
+        foreach ($it in $items) { $byType[$type].Add($it) }
+        $sumGb = 0.0
+        if ($entry.SizeField) { foreach ($it in $items) { $v = $it.($entry.SizeField); if ($null -ne $v -and "$v" -match '^\s*-?[\d\.]+\s*$') { $sumGb += [double]$v } } }
+        if (-not $sumByType.Contains($type)) { $sumByType[$type] = @{ Count = 0; Gb = 0.0 } }
+        $sumByType[$type].Count += $items.Count
+        $sumByType[$type].Gb    += $sumGb
+    }
+    if (-not $byType.Count) { return $null }
+
+    if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
+
+    $summary = foreach ($type in $sumByType.Keys) {
+        [pscustomobject]@{ Service = $type; Count = $sumByType[$type].Count; TotalSizeGB = [math]::Round($sumByType[$type].Gb, 4) }
+    }
+    $sheets = [ordered]@{ 'Summary' = @($summary) }
+    foreach ($type in $byType.Keys) { $sheets[$type] = @($byType[$type]) }
+
+    $wrote = $false
+    foreach ($name in $sheets.Keys) {
+        $rows = @($sheets[$name])
+        if (-not $rows.Count) { continue }
+        # Union-of-columns projection so no column is dropped when rows are heterogeneous (e.g. per-resource Tag_*).
+        $cols = [System.Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($r in $rows) { foreach ($n in $r.PSObject.Properties.Name) { if (-not $cols.Contains($n)) { $cols[$n] = $true } } }
+        $projected = $rows | Select-Object -Property @($cols.Keys)
+        $p = @{ Path = $Path; WorksheetName = (Get-CVExcelSheetName -Name $name); FreezeTopRow = $true; BoldTopRow = $true }
+        if ($IsWindows) { $p.AutoSize = $true }   # -AutoSize needs libgdiplus (Windows-only in practice)
+        try   { $projected | Export-Excel @p -WarningAction SilentlyContinue; $wrote = $true }
+        catch { Write-CVLog "Excel sheet '$name' failed: $($_.Exception.Message)" -Level Warning -Source 'Excel' }
+    }
+    return $(if ($wrote) { $Path } else { $null })
 }
 
 #endregion
@@ -740,17 +783,60 @@ function ConvertTo-CVTemplate {
     return $t.Trim()
 }
 
+# Canonical permission/authorization-error signature, shared by Get-CVCategory (categorization) and
+# Test-CVPermissionError (call-site decisions) so the two never drift. Covers AWS (not authorized to
+# perform / Access Denied / UnauthorizedOperation), Azure (AuthorizationFailed / does not have
+# authorization - NB this text lacks "not authorized", so it must be named explicitly), and GCP
+# (PERMISSION_DENIED / does not have permission - matched by the case-insensitive `permission` alternate).
+$script:CVPermissionRegex = 'access[\s-]?denied|not authorized|unauthorized|permission|forbidden|\b403\b|AuthorizationFailed|LinkedAuthorizationFailed|does not have authorization'
+
 function Get-CVCategory {
     param([string]$Message)
     switch -Regex ($Message) {
         'not recognized|is not installed|could not (load|find)|no module|missing module' { 'MissingModule'; break }
+        # ApiDisabled is checked BEFORE Permission on purpose: gcloud reports a disabled API as
+        # PERMISSION_DENIED/SERVICE_DISABLED, which is not a real permission problem.
         'not enabled|SERVICE_DISABLED|has not been used|API .*disabled'                  { 'ApiDisabled'; break }
-        'access[\s-]?denied|not authorized|permission|forbidden|\b403\b|unauthorized'    { 'Permission'; break }
+        $script:CVPermissionRegex                                                        { 'Permission'; break }
         'credential|expired token|authenticat|Connect-Az|sso'                            { 'Auth'; break }
         'timed out|timeout|deadline'                                                     { 'Timeout'; break }
         'throttl|rate exceeded|too many requests|\b429\b|\b503\b'                        { 'Transient'; break }
         default                                                                          { 'Unknown' }
     }
+}
+
+function Test-CVPermissionError {
+    <#
+      .SYNOPSIS  $true when the argument is a permission/authorization failure (not ApiDisabled/Transient/etc).
+      .DESCRIPTION Accepts a string, an [Exception], or an [ErrorRecord]. Uses Get-CVCategory so classification
+                   stays single-sourced - ApiDisabled (disabled-API) correctly returns $false.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Position = 0)]$InputObject)
+    $msg =
+        if ($null -eq $InputObject)                                            { '' }
+        elseif ($InputObject -is [System.Management.Automation.ErrorRecord])   { "$($InputObject.Exception.Message)" }
+        elseif ($InputObject -is [System.Exception])                          { "$($InputObject.Message)" }
+        else                                                                   { "$InputObject" }
+    return ((Get-CVCategory -Message $msg) -eq 'Permission')
+}
+
+function Get-CVDeniedAction {
+    <#
+      .SYNOPSIS  The specific action/permission a denial names, or $null. AWS iam:Action, Azure RBAC action, GCP permission.
+    #>
+    [CmdletBinding()]
+    param([Parameter(Position = 0)]$InputObject)
+    $msg =
+        if ($null -eq $InputObject)                                            { '' }
+        elseif ($InputObject -is [System.Management.Automation.ErrorRecord])   { "$($InputObject.Exception.Message)" }
+        elseif ($InputObject -is [System.Exception])                          { "$($InputObject.Message)" }
+        else                                                                   { "$InputObject" }
+    if ($msg -match "perform:\s*([a-z0-9]+:[A-Za-z0-9]+)")                       { return $Matches[1] }   # AWS: iam:Action
+    if ($msg -match "perform action '?([A-Za-z0-9./]+)'?")                       { return $Matches[1] }   # Azure: Microsoft.X/Y/read
+    if ($msg -match "[Pp]ermission '?([a-z][a-z0-9]+(?:\.[a-z0-9]+)+)'?")        { return $Matches[1] }   # GCP: Permission 'storage.buckets.list' denied
+    if ($msg -match "\b([a-z][a-z0-9]+(?:\.[a-z0-9]+)+)\s+access\b")             { return $Matches[1] }   # GCP: does not have storage.buckets.list access
+    return $null
 }
 
 function Add-CVDiagnostic {

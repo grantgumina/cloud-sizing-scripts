@@ -96,5 +96,5 @@ The term "environment" here refers to the scale of the Google Cloud (GC) environ
 ```
 
 #### Results & Output
-The script writes CSV summaries and any JSON output to `Output/gcp_<timestamp>/` (with a `.zip` archive beside it) and the run log to `Logs/gcp_<timestamp>.log`, at the repository top level. In Cloud Shell you can download these via the built‑in file browser. Share the ZIP or individual CSVs with the team as needed.
+The script writes CSV summaries, a structured JSON (`gcp_sizing_<timestamp>.json`, the default feed for the cloud posture report), and an Excel workbook (`gcp_sizing_<timestamp>.xlsx` — a Summary sheet plus one detail sheet per service; needs the `ImportExcel` module, and is skipped with a warning if it is absent) to `Output/gcp_<timestamp>/`, with a `.zip` archive beside it. The run log (`Logs/gcp_<timestamp>.log`) is copied into the ZIP so the bundle is self-contained. In Cloud Shell you can download these via the built‑in file browser. Share the ZIP with the team.
 

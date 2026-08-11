@@ -104,19 +104,21 @@ function Test-CVAzureCloudRewindInclude {
             return $true
         }
         'Microsoft.Compute/disks' {
-            # Data disks only, and attached only (exclude OS disks and unattached/orphaned disks).
-            $disk = Get-AzDisk -ResourceGroupName $rg -DiskName $name -ErrorAction SilentlyContinue
+            # Data disks only, and attached only (exclude OS disks and unattached/orphaned disks). -Stop (not
+            # SilentlyContinue) so a denial THROWS to the caller and is classified, instead of null -> silently
+            # excluding the resource (an invisible undercount when a read permission is missing).
+            $disk = Get-AzDisk -ResourceGroupName $rg -DiskName $name -ErrorAction Stop
             if ($null -eq $disk) { return $false }
             if ($disk.OsType)    { return $false }
             return ($null -ne $disk.ManagedBy)
         }
         'Microsoft.Network/publicIPAddresses' {
-            $pip = Get-AzPublicIpAddress -ResourceGroupName $rg -Name $name -ErrorAction SilentlyContinue
+            $pip = Get-AzPublicIpAddress -ResourceGroupName $rg -Name $name -ErrorAction Stop
             if ($null -eq $pip) { return $false }
             return ($null -ne $pip.IpConfiguration)
         }
         'Microsoft.Network/networkInterfaces' {
-            $nic = Get-AzNetworkInterface -ResourceGroupName $rg -Name $name -ErrorAction SilentlyContinue
+            $nic = Get-AzNetworkInterface -ResourceGroupName $rg -Name $name -ErrorAction Stop
             if ($null -eq $nic) { return $false }
             return ($null -ne $nic.VirtualMachine)
         }
@@ -295,7 +297,14 @@ function Get-CVAzureCloudRewindArmDiscovery {
             if ($null -eq (Get-CVCloudRewindBillable -ResourceType $r.ResourceType -Taxonomy $Taxonomy)) { continue }
             try { if (-not (Test-CVAzureCloudRewindInclude -Resource $r)) { continue } }
             catch {
-                if (-not $shownErr) { $shownErr = $true; Write-Host "[CloudRewind] inclusion check error on $($r.ResourceType): $($_.Exception.Message)" -ForegroundColor DarkYellow }
+                # Route through Write-CVLog (categorized + deduped) rather than a raw Write-Host. A denial reading a
+                # resource's attach state means we cannot classify it billable/non-billable - the count may be
+                # incomplete, and the user is told so instead of it being silently dropped.
+                if (Test-CVPermissionError $_) {
+                    if (-not $shownErr) { $shownErr = $true; Write-CVLog "Cloud Rewind: resource inclusion check denied - permission denied; billable counts may be incomplete for this subscription." -Level Warning -Source 'CloudRewind' -Scope @{ Subscription = $sub.Name } -Exception $_ }
+                } elseif (-not $shownErr) {
+                    $shownErr = $true; Write-CVLog "Cloud Rewind: inclusion check error on $($r.ResourceType): $($_.Exception.Message)" -Level Warning -Source 'CloudRewind' -Scope @{ Subscription = $sub.Name }
+                }
                 continue
             }
             $out.Add([pscustomobject]@{

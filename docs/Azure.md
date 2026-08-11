@@ -126,8 +126,10 @@ The script creates a timestamped output directory with the following files:
 - `azure_aks_persistent_volumes_YYYY-MM-DD_HHMMSS.csv` - AKS Persistent Volumes inventory
 - `azure_aks_persistent_volume_claims_YYYY-MM-DD_HHMMSS.csv` - AKS Persistent Volume Claims inventory
 - `azure_inventory_summary_YYYY-MM-DD_HHMMSS.csv` - Comprehensive summary with regional breakdowns
-- `azure_sizing_script_output_YYYY-MM-DD_HHMMSS.log` - Complete execution log
-- `azure_sizing_YYYY-MM-DD_HHMMSS.zip` - ZIP archive containing all output files
+- `azure_sizing_YYYY-MM-DD_HHMMSS.json` - structured JSON for the cloud posture report (default)
+- `azure_sizing_YYYY-MM-DD_HHMMSS.xlsx` - Excel workbook: a Summary sheet + one detail sheet per service (needs `ImportExcel`; skipped with a warning if absent)
+- `azure_sizing_script_output_YYYY-MM-DD_HHMMSS.log` - Complete execution log (also included inside the ZIP)
+- `azure_sizing_YYYY-MM-DD_HHMMSS.zip` - ZIP archive containing all output files **and the run log**
 
 The script automatically creates a ZIP archive of all results. In Azure Cloud Shell you can download this via the built-in file browser; locally you will find it in the same folder you executed the script from. Share the ZIP file with your Commvault representative for sizing analysis.
 

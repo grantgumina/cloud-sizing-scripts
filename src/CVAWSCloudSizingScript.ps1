@@ -443,7 +443,7 @@ function Get-SafeCWMetricStatistic {
 function Write-ScriptOutput {
     param(
         [string]$Message,
-        [ValidateSet("Info", "Warning", "Error", "Success")]
+        [ValidateSet("Info", "Warning", "Error", "Success", "Debug")]
         [string]$Level = "Info"
     )
     # Shim over the shared console layer: rendering, structured file logging, and warning/error
@@ -598,33 +598,31 @@ function Invoke-ServiceInventory {
         Write-ScriptOutput "$ServiceName done" -Level Success
     }
     catch {
-        # Aggregated: the first failure per (service+message) renders; per-region repeats collapse into the summary.
-        Write-CVLog "Failed to get $ServiceName for region $Region" -Level Error -Source $ServiceName -Scope @{ Region = $Region } -Exception $_
+        # A permission the caller simply lacks for a service (often one they don't use) is not a run failure -
+        # downgrade it to a Warning that names the missing action, so a least-privilege role runs clean. Real
+        # failures (throttling, expired token, API errors) stay red Errors. Classification is shared across clouds
+        # (Test-CVPermissionError / Get-CVDeniedAction). Aggregated: per-region repeats collapse into the summary.
+        if (Test-CVPermissionError $_) {
+            $action = Get-CVDeniedAction "$($_.Exception.Message)"
+            $detail = if ($action) { "missing IAM permission '$action'" } else { 'missing IAM permission' }
+            Write-CVLog "Skipped $ServiceName in region $Region - $detail. Grant it (see docs/AWS.md) if this service should be inventoried." `
+                -Level Warning -Source $ServiceName -Scope @{ Region = $Region } -Exception $_
+        } else {
+            Write-CVLog "Failed to get $ServiceName for region $Region" -Level Error -Source $ServiceName -Scope @{ Region = $Region } -Exception $_
+        }
     }
 }
 
 # ============================================================
-# CYBER RESILIENCE POSTURE (AWS)  -  skip with -SkipResilienceReport
-# Scores each resource's CURRENT NATIVE AWS configuration against the Cloud Resilience Control Catalog.
-# Runs per account BEFORE that account's CSVs are written, so Ctl_*/ResilienceScore columns land on every
-# per-service CSV - matching the GCP and Azure passes. Any signal we could not collect scores as Unknown and
-# is excluded from the score; it never fails the run.
+# PROTECTION DATA (AWS)  -  skip with -SkipResilienceReport
+# Attaches the six RAW protection fields (backup_enabled, backup_retention_days, backup_immutable,
+# pitr_enabled, public_access_blocked, cross_region_backup) to each resource's inventory row. Runs per
+# account BEFORE that account's CSVs are written, so the columns land on every per-service CSV/Excel sheet
+# and flow into the JSON. All scoring/severity/interpretation is owned by the downstream report generator.
 # ============================================================
-$script:ResilienceSignalRows = New-Object System.Collections.Generic.List[psobject]
-
-# Name and size are the only genuinely per-type fields; resource group/region/id are probed by New-CVSignalRow.
-$script:AwsSignalFields = @{
-    EC2      = @{ Name = 'InstanceId';           SizeGB = 'SizeGB' }
-    EBS      = @{ Name = 'VolumeId';             SizeGB = 'SizeGB' }
-    RDS      = @{ Name = 'DBInstanceIdentifier'; SizeGB = 'SizeGB' }
-    S3       = @{ Name = 'BucketName';           SizeGB = 'SizeGB' }
-    EFS      = @{ Name = 'FileSystemId';         SizeGB = 'SizeGB' }
-    DynamoDB = @{ Name = 'TableName';            SizeGB = 'SizeGB' }
-    Redshift = @{ Name = 'ClusterIdentifier';    SizeGB = 'SizeGB' }
-}
 $script:ResilienceErrShown = $false
 
-# Inventory service name -> control set in Get-CVAwsResilienceControls. Services absent here simply are not scored.
+# Inventory service name -> control set in Get-CVAwsResilienceControls. Services absent here get no protection fields.
 $script:AwsResilienceMap = @{
     EC2               = 'EC2'
     UnattachedVolumes = 'EBS'
@@ -639,7 +637,7 @@ $script:AwsResilienceMap = @{
 
 function Invoke-AWSResiliencePass {
     <#
-      .SYNOPSIS  Append Ctl_*/ResilienceScore/ResilienceGaps columns to one account's inventory rows.
+      .SYNOPSIS  Attach the six raw protection fields (backup_enabled, ...) to one account's inventory rows.
     #>
     param([Parameter(Mandatory)][string]$AccountId)
 
@@ -656,51 +654,22 @@ function Invoke-AWSResiliencePass {
 
             foreach ($row in $rows) {
                 if (-not $row) { continue }
-                # Isolate per-row failures so one problematic resource cannot sink the whole report.
+                # Isolate per-row failures so one problematic resource cannot sink the whole pass.
                 try {
-                    # No evaluation: controls declare WHICH fields are signals; thresholds belong to the backend.
-                    if (-not $script:AwsSignalMap) { $script:AwsSignalMap = Get-CVSignalFieldMap -ControlSets (Get-CVAwsResilienceControls) }
-                    $script:ResilienceSignalRows.Add((New-CVSignalRow -Resource $row -ResourceType $setName `
-                        -SignalFields $script:AwsSignalMap[$setName] -FieldMap $script:AwsSignalFields[$setName]))
+                    $pd = Get-CVProtectionData -Resource $row -Cloud 'aws' -ResourceType $setName -ControlSet $set
+                    foreach ($kv in $pd.GetEnumerator()) {
+                        Add-Member -InputObject $row -NotePropertyName $kv.Key -NotePropertyValue $kv.Value -Force
+                    }
                 } catch {
                     if (-not $script:ResilienceErrShown) {
                         $script:ResilienceErrShown = $true
-                        Write-CVLog "Signal export failed on a $setName row" -Level Warning -Source 'Resilience' -Exception $_
+                        Write-CVLog "Protection-data evaluation failed on a $setName row" -Level Warning -Source 'Resilience' -Exception $_
                     }
                 }
             }
         }
     } catch {
-        Write-CVLog "Resilience pass failed for account ${AccountId}: $($_.Exception.Message)" -Level Warning -Source 'Resilience'
-    }
-}
-
-function Write-AWSResilienceReport {
-    <# .SYNOPSIS  Write the run-wide resilience posture summary and the per-resource gap report. #>
-    param([Parameter(Mandatory)][string]$OutputPath, [Parameter(Mandatory)][string]$DateString)
-
-    if ($SkipResilienceReport) { return }
-    try {
-        Write-CVSection 'Cyber Resilience Posture'
-        # No score is printed - the export is judgement-free; scoring is the backend's. Two lines here used to
-        # print one anyway, off a $summary variable that was never assigned: the run emitted "Overall native
-        # resilience score: /100  (0 controls assessed, 0 not assessed)" on every AWS run, directly contradicting
-        # the comment above it, and the per-category loop iterated nothing.
-        # One file: every resource with a gap or an incomplete assessment, ranked. The static control catalog and
-        # the per-category rollup are no longer written - neither named the resources to go look at.
-        if ($script:ResilienceSignalRows.Count) {
-            Sort-CVSignalRows -Rows $script:ResilienceSignalRows |
-                Export-CVCsv -Path (Join-Path $OutputPath ("aws_resilience_signals_" + $DateString + ".csv")) `
-                             -PreferredOrder (Get-CVSignalColumns -ControlSets (Get-CVAwsResilienceControls)) -KeepDeclaredColumns
-            Write-CVLog ("Resilience signals: {0} resource(s) exported across {1} resource type(s)." -f `
-                         $script:ResilienceSignalRows.Count, @($script:ResilienceSignalRows | Select-Object -ExpandProperty ResourceType -Unique).Count) `
-                        -Level Info -Source 'Resilience'
-            Write-ScriptOutput "aws_resilience_signals_$DateString.csv written to $OutputPath" -Level Success
-        } else {
-            Write-CVLog "No resources of an assessed type were found - no signals CSV written." -Level Info -Source 'Resilience'
-        }
-    } catch {
-        Write-CVLog "Resilience report failed: $($_.Exception.Message)" -Level Warning -Source 'Resilience'
+        Write-CVLog "Protection-data pass failed for account ${AccountId}: $($_.Exception.Message)" -Level Warning -Source 'Resilience'
     }
 }
 
@@ -919,7 +888,14 @@ function Process-EC2Instance {
                 $latestSnapshotDate = if ($latestSnap) { $latestSnap.StartTime } else { $null }
             }
         } catch {
-            Write-ScriptOutput "Snapshot lookup failed for $($Item.InstanceId) in ${Region}: $($_.Exception.Message)" -Level Warning
+            # A denial on ec2:DescribeSnapshots must read Unknown, not a fabricated "no snapshots".
+            if (Test-CVPermissionError $_) {
+                $snapshotCount = $null
+                Write-CVLog "EBS snapshot lookup unreadable - permission denied (ec2:DescribeSnapshots). Snapshot count reported as Unknown, not zero." `
+                    -Level Warning -Source 'EC2' -Scope @{ Region = $Region } -Exception $_
+            } else {
+                Write-ScriptOutput "Snapshot lookup failed for $($Item.InstanceId) in ${Region}: $($_.Exception.Message)" -Level Warning
+            }
         }
     }
 
@@ -1087,19 +1063,34 @@ function Process-S3Bucket {
             $publicAccessBlocked = ($pab.BlockPublicAcls -and $pab.BlockPublicPolicy -and $pab.IgnorePublicAcls -and $pab.RestrictPublicBuckets)
         } catch { $publicAccessBlocked = $null }
 
+        # For each of these three, a bucket with the feature genuinely OFF throws a specific *NotFound* error
+        # (real negative), while a denial throws AccessDenied. Only a denial must become Unknown ($null) - keeping
+        # the default on a real NotFound. Otherwise a missing s3:Get* permission fabricates a "not protected" gap.
         # ── Replication ───────────────────────────────────────────────────
         $replicationEnabled = $false
         try {
             $replConfig = Get-S3BucketReplication -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
             $replicationEnabled = ($replConfig -and $replConfig.Rules -and $replConfig.Rules.Count -gt 0)
-        } catch { $replicationEnabled = $false }
+        } catch {
+            if (Test-CVPermissionError $_) {
+                $replicationEnabled = $null
+                Write-CVLog "S3 replication config unreadable - permission denied (s3:GetReplicationConfiguration). Cross-region reported as Unknown, not false." `
+                    -Level Warning -Source 'S3' -Scope @{ Region = $actualRegion; Bucket = $bucketName } -Exception $_
+            }
+        }
 
         # ── Lifecycle rules ───────────────────────────────────────────────
         $lifecycleRuleCount = 0
         try {
             $lcRules = Get-S3LifecycleConfiguration -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
             $lifecycleRuleCount = if ($lcRules -and $lcRules.Rules) { $lcRules.Rules.Count } else { 0 }
-        } catch { $lifecycleRuleCount = 0 }
+        } catch {
+            if (Test-CVPermissionError $_) {
+                $lifecycleRuleCount = $null
+                Write-CVLog "S3 lifecycle config unreadable - permission denied (s3:GetLifecycleConfiguration). Reported as Unknown, not zero." `
+                    -Level Warning -Source 'S3' -Scope @{ Region = $actualRegion; Bucket = $bucketName } -Exception $_
+            }
+        }
 
         # ── Encryption ────────────────────────────────────────────────────
         $serverSideEncryption = 'None'
@@ -1109,7 +1100,13 @@ function Process-S3Bucket {
                 $sse = $encConfig.ServerSideEncryptionRules[0].ServerSideEncryptionByDefault.SSEAlgorithm
                 $serverSideEncryption = if ($sse -and $sse.PSObject.Properties.Name -contains 'Value') { $sse.Value } else { [string]$sse }
             }
-        } catch { $serverSideEncryption = 'None' }
+        } catch {
+            if (Test-CVPermissionError $_) {
+                $serverSideEncryption = $null
+                Write-CVLog "S3 encryption config unreadable - permission denied (s3:GetEncryptionConfiguration). Reported as Unknown, not None." `
+                    -Level Warning -Source 'S3' -Scope @{ Region = $actualRegion; Bucket = $bucketName } -Exception $_
+            }
+        }
 
         # ── Object Lock (WORM immutability) ───────────────────────────────
         $objectLockEnabled = Get-S3ObjectLockEnabled -BucketName $bucketName -Credential $Credential -Region $actualRegion
@@ -2140,9 +2137,16 @@ function Process-DynamoDBTable {
                 $cbs.PointInTimeRecoveryDescription.PointInTimeRecoveryStatus
             } else { $null }
             $pitrEnabled = ($pitrStatus -ne $null) -and ($pitrStatus.ToString() -eq 'ENABLED')
-        } catch { $pitrEnabled = $false }
+        } catch {
+            # A denial on dynamodb:DescribeContinuousBackups must read Unknown, not a fabricated "PITR disabled".
+            if (Test-CVPermissionError $_) {
+                $pitrEnabled = $null
+                Write-CVLog "DynamoDB PITR status unreadable - permission denied (dynamodb:DescribeContinuousBackups). Reported as Unknown, not disabled." `
+                    -Level Warning -Source 'DynamoDB' -Scope @{ Region = $Region; Table = $tableName } -Exception $_
+            } else { $pitrEnabled = $false }
+        }
 
-        $ddbProtectionStatus = if ($pitrEnabled) { 'Protected' } else { 'Unprotected' }
+        $ddbProtectionStatus = if ($null -eq $pitrEnabled) { 'Unknown' } elseif ($pitrEnabled) { 'Protected' } else { 'Unprotected' }
 
         # Immutability: recovery points held in a locked (immutable) AWS Backup vault.
         $backupVaultLocked = if ($tableArn) { Get-AWSBackupVaultLocked -ResourceArn $tableArn -Credential $Credential -Region $Region } else { $null }
@@ -2768,7 +2772,16 @@ function Export-DataToExcel {
             return $false
         }
 
-        Import-Module ImportExcel -Force -ErrorAction Stop
+        # ImportExcel writes a "Cannot Autosize … brew install mono-libgdiplus" notice via Write-Warning at
+        # module-LOAD time (ImportExcel.psm1). That runs in module scope (parent = global), so neither a
+        # function-local $WarningPreference nor a per-statement 3>$null silences it - only a GLOBAL preference
+        # override does. Import once (not -Force, which would re-import per Excel file and re-emit the notice),
+        # under a global override that is restored immediately. The notice used to collide with the progress pane.
+        if (-not (Get-Module ImportExcel)) {
+            $prevWarn = $global:WarningPreference
+            try   { $global:WarningPreference = 'SilentlyContinue'; Import-Module ImportExcel -ErrorAction Stop }
+            finally { $global:WarningPreference = $prevWarn }
+        }
         Write-ScriptOutput "Using ImportExcel module for Excel generation..." -Level Success
 
         if (Test-Path $FilePath) {
@@ -2783,11 +2796,19 @@ function Export-DataToExcel {
         foreach ($sheetName in $worksheetOrder) {
             if ($DataSheets.Keys -contains $sheetName) {
                 $data = $DataSheets[$sheetName]
-                $data | Export-Excel -Path $FilePath -WorksheetName $sheetName -AutoSize -FreezeTopRow -BoldTopRow
+                # -AutoSize needs System.Drawing/libgdiplus, which .NET on macOS/Linux can't use (even with
+                # mono-libgdiplus installed) - it only spams "Auto-fitting columns is not available" warnings and
+                # does nothing. Request it only on Windows, where it works natively; elsewhere columns keep the
+                # default width (widen in Excel if needed). Keeps the run output clean.
+                $excelParams = @{ Path = $FilePath; WorksheetName = $sheetName; FreezeTopRow = $true; BoldTopRow = $true }
+                if ($IsWindows) { $excelParams.AutoSize = $true }
+                # -WarningAction SilentlyContinue: ImportExcel writes autosize/libgdiplus warnings straight to the
+                # host, colliding with the live progress pane. Keep them out of the console (full detail still logged).
+                $data | Export-Excel @excelParams -WarningAction SilentlyContinue
 
                 if ($sheetName -like "*Summary*") {
                     try {
-                        $excel = Open-ExcelPackage -Path $FilePath
+                        $excel = Open-ExcelPackage -Path $FilePath -WarningAction SilentlyContinue
                         $worksheet = $excel.Workbook.Worksheets[$sheetName]
 
                         for ($row = 1; $row -le $worksheet.Dimension.End.Row; $row++) {
@@ -2803,10 +2824,15 @@ function Export-DataToExcel {
                                 }
                             }
                         }
-                        Close-ExcelPackage $excel -Save
+                        # Close-ExcelPackage has no -Save switch (it saves by default; the old '-Save' prefix-bound
+                        # to -SaveAs and errored). Just close - saving is the default unless -NoSave is passed.
+                        Close-ExcelPackage $excel -WarningAction SilentlyContinue
                     }
                     catch {
-                        Write-ScriptOutput "Warning: Could not apply additional formatting to $sheetName : $_" -Level Warning
+                        # Best-effort cosmetic bolding of BREAKDOWN header rows. It can fail on macOS/Linux inside
+                        # ImportExcel (op_Subtraction on a non-Windows System.Drawing path); the workbook is intact
+                        # either way, so this is non-fatal noise - log at Debug, not Warning.
+                        Write-ScriptOutput "Skipped cosmetic BREAKDOWN-header bolding on $sheetName (non-fatal): $_" -Level Debug
                     }
                 }
 
@@ -3049,7 +3075,16 @@ function Invoke-AWSCloudRewindSweep {
             $region = Format-RegionName -Region $region
             $resources = @()
             try { $resources = @(Get-RGTResource -Credential $Credential -Region $region -ErrorAction Stop) }
-            catch { Write-CVLog "Cloud Rewind: Get-RGTResource failed in $region : $($_.Exception.Message)" -Level Warning -Source 'CloudRewind'; continue }
+            catch {
+                if (Test-CVPermissionError $_) {
+                    $act = Get-CVDeniedAction "$($_.Exception.Message)"
+                    Write-CVLog ("Cloud Rewind: resource discovery in {0} skipped - permission denied ({1}). Cloud Rewind counts may be incomplete." -f $region, ($act ? "missing '$act'" : "missing tag:GetResources")) `
+                        -Level Warning -Source 'CloudRewind' -Scope @{ Region = $region } -Exception $_
+                } else {
+                    Write-CVLog "Cloud Rewind: Get-RGTResource failed in $region : $($_.Exception.Message)" -Level Warning -Source 'CloudRewind' -Scope @{ Region = $region }
+                }
+                continue
+            }
 
             foreach ($res in $resources) {
                 $arn = $res.ResourceARN
@@ -3268,8 +3303,15 @@ function Get-ProcessingRegions {
             return Get-EC2Region @profileLocationParams -Region $QueryRegion -Credential $Credential -ErrorAction Stop | Select-Object -ExpandProperty RegionName
         } catch {
             # Carry the exception: without it this reads as a bare "EC2 query failed" and hides the real cause
-            # (most often credential resolution, since this is the first AWS call the script makes).
-            Write-CVLog "Failed to list EC2 regions (query region $QueryRegion)" -Level Error -Source 'Region' -Exception $_
+            # (most often credential resolution, since this is the first AWS call the script makes). A denial here
+            # is graceful (Warning naming ec2:DescribeRegions) rather than a red Error - pass -Regions to skip it.
+            if (Test-CVPermissionError $_) {
+                $act = Get-CVDeniedAction "$($_.Exception.Message)"
+                Write-CVLog ("Could not list EC2 regions (query region {0}) - permission denied ({1}). Pass -Regions to name regions explicitly." -f $QueryRegion, ($act ? "missing '$act'" : "missing ec2:DescribeRegions")) `
+                    -Level Warning -Source 'Region' -Exception $_
+            } else {
+                Write-CVLog "Failed to list EC2 regions (query region $QueryRegion)" -Level Error -Source 'Region' -Exception $_
+            }
             return @()
         }
     }
@@ -3292,7 +3334,14 @@ function Get-AWSAccountInfo {
             AccountAlias = $awsAccountAlias
         }
     } catch {
-        Write-CVLog "Failed to get AWS account information" -Level Error -Source 'Auth' -Exception $_
+        # A denial on sts:GetCallerIdentity means we cannot identify the account - skip it gracefully (Warning)
+        # rather than a red Error; the account contributes nothing but the run continues for other accounts.
+        if (Test-CVPermissionError $_) {
+            Write-CVLog "Could not identify AWS account - permission denied (sts:GetCallerIdentity). Skipping this account." `
+                -Level Warning -Source 'Auth' -Exception $_
+        } else {
+            Write-CVLog "Failed to get AWS account information" -Level Error -Source 'Auth' -Exception $_
+        }
         return $null
     }
 }
@@ -3940,6 +3989,12 @@ function New-OutputArchive {
             }
         }
 
+        # Include the run log so the bundle is self-contained - it is the whole point when a customer sends it
+        # back to explain a failed or partial run.
+        if ($script:LogPath -and (Test-Path -LiteralPath $script:LogPath) -and ($filesToArchive -notcontains $script:LogPath)) {
+            $filesToArchive += $script:LogPath
+        }
+
         if ($filesToArchive.Count -gt 0) {
             Add-Type -AssemblyName System.IO.Compression
             Add-Type -AssemblyName System.IO.Compression.FileSystem
@@ -4057,6 +4112,11 @@ try {
 
     Invoke-AuthenticationScenarios
 
+    # Tear down the live progress bar before the end-of-run output. Show-ScriptProgress only ever UPDATES the
+    # 'aws' bar; without this completion the native Write-Progress pane stays pinned to the terminal, so the
+    # summary/JSON/archive lines below scroll "under" it and get flushed out of order (and overwritten) at exit.
+    if (Get-Command Complete-CVProgress -ErrorAction SilentlyContinue) { Complete-CVProgress -Id 'aws' }
+
     Write-ScriptOutput "=== Processing Summary ===" -Level Success
     Write-ScriptOutput "Accounts processed: $($script:AccountsProcessed.Count)" -Level Info
 
@@ -4074,9 +4134,6 @@ try {
             }
         }
     }
-
-    # Run-wide resilience posture report (per-account scoring already ran before each account's CSV export).
-    Write-AWSResilienceReport -OutputPath $script:Config.OutputPath -DateString $date_string
 
     # ============================================================
     # JSON EXPORT (when OutputFormat is json or both)
@@ -4115,8 +4172,7 @@ try {
         $jsonPath = Export-CVSizingJson -Cloud 'aws' -OutputDir $jsonOutDir `
             -TimeStamp (Get-Date -Format "yyyy-MM-dd_HHmmss") `
             -Metadata ([ordered]@{ accounts = @($script:AccountsProcessed | ForEach-Object { $_.Account }); script_version = "2.2" }) `
-            -Workloads $workloads `
-            -Controls (Get-CVAwsResilienceControls)
+            -Workloads $workloads
         Write-ScriptOutput "JSON sizing report written: $jsonPath" -Level Success
     }
 
