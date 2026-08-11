@@ -610,11 +610,10 @@ function Invoke-ServiceInventory {
 # per-service CSV - matching the GCP and Azure passes. Any signal we could not collect scores as Unknown and
 # is excluded from the score; it never fails the run.
 # ============================================================
-$script:ResilienceResults = New-Object System.Collections.Generic.List[psobject]
-$script:ResilienceGapRows = New-Object System.Collections.Generic.List[psobject]
+$script:ResilienceSignalRows = New-Object System.Collections.Generic.List[psobject]
 
-# Name and size are the only genuinely per-type fields; resource group/region/id are probed by New-CVGapRow.
-$script:AwsGapFields = @{
+# Name and size are the only genuinely per-type fields; resource group/region/id are probed by New-CVSignalRow.
+$script:AwsSignalFields = @{
     EC2      = @{ Name = 'InstanceId';           SizeGB = 'SizeGB' }
     EBS      = @{ Name = 'VolumeId';             SizeGB = 'SizeGB' }
     RDS      = @{ Name = 'DBInstanceIdentifier'; SizeGB = 'SizeGB' }
@@ -659,20 +658,14 @@ function Invoke-AWSResiliencePass {
                 if (-not $row) { continue }
                 # Isolate per-row failures so one problematic resource cannot sink the whole report.
                 try {
-                    $ev = Invoke-CVResilience -Resource $row -Controls $set
-                    foreach ($kv in (ConvertTo-CVResilienceColumns -Evaluation $ev).GetEnumerator()) {
-                        Add-Member -InputObject $row -NotePropertyName $kv.Key -NotePropertyValue $kv.Value -Force
-                    }
-                    foreach ($res in $ev.Results) {
-                        Add-Member -InputObject $res -NotePropertyName ResourceType -NotePropertyValue $setName -Force
-                        $script:ResilienceResults.Add($res)
-                    }
-                    $gr = New-CVGapRow -Resource $row -ResourceType $setName -Evaluation $ev -FieldMap $script:AwsGapFields[$setName]
-                    if ($gr) { $script:ResilienceGapRows.Add($gr) }
+                    # No evaluation: controls declare WHICH fields are signals; thresholds belong to the backend.
+                    if (-not $script:AwsSignalMap) { $script:AwsSignalMap = Get-CVSignalFieldMap -ControlSets (Get-CVAwsResilienceControls) }
+                    $script:ResilienceSignalRows.Add((New-CVSignalRow -Resource $row -ResourceType $setName `
+                        -SignalFields $script:AwsSignalMap[$setName] -FieldMap $script:AwsSignalFields[$setName]))
                 } catch {
                     if (-not $script:ResilienceErrShown) {
                         $script:ResilienceErrShown = $true
-                        Write-CVLog "Resilience evaluation failed on a $setName row" -Level Warning -Source 'Resilience' -Exception $_
+                        Write-CVLog "Signal export failed on a $setName row" -Level Warning -Source 'Resilience' -Exception $_
                     }
                 }
             }
@@ -689,30 +682,23 @@ function Write-AWSResilienceReport {
     if ($SkipResilienceReport) { return }
     try {
         Write-CVSection 'Cyber Resilience Posture'
-        $summary = Get-CVResilienceSummary -Results $script:ResilienceResults
-        if ($null -eq $summary.OverallScore) {
-            Write-CVLog "No resilience controls could be assessed (no eligible resources or signals)." -Level Warning -Source 'Resilience'
-            return
-        }
+        # No score is printed - the export is judgement-free; scoring is the backend's.
         Write-CVLog ("Overall native resilience score: {0}/100  ({1} controls assessed, {2} not assessed)" -f $summary.OverallScore, $summary.Assessed, $summary.Excluded) -Level Success -Source 'Resilience'
         foreach ($cat in $summary.ByCategory) {
             Write-CVLog ("  {0,-14} {1,3}% met ({2}/{3})" -f $cat.Category, $cat.PercentMet, $cat.ControlsMet, $cat.ControlsTotal) -Level Info -Source 'Resilience'
         }
         # One file: every resource with a gap or an incomplete assessment, ranked. The static control catalog and
         # the per-category rollup are no longer written - neither named the resources to go look at.
-        if ($script:ResilienceGapRows.Count) {
-            Sort-CVGapRows -Rows $script:ResilienceGapRows |
-                Export-CVCsv -Path (Join-Path $OutputPath ("aws_resilience_gaps_" + $DateString + ".csv")) `
-                             -PreferredOrder (Get-CVGapReportColumns -ControlSets (Get-CVAwsResilienceControls))
-            $withGaps    = @($script:ResilienceGapRows | Where-Object { $_.Status -eq 'Gap' }).Count
-            $noneAssessed = @($script:ResilienceGapRows | Where-Object { $_.Status -eq 'NotAssessed' }).Count
-$partial      = @($script:ResilienceGapRows | Where-Object { $_.Status -eq 'Gap' -and -not $_.AssessmentComplete }).Count
-            $tbAtRisk    = [math]::Round((@($script:ResilienceGapRows | Where-Object { $_.Status -eq 'Gap' -and $null -ne $_.SizeGB } |
-                                Measure-Object -Property SizeGB -Sum).Sum / 1000), 3)
-            Write-CVLog ("Resilience gaps: {0} resource(s) with at least one gap ({1} TB of sized data); {2} could not be assessed at all; {3} of the flagged resources were only partially assessed." -f $withGaps, $tbAtRisk, $noneAssessed, $partial) -Level Info -Source 'Resilience'
-            Write-ScriptOutput "aws_resilience_gaps_$DateString.csv written to $OutputPath" -Level Success
+        if ($script:ResilienceSignalRows.Count) {
+            Sort-CVSignalRows -Rows $script:ResilienceSignalRows |
+                Export-CVCsv -Path (Join-Path $OutputPath ("aws_resilience_signals_" + $DateString + ".csv")) `
+                             -PreferredOrder (Get-CVSignalColumns -ControlSets (Get-CVAwsResilienceControls)) -KeepDeclaredColumns
+            Write-CVLog ("Resilience signals: {0} resource(s) exported across {1} resource type(s)." -f `
+                         $script:ResilienceSignalRows.Count, @($script:ResilienceSignalRows | Select-Object -ExpandProperty ResourceType -Unique).Count) `
+                        -Level Info -Source 'Resilience'
+            Write-ScriptOutput "aws_resilience_signals_$DateString.csv written to $OutputPath" -Level Success
         } else {
-            Write-CVLog "No resilience gaps found (and nothing left unassessed) - no gap CSV written." -Level Info -Source 'Resilience'
+            Write-CVLog "No resources of an assessed type were found - no signals CSV written." -Level Info -Source 'Resilience'
         }
     } catch {
         Write-CVLog "Resilience report failed: $($_.Exception.Message)" -Level Warning -Source 'Resilience'

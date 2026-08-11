@@ -253,6 +253,7 @@ $cvRequired  = @(
     'CVSizing.Resilience.Azure.ps1'   # Azure control definitions
     'CVSizing.Backup.Azure.ps1'       # Azure backup attribution
     'CVSizing.Metrics.Azure.ps1'      # Azure Monitor metric wrapper
+    'CVSizing.Kubectl.ps1'            # cross-platform kubectl provisioning (Install-CVKubectl, used by AKS)
     'CVSizing.CloudRewind.ps1'        # provider-neutral Cloud Rewind engine
     'CVSizing.CloudRewind.Azure.ps1'  # Azure billable taxonomy + inclusion rules
 )
@@ -548,9 +549,13 @@ function Test-EnvTagMatch {
     return ($EnvTagValues | Where-Object { $_ -ieq $tagVal }).Count -gt 0
 }
   
-# Normalize types  
-if ($Types) {  
-    $Types = $Types | ForEach-Object { $_.Trim().ToUpper() }
+# Normalize types
+if ($Types) {
+    # Split on commas as well as taking the array as given. `pwsh -File script.ps1 -Types VM,SQL` hands the whole
+    # list over as ONE string (unlike `-Command` or a direct call from a session, which bind an array), so every
+    # type came through as the single unmatched value "VM,SQL" - and the error then listed VM and SQL among the
+    # valid types it had just rejected. Splitting here makes all three invocation styles behave the same.
+    $Types = $Types | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim().ToUpper() } | Where-Object { $_ }
     $Selected = @{}
     $invalidTypes = @()
     foreach ($t in $Types) {
@@ -671,7 +676,7 @@ $ResourceTypeModules = @{
     COSMOS         = @('Az.Accounts', 'Az.CosmosDB', 'Az.Monitor')
     AKS            = @('Az.Accounts', 'Az.Aks', 'Az.Resources')
     BACKUP         = @('Az.Accounts', 'Az.RecoveryServices')
-    UNMANAGEDISKS  = @('Az.Accounts', 'Az.Compute')
+    UNMANAGEDDISKS = @('Az.Accounts', 'Az.Compute')
     AVS            = @('Az.Accounts', 'Az.VMware')
 }
 
@@ -809,7 +814,12 @@ foreach ($sub in $subs) {
     if ($Selected.VM) {  
         try {
             Write-Host "Processing Virtual Machines in subscription $($sub.Name)" -ForegroundColor Green
-            $vmList = Get-AzVM
+            # -Status is required for PowerState. Without it the list call returns PSVirtualMachine, which carries
+            # no run-state at all, so the PowerState column was empty on every row this script has ever written.
+            # -Status returns PSVirtualMachineListStatus, verified to be a strict SUPERSET of PSVirtualMachine
+            # (StorageProfile/HardwareProfile/Tags all still present, so disk sizing is unaffected), and it is
+            # still ONE ARM list call - statusOnly=true, not a per-VM instance-view fetch.
+            $vmList = Get-AzVM -Status
             if ($vmList) {
                 $vmCount = 0
                 foreach ($vm in $vmList) {  
@@ -877,7 +887,15 @@ foreach ($sub in $subs) {
                     VMSize         = $vm.HardwareProfile.VmSize  
                     OS             = $vm.StorageProfile.OsDisk.OsType  
                     Region         = $vm.Location
-                    PowerState     = ($vm.Statuses | Where-Object Code -like 'PowerState/*' | Select-Object -First 1 -ExpandProperty DisplayStatus)
+                    # The list form (-Status) exposes PowerState directly as a string ("VM running"); the
+                    # single-VM/instance-view shape exposes it only under Statuses. Handle both rather than
+                    # assuming, and leave it blank - never a guess - if neither is populated.
+                    PowerState     = $(
+                        if ($vm.PSObject.Properties['PowerState'] -and $vm.PowerState) { $vm.PowerState }
+                        elseif ($vm.PSObject.Properties['Statuses']) {
+                            $vm.Statuses | Where-Object Code -like 'PowerState/*' | Select-Object -First 1 -ExpandProperty DisplayStatus
+                        }
+                    )
                     DiskCount      = $diskCount
                     VMDiskSizeGB   = $totalDiskSizeGB
                     # Protection coverage - $null, NOT $false. These are placeholders until the enrichment pass
@@ -1281,24 +1299,29 @@ foreach ($sub in $subs) {
                     Write-Progress -Id 7 -ParentId 1 -Activity "Processing SQL Managed Instances" -Status "Processing SQL MI $sqlMICount of $($sqlMIList.Count) - $sqlMIPercentComplete% complete" -PercentComplete $sqlMIPercentComplete
                     
                     try {
-                        # Get storage metrics for SQL MI
-                        $storageUsedGB = 0
-                        $storageAllocatedGB = 0
-                        $storageUsedMB = 0
+                        # Get storage metrics for SQL MI. $null - not 0 - is the "we did not measure it" value:
+                        # 0 has to keep meaning "measured, and it was zero", same discipline as the backup signals.
+                        $storageUsedGB = $null
+                        $storageAllocatedGB = $null
+                        $storageUsedMB = $null
                         # Binary TiB values computed from MB (1024-based) for clarity
-                        $storageUsedTiBBinary = 0
-                        $storageAllocatedTiBBinary = 0
-                        
+                        $storageUsedTiBBinary = $null
+                        $storageAllocatedTiBBinary = $null
+
                         try {
                             # 48h window: a 1h window returned no datapoints often enough that used-storage
                             # reported 0 for instances that were simply idle.
-                            $storageMetrics = Get-AzMetric -ResourceId $sqlMI.Id -StartTime (Get-Date).ToUniversalTime().AddHours(-(Get-CVAzMetricWindowHours 'storage_space_used_mb')) -MetricNames @("storage_space_used_mb") -AggregationType Maximum -WarningAction SilentlyContinue
-                            
+                            #
+                            # BOTH metric names must be requested. The switch below has always had a
+                            # reserved_storage_mb case, but the request asked for storage_space_used_mb only -
+                            # so that case was unreachable and StorageAllocatedGB was 0 on every row.
+                            $storageMetrics = Get-AzMetric -ResourceId $sqlMI.Id -StartTime (Get-Date).ToUniversalTime().AddHours(-(Get-CVAzMetricWindowHours 'storage_space_used_mb')) -MetricNames @("storage_space_used_mb", "reserved_storage_mb") -AggregationType Maximum -WarningAction SilentlyContinue
+
                             if ($storageMetrics) {
                                 foreach ($metric in $storageMetrics) {
                                     if ($metric.Data -and $metric.Data.Count -gt 0) {
                                         $latestValue = $metric.Data[-1].Maximum
-                                        if (-not $latestValue) { $latestValue = 0 }
+                                        if ($null -eq $latestValue) { continue }   # no datapoint: leave the column blank
                                         switch ($metric.Name.Value) {
                                             "storage_space_used_mb" {
                                                 $valueMiB = [double]$latestValue
@@ -1308,8 +1331,8 @@ foreach ($sub in $subs) {
                                                 $storageUsedGB = [math]::Round($valueBytes / 1000000000.0, 2)
                                                 # Binary TiB (IEC): 1 TiB = 1024^4 bytes
                                                 $storageUsedTiBBinary = [math]::Round($valueBytes / 1099511627776.0, 4)
-                                                                    }
-                                                                    "reserved_storage_mb" {
+                                            }
+                                            "reserved_storage_mb" {
                                                 $valueMiB = [double]$latestValue
                                                 $valueBytes = $valueMiB * 1048576.0
                                                 $storageAllocatedGB = [math]::Round($valueBytes / 1000000000.0, 2)
@@ -1335,10 +1358,12 @@ foreach ($sub in $subs) {
                         $sqlMIObj.Add("StorageUsedMB", $storageUsedMB)
                         $sqlMIObj.Add("StorageUsedGB", $storageUsedGB)
                         $sqlMIObj.Add("StorageUsedTiB", $storageUsedTiBBinary)
-                        $sqlMIObj.Add("StorageUsedTB", [math]::Round($storageUsedGB / 1000, 4))
+                        # $null / 1000 is 0 in PowerShell, so these derived columns need the same guard as their
+                        # source - otherwise TB reads 0 while GB is blank, which is the ambiguity we just removed.
+                        $sqlMIObj.Add("StorageUsedTB", $(if ($null -ne $storageUsedGB) { [math]::Round($storageUsedGB / 1000, 4) }))
                         $sqlMIObj.Add("StorageAllocatedGB", $storageAllocatedGB)
                         $sqlMIObj.Add("StorageAllocatedTiB", $storageAllocatedTiBBinary)
-                        $sqlMIObj.Add("StorageAllocatedTB", [math]::Round($storageAllocatedGB / 1000, 4))
+                        $sqlMIObj.Add("StorageAllocatedTB", $(if ($null -ne $storageAllocatedGB) { [math]::Round($storageAllocatedGB / 1000, 4) }))
                         $sqlMIObj.Add("LicenseType", $sqlMI.LicenseType)
                         $sqlMIObj.Add("State", $sqlMI.State)
                         $sqlMIObj.Add("SubnetId", $sqlMI.SubnetId)
@@ -1436,6 +1461,20 @@ foreach ($sub in $subs) {
                         continue
                     }
 
+                    # db-cmek reads CmkEncrypted, which nothing populated - so the TDE control was blank on every
+                    # SQL row. The TDE protector is a SERVER-level setting (Type: AzureKeyVault | ServiceManaged),
+                    # so it is fetched once here and applied to each of that server's databases below, rather than
+                    # once per database. A failure leaves it $null (Unknown), never $false.
+                    $sqlTdeCmk = $null
+                    try {
+                        $tde = Get-AzSqlServerTransparentDataEncryptionProtector -ResourceGroupName $sqlServer.ResourceGroupName -ServerName $sqlServer.ServerName -ErrorAction Stop
+                        if ($tde -and -not [string]::IsNullOrWhiteSpace("$($tde.Type)")) {
+                            $sqlTdeCmk = [bool]("$($tde.Type)" -match 'KeyVault')
+                        }
+                    } catch {
+                        Write-CVLog "Could not read TDE protector: $($_.Exception.Message)" -Level Warning -Source 'SQL' -Scope @{ Subscription = $sub.Name; Server = $sqlServer.ServerName }
+                    }
+
                     foreach ($sqlDB in $sqlDBs) {
                         # Skip system DBs
                         if ($sqlDB.SkuName -eq 'System') { continue }
@@ -1461,6 +1500,7 @@ foreach ($sub in $subs) {
                         $sqlObj.Add("Region", $sqlDB.Location)
                         $sqlObj.Add("DatabaseId", $sqlDB.DatabaseId)
                         $sqlObj.Add("Status", $sqlDB.Status)
+                        $sqlObj.Add("CmkEncrypted", $sqlTdeCmk)   # server-level TDE protector, resolved above
 
                         # Get allocated and used storage metrics (Maximum over last 24h)
                         $allocatedVal = $null
@@ -1549,11 +1589,17 @@ foreach ($sub in $subs) {
             try {
                 # Get all MySQL flexible servers at subscription level
                 Write-Progress -Id 10 -ParentId 1 -Activity "Discovering MySQL Servers" -Status "Getting MySQL Flexible Servers..." -PercentComplete 25
+                # -Force on the Add-Member calls below is load-bearing. Observed live: "Cannot add a member with
+                # the name ResourceGroupName because a member with that name already exists" - some Az.MySql /
+                # Az.PostgreSql builds already surface that property on the server object. Add-Member throws
+                # rather than warns, and -ErrorAction on the GET does not cover it, so the exception escaped to
+                # the outer catch and ABANDONED MySQL collection for the whole subscription. The run then
+                # reported "Total MySQL Servers found: 0" as though the tenant had none.
                 $mysqlFlexibleServers = Get-AzMySqlFlexibleServer -ErrorAction SilentlyContinue
                 if ($mysqlFlexibleServers) {
                     $allMySQLServers += $mysqlFlexibleServers | ForEach-Object {
-                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Flexible" -PassThru |
-                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -PassThru
+                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Flexible" -Force -PassThru |
+                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -Force -PassThru
                     }
                 }
                 
@@ -1563,8 +1609,8 @@ foreach ($sub in $subs) {
                 $mysqlSingleServers = if (Get-Command Get-AzMySqlServer -ErrorAction SilentlyContinue) { Get-AzMySqlServer -ErrorAction SilentlyContinue } else { $null }
                 if ($mysqlSingleServers) {
                     $allMySQLServers += $mysqlSingleServers | ForEach-Object {
-                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Single" -PassThru |
-                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -PassThru
+                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Single" -Force -PassThru |
+                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -Force -PassThru
                     }
                 }
             } catch {
@@ -1595,6 +1641,13 @@ foreach ($sub in $subs) {
                                 "Version" = $mysqlServer.Version
                                 "FullyQualifiedDomainName" = $mysqlServer.FullyQualifiedDomainName
                                 "BackupRetentionDays" = $mysqlServer.BackupRetentionDays
+                                # Needed by the fx-xregion control, which previously read a field nothing set.
+                                # Property naming varies by Az module version, same as BackupRetentionDay(s) below.
+                                "GeoRedundantBackup" = $(
+                                    if ($mysqlServer.BackupGeoRedundantBackup)      { $mysqlServer.BackupGeoRedundantBackup }
+                                    elseif ($mysqlServer.Backup.GeoRedundantBackup) { $mysqlServer.Backup.GeoRedundantBackup }
+                                    elseif ($mysqlServer.GeoRedundantBackup)        { $mysqlServer.GeoRedundantBackup }
+                                    else { $null })
                                 "StorageSku" = $mysqlServer.StorageSku
                                 "SkuName" = $mysqlServer.SkuName
                             }
@@ -1676,7 +1729,11 @@ foreach ($sub in $subs) {
                                 $mysqlObj.Add("StoragePercent", $null)
                             }
 
-                            
+
+                            # fx-cmek reads this. Probed, not assumed - see Resolve-CVAzureFlexServerCmk for why
+                            # $null (not $false) is correct when the module build exposes no encryption property.
+                            $mysqlObj.Add("CmkEncrypted", (Resolve-CVAzureFlexServerCmk -Server $mysqlServer))
+
                             $MySQLServers += New-Object -TypeName PSObject -Property $mysqlObj
                             Write-Verbose "Added MySQL server $($mysqlServer.Name)"
                         } catch {
@@ -1713,8 +1770,8 @@ foreach ($sub in $subs) {
                 $postgresFlexibleServers = Get-AzPostgreSqlFlexibleServer -ErrorAction SilentlyContinue
                 if ($postgresFlexibleServers) {
                     $allPostgreSQLServers += $postgresFlexibleServers | ForEach-Object {
-                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Flexible" -PassThru |
-                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -PassThru
+                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Flexible" -Force -PassThru |
+                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -Force -PassThru
                     }
                 }
                 
@@ -1724,8 +1781,8 @@ foreach ($sub in $subs) {
                 $postgresSingleServers = if (Get-Command Get-AzPostgreSqlServer -ErrorAction SilentlyContinue) { Get-AzPostgreSqlServer -ErrorAction SilentlyContinue } else { $null }
                 if ($postgresSingleServers) {
                     $allPostgreSQLServers += $postgresSingleServers | ForEach-Object {
-                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Single" -PassThru |
-                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -PassThru
+                        $_ | Add-Member -NotePropertyName "ServerType" -NotePropertyValue "Single" -Force -PassThru |
+                             Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue ($_.Id -split '/')[4] -Force -PassThru
                     }
                 }
             } catch {
@@ -1757,6 +1814,12 @@ foreach ($sub in $subs) {
                                 "FullyQualifiedDomainName" = $postgresServer.FullyQualifiedDomainName
                                 "BackupRetentionDays" = if ($postgresServer.BackupRetentionDays) { $postgresServer.BackupRetentionDays } elseif ($postgresServer.BackupRetentionDay) { $postgresServer.BackupRetentionDay } elseif ($postgresServer.StorageProfileBackupRetentionDay) { $postgresServer.StorageProfileBackupRetentionDay } else { $null }
                                 "SkuName" = $postgresServer.SkuName
+                                # Needed by the fx-xregion control - see the MySQL block above.
+                                "GeoRedundantBackup" = $(
+                                    if ($postgresServer.BackupGeoRedundantBackup)      { $postgresServer.BackupGeoRedundantBackup }
+                                    elseif ($postgresServer.Backup.GeoRedundantBackup) { $postgresServer.Backup.GeoRedundantBackup }
+                                    elseif ($postgresServer.GeoRedundantBackup)        { $postgresServer.GeoRedundantBackup }
+                                    else { $null })
                             }
                             
                             # Get storage size based on server type (different properties for different types)
@@ -1811,7 +1874,10 @@ foreach ($sub in $subs) {
                             } catch {
                                 $postgresObj.Add("StoragePercent", $null)
                             }
-                            
+
+                            # fx-cmek reads this - same probe as MySQL above.
+                            $postgresObj.Add("CmkEncrypted", (Resolve-CVAzureFlexServerCmk -Server $postgresServer))
+
                             $PostgreSQLServers += New-Object -TypeName PSObject -Property $postgresObj
                             Write-Verbose "Added PostgreSQL server $($postgresServer.Name)"
                         } catch {
@@ -1861,7 +1927,7 @@ foreach ($sub in $subs) {
                 try {
                     $cosmosAccountsInRG = Get-AzCosmosDBAccount -ResourceGroupName $rg.ResourceGroupName -ErrorAction SilentlyContinue
                     if ($cosmosAccountsInRG) {
-                        $allCosmosAccounts += $cosmosAccountsInRG | Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue $rg.ResourceGroupName -PassThru
+                        $allCosmosAccounts += $cosmosAccountsInRG | Add-Member -NotePropertyName "ResourceGroupName" -NotePropertyValue $rg.ResourceGroupName -Force -PassThru
                     }
                 } catch {
                     Write-Error "Unable to collect CosmosDB information for Resource Group $($rg.ResourceGroupName) in subscription: $($sub.Name)"
@@ -1894,8 +1960,13 @@ foreach ($sub in $subs) {
                             "BackupPolicyBackupType" = $cosmosAccount.BackupPolicy.BackupType
                             "BackupPolicyBackupStorageRedundancy" = $cosmosAccount.BackupPolicy.BackupStorageRedundancy
                             "MinimalTlsVersion" = $cosmosAccount.MinimalTlsVersion
+                            # cos-cmek reads this. Cosmos signals CMK by carrying a key-vault key URI; a
+                            # service-managed account leaves it empty. The property is always present on the
+                            # account model, so empty here genuinely means "not CMK" rather than "not collected".
+                            "CmkEncrypted" = [bool]$cosmosAccount.KeyVaultKeyUri
+                            "KeyVaultKeyUri" = $cosmosAccount.KeyVaultKeyUri
                         }
-                        
+
                         # Get metrics following the reference file pattern
                         $id = $cosmosAccount.Id
                         
@@ -2191,6 +2262,11 @@ foreach ($sub in $subs) {
                         DiskState       = $disk.DiskState      # Unattached / Attached / Reserved
                         DiskSku         = $disk.Sku.Name
                         OsType          = $disk.OsType
+                        # disk-cmek reads this. Encryption.Type is one of EncryptionAtRestWithPlatformKey /
+                        # WithCustomerKey / WithPlatformAndCustomerKeys - the last two both involve a CMK. Absent
+                        # Encryption block stays $null (Unknown); it is not evidence of platform-key encryption.
+                        CmkEncrypted    = $(if (-not $disk.Encryption) { $null } else { [bool]("$($disk.Encryption.Type)" -match 'CustomerKey') })
+                        DiskEncryptionSetId = $disk.Encryption.DiskEncryptionSetId
                         AttachedToVM    = if ($disk.ManagedBy) { ($disk.ManagedBy -split '/')[-1] } else { 'Unattached' }
                         CreationTime    = $disk.TimeCreated
                     }
@@ -2331,7 +2407,6 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
   try {
     Write-CVSection 'Cyber Resilience Posture'
     $azControls   = Get-CVAzureResilienceControls
-    $resilResults = New-Object System.Collections.Generic.List[psobject]
 
     # Storage posture signals are collected inside the subscription loop now (see the storage block above), where
     # the Az context already points at the right subscription. The post-loop pass that used to live here re-fetched
@@ -2352,8 +2427,8 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         @{ Type='AKS';       Set=$azControls.AKS;       Rows=@($AKSClusters) }
     )
     # Name and size are the only fields that differ meaningfully per type; resource group, region and resource id
-    # are probed from candidate lists inside New-CVGapRow.
-    $azGapFields = @{
+    # are probed from candidate lists inside New-CVSignalRow.
+    $azSignalFields = @{
         VM        = @{ Name = 'VMName';         SizeGB = 'VMDiskSizeGB' }
         Disk      = @{ Name = 'DiskName';       SizeGB = 'DiskSizeGB' }
         Storage   = @{ Name = 'StorageAccount'; SizeGB = 'UsedCapacityGB' }
@@ -2363,55 +2438,45 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         FileShare = @{ Name = 'Name';           SizeGB = 'UsedCapacityGB'; Parent = 'StorageAccount' }
         AKS       = @{ Name = 'ClusterName';    SizeGB = 'PersistentVolumeCapacityGB' }
     }
-    $gapRows = New-Object System.Collections.Generic.List[psobject]
+    # Signal fields per resource type, derived from the control definitions so the export cannot drift.
+    $azSignalMap = Get-CVSignalFieldMap -ControlSets $azControls
+    $signalRows  = New-Object System.Collections.Generic.List[psobject]
     $resilShownErr = $false
     foreach ($c in $collections) {
         if (-not $c.Set) { continue }
         foreach ($row in $c.Rows) {
             if (-not $row) { continue }
             try {
-                $ev = Invoke-CVResilience -Resource $row -Controls $c.Set
-                foreach ($kv in (ConvertTo-CVResilienceColumns -Evaluation $ev).GetEnumerator()) {
-                    Add-Member -InputObject $row -NotePropertyName $kv.Key -NotePropertyValue $kv.Value -Force
-                }
-                foreach ($res in $ev.Results) {
-                    Add-Member -InputObject $res -NotePropertyName ResourceType -NotePropertyValue $c.Type -Force
-                    $resilResults.Add($res)
-                }
-                $gr = New-CVGapRow -Resource $row -ResourceType $c.Type -Evaluation $ev -FieldMap $azGapFields[$c.Type]
-                if ($gr) { $gapRows.Add($gr) }
+                # No evaluation. The controls are consulted only for WHICH fields are signals (via
+                # Get-CVSignalFieldMap); their pass/fail thresholds are the backend's to apply. Nothing is written
+                # back onto the inventory row either - Ctl_*/ResilienceScore/ResilienceGaps used to be added here,
+                # which put our verdicts on the per-service CSVs and contradicted the judgement-free export.
+                $signalRows.Add((New-CVSignalRow -Resource $row -ResourceType $c.Type `
+                                    -SignalFields $azSignalMap[$c.Type] -FieldMap $azSignalFields[$c.Type]))
             } catch {
                 if (-not $resilShownErr) {
                     $resilShownErr = $true
-                    Write-Host ("[Resilience] eval error on a $($c.Type) row: $($_.Exception.GetType().Name): $($_.Exception.Message) :: " + ($_.ScriptStackTrace -replace "`r?`n", ' <- ')) -ForegroundColor DarkYellow
+                    Write-Host ("[Resilience] signal export error on a $($c.Type) row: $($_.Exception.GetType().Name): $($_.Exception.Message)") -ForegroundColor DarkYellow
                 }
             }
         }
     }
 
-    $resilSummary = Get-CVResilienceSummary -Results $resilResults
-    if ($null -ne $resilSummary.OverallScore) {
-        Write-CVLog ("Overall native resilience score: {0}/100  ({1} controls assessed, {2} not assessed)" -f $resilSummary.OverallScore, $resilSummary.Assessed, $resilSummary.Excluded) -Level Success -Source 'Resilience'
-        foreach ($cat in $resilSummary.ByCategory) { Write-CVLog ("  {0,-14} {1,3}% met ({2}/{3})" -f $cat.Category, $cat.PercentMet, $cat.ControlsMet, $cat.ControlsTotal) -Level Info -Source 'Resilience' }
+    # No score is printed. A score is a judgement, and an on-screen "0/100" invites an SE to quote it - which was
+    # exactly the trap where a storage account with 1 of 6 controls assessable scored 100. What is reported below
+    # is countable fact: how many resources were exported and how completely they were measured.
+    if ($signalRows.Count) {
+        # Judgement-free export: the VALUES the controls evaluate, not our verdicts about them. -KeepDeclaredColumns
+        # fixes the header across runs and scopes so a machine consumer sees one stable schema.
+        Sort-CVSignalRows -Rows $signalRows |
+            Export-CVCsv -Path (Join-Path $outdir ("azure_resilience_signals_$dateStr.csv")) `
+                         -PreferredOrder (Get-CVSignalColumns -ControlSets $azControls) -KeepDeclaredColumns
+        Write-CVLog ("Resilience signals: {0} resource(s) exported across {1} resource type(s)." -f `
+                     $signalRows.Count, @($signalRows | Select-Object -ExpandProperty ResourceType -Unique).Count) `
+                    -Level Info -Source 'Resilience'
+        Write-Host "azure_resilience_signals_$dateStr.csv written to $outdir" -ForegroundColor Cyan
     } else {
-        Write-CVLog "No resilience controls could be assessed (no eligible resources or signals)." -Level Warning -Source 'Resilience'
-    }
-
-    # One file: every resource with a gap or an incomplete assessment, ranked. The control catalog (a static
-    # legend) and the per-category rollup are no longer written - the catalog said nothing about the estate, and
-    # the category percentages are in the console summary above and derivable from GapCategories here.
-    if ($gapRows.Count) {
-        Sort-CVGapRows -Rows $gapRows | Export-CVCsv -Path (Join-Path $outdir ("azure_resilience_gaps_$dateStr.csv")) `
-            -PreferredOrder (Get-CVGapReportColumns -ControlSets $azControls)
-        $withGaps    = @($gapRows | Where-Object { $_.Status -eq 'Gap' }).Count
-        $noneAssessed = @($gapRows | Where-Object { $_.Status -eq 'NotAssessed' }).Count
-$partial      = @($gapRows | Where-Object { $_.Status -eq 'Gap' -and -not $_.AssessmentComplete }).Count
-        $tbAtRisk    = [math]::Round((@($gapRows | Where-Object { $_.Status -eq 'Gap' -and $null -ne $_.SizeGB } |
-                            Measure-Object -Property SizeGB -Sum).Sum / 1000), 3)
-        Write-CVLog ("Resilience gaps: {0} resource(s) with at least one gap ({1} TB of sized data); {2} could not be assessed at all; {3} of the flagged resources were only partially assessed." -f $withGaps, $tbAtRisk, $noneAssessed, $partial) -Level Info -Source 'Resilience'
-        Write-Host "azure_resilience_gaps_$dateStr.csv written to $outdir" -ForegroundColor Cyan
-    } else {
-        Write-CVLog "No resilience gaps found (and nothing left unassessed) - no gap CSV written." -Level Info -Source 'Resilience'
+        Write-CVLog "No resources of an assessed type were found - no signals CSV written." -Level Info -Source 'Resilience'
     }
   } catch {
     Write-CVLog "Resilience report failed: $($_.Exception.Message)" -Level Warning -Source 'Resilience'
@@ -3673,8 +3738,15 @@ if (($OutputFormat -eq "json" -or $OutputFormat -eq "both") -and -not $SkipDataP
     if ($StorageAccounts)   { $allWorkloads["azure_storage"]        = @($StorageAccounts) }
     if ($FileShares)        { $allWorkloads["azure_file_shares"]    = @($FileShares) }
     if ($NetAppVolumes)     { $allWorkloads["azure_netapp"]         = @($NetAppVolumes) }
-    if ($SQLDatabases)      { $allWorkloads["azure_sql"]            = @($SQLDatabases) }
-    if ($CosmosAccounts)    { $allWorkloads["azure_cosmos"]         = @($CosmosAccounts) }
+    # These names must match the collections declared at :757-775. They previously read $SQLDatabases /
+    # $CosmosAccounts, which are assigned nowhere - and because each read is `if`-guarded, that failed silently:
+    # azure_sql and azure_cosmos were simply absent from every JSON this script has ever written.
+    if ($SqlDbInventory)         { $allWorkloads["azure_sql"]           = @($SqlDbInventory) }
+    if ($SqlInstancesInventory)  { $allWorkloads["azure_sql_mi"]        = @($SqlInstancesInventory) }
+    if ($SqlMIDbInventory)       { $allWorkloads["azure_sql_mi_dbs"]    = @($SqlMIDbInventory) }
+    if ($MySQLServers)           { $allWorkloads["azure_mysql"]         = @($MySQLServers) }
+    if ($PostgreSQLServers)      { $allWorkloads["azure_postgresql"]    = @($PostgreSQLServers) }
+    if ($CosmosDBs)              { $allWorkloads["azure_cosmos"]        = @($CosmosDBs) }
     if ($AKSClusters)       { $allWorkloads["azure_aks"]            = @($AKSClusters) }
     if ($BackupItems)       { $allWorkloads["azure_backup"]         = @($BackupItems) }
     if ($UnmanagedDiskItems){ $allWorkloads["azure_disks"]          = @($UnmanagedDiskItems) }
@@ -3684,7 +3756,7 @@ if (($OutputFormat -eq "json" -or $OutputFormat -eq "both") -and -not $SkipDataP
         metadata = @{
             cloud            = "azure"
             tenant_id        = (Get-AzContext).Tenant.Id
-            subscriptions    = @($allSubscriptions | ForEach-Object { $_.Id })
+            subscriptions    = @($subs | ForEach-Object { $_.Id })
             generated_at     = (Get-Date -Format "o")
             script_version   = "2.0"
             env_tag_name     = $EnvTagName

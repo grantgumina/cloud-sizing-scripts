@@ -262,7 +262,11 @@ function Export-CVCsv {
         [Parameter(Mandatory)][string]$Path,
         [string[]]$PreferredOrder,
         [switch]$Append,
-        [switch]$NoHeaderOnEmpty
+        [switch]$NoHeaderOnEmpty,
+        # Emit every name in -PreferredOrder even when no row carries it, so the header is identical between runs
+        # and scopes. Machine consumers want a fixed schema; a human reading a gap list wants a narrow file, which
+        # is why absent columns are dropped by default.
+        [switch]$KeepDeclaredColumns
     )
     begin { $rows = [System.Collections.Generic.List[psobject]]::new() }
     process {
@@ -293,10 +297,14 @@ function Export-CVCsv {
                 if (-not $keys.Contains($n)) { $keys[$n] = $true }
             }
         }
-        # Drop preferred names that no row actually has, so we do not invent empty columns.
-        $present = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-        foreach ($r in $rows) { foreach ($n in $r.PSObject.Properties.Name) { [void]$present.Add($n) } }
-        $ordered = @($keys.Keys | Where-Object { $present.Contains($_) })
+        if ($KeepDeclaredColumns) {
+            $ordered = @($keys.Keys)
+        } else {
+            # Drop preferred names that no row actually has, so we do not invent empty columns.
+            $present = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($r in $rows) { foreach ($n in $r.PSObject.Properties.Name) { [void]$present.Add($n) } }
+            $ordered = @($keys.Keys | Where-Object { $present.Contains($_) })
+        }
 
         $rows | Select-Object -Property $ordered | Export-Csv -Path $Path -NoTypeInformation -Append:$Append
     }

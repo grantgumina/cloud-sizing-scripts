@@ -98,8 +98,10 @@ function Get-CVAwsResilienceControls {
         New-CVControl -Id 'rs-encrypted'  -Title 'Cluster encrypted at rest'                   -Category DataExposure  -Severity High     -Test { param($r) Get-CVTri $r.Encrypted }
         New-CVControl -Id 'rs-retention'  -Title 'Automated snapshot retention >= 7 days'      -Category RecoveryReady -Severity High     -Test {
             param($r)
-            if ($null -eq $r.AutomatedSnapshotRetentionPeriod) { return $null }
-            [bool]([int]$r.AutomatedSnapshotRetentionPeriod -ge 7)
+            # The Redshift row names this AutomatedSnapshotRetentionDays; this control was written against the
+            # raw AWS API property name (…Period), which the row does not carry, so it never evaluated.
+            if ($null -eq $r.AutomatedSnapshotRetentionDays) { return $null }
+            [bool]([int]$r.AutomatedSnapshotRetentionDays -ge 7)
         }
     )
 

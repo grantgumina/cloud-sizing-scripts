@@ -52,6 +52,25 @@ Assert-CV 'fs-xregion Met'   (Outcome $e 'fs-xregion') 'Met'
 Assert-CV 'fs-encrypted Met' (Outcome $e 'fs-encrypted') 'Met'
 Assert-CV 'fs-backup Unknown' (Outcome $e 'fs-backup') 'Unknown'
 
+Write-Host "`n[5b] Resolve-CVAzureFlexServerCmk - tri-state over inconsistent module shapes"
+# Az.MySql / Az.PostgreSql surface data encryption differently per version, and the versions installed here
+# surface it not at all. The resolver must probe, and must return $null (not $false) when nothing is exposed -
+# reporting 'platform key' for a server we could not read is the fabricated-gap failure mode.
+Assert-CV 'flattened AzureKeyVault -> true'   (Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ DataEncryptionType='AzureKeyVault' })) $true
+Assert-CV 'flattened SystemManaged -> false'  (Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ DataEncryptionType='SystemManaged' })) $false
+Assert-CV 'nested .Type AzureKeyVault -> true' (Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ DataEncryption=[pscustomobject]@{ Type='AzureKeyVault' } })) $true
+Assert-CV 'nested .Type SystemManaged -> false' (Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ DataEncryption=[pscustomobject]@{ Type='SystemManaged' } })) $false
+Assert-CV 'flattened key URI alone -> true'   (Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ DataEncryptionPrimaryKeyUri='https://kv.vault.azure.net/keys/k/1' })) $true
+Assert-CV 'nested key URI alone -> true'      (Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ DataEncryption=[pscustomobject]@{ PrimaryKeyUri='https://kv.vault.azure.net/keys/k/1' } })) $true
+# The cases that must stay Unknown:
+Assert-CV 'no encryption property -> null'    ($null -eq (Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ Name='srv1'; StorageGB=128 }))) $true
+Assert-CV 'empty type string -> null'         ($null -eq (Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ DataEncryptionType='' })))       $true
+Assert-CV 'whitespace type -> null'           ($null -eq (Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ DataEncryptionType='   ' })))    $true
+Assert-CV 'null server -> null'               ($null -eq (Resolve-CVAzureFlexServerCmk -Server $null))                                              $true
+# And the control built on it agrees.
+Assert-CV 'fx-cmek unreadable -> Unknown' (Outcome (Invoke-CVResilience -Resource ([pscustomobject]@{ CmkEncrypted=(Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ Name='srv1' })) }) -Controls $ctl.FlexDB) 'fx-cmek') 'Unknown'
+Assert-CV 'fx-cmek CMK -> Met'            (Outcome (Invoke-CVResilience -Resource ([pscustomobject]@{ CmkEncrypted=(Resolve-CVAzureFlexServerCmk -Server ([pscustomobject]@{ DataEncryptionType='AzureKeyVault' })) }) -Controls $ctl.FlexDB) 'fx-cmek') 'Met'
+
 Write-Host "`n[6] Empty environment + no Clean Recovery controls"
 Assert-CV 'empty summary null'  ($null -eq (Get-CVResilienceSummary -Results @()).OverallScore) $true
 $cats = ($ctl.Values | ForEach-Object { $_ } | ForEach-Object { $_.Category }) | Sort-Object -Unique

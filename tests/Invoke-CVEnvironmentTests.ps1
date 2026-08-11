@@ -114,6 +114,117 @@ foreach ($f in @('CVAzureCloudSizingScript.ps1','CVAWSCloudSizingScript.ps1','CV
     Assert-CV "$f guards its dot-sources" ([bool]($body -match '\$cvMissing\s*=' -and $body -match 'Test-Path -LiteralPath \(Join-Path \$cvCommonDir')) $true
 }
 
+# Add-Member THROWS on an existing member rather than warning, and -ErrorAction on a preceding cmdlet does not
+# cover it. Observed live: Az.MySql already surfaced ResourceGroupName, so the throw escaped to the enclosing
+# catch and abandoned MySQL collection for the whole subscription - reported as "0 servers found".
+$addMemberOffenders = @(Get-ChildItem -Path $srcRoot -Recurse -Filter *.ps1 | ForEach-Object {
+    $lines = Get-Content $_.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -match 'Add-Member' -and $lines[$i] -match 'NotePropertyName' -and $lines[$i] -notmatch '-Force') {
+            "$($_.Name):$($i + 1)"
+        }
+    }
+})
+Assert-CV 'every Add-Member -NotePropertyName passes -Force' $addMemberOffenders.Count 0
+if ($addMemberOffenders.Count) { $addMemberOffenders | ForEach-Object { Write-Host "        $_" -ForegroundColor DarkYellow } }
+
+Write-Host "`n[7b] Every shared CV command a script calls is in that script's own `$cvRequired"
+<#
+    The defect this catches: the Azure script called Install-CVKubectl while CVSizing.Kubectl.ps1 was absent from
+    its $cvRequired list (AWS and GCP both had it). Dot-sourcing is per-script, so the call raised
+    CommandNotFoundException mid-inventory - invisible until someone ran -Types AKS on a machine without kubectl.
+
+    For each cloud script: collect the CV* commands it invokes, collect the commands defined by the common files
+    it actually dot-sources, and require the first set to be covered by the second.
+#>
+$commonRoot = Join-Path $srcRoot 'common'
+# command name -> defining file, across all of src/common/
+$cvDefinedIn = @{}
+foreach ($cf in Get-ChildItem -Path $commonRoot -Filter *.ps1) {
+    $cfAst = [System.Management.Automation.Language.Parser]::ParseFile($cf.FullName, [ref]$null, [ref]$null)
+    $cfAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+        ForEach-Object { $cvDefinedIn[$_.Name] = $cf.Name }
+}
+Assert-CV 'common/ function index built' ([bool]($cvDefinedIn.Count -ge 30)) $true
+
+foreach ($f in @('CVAzureCloudSizingScript.ps1','CVAWSCloudSizingScript.ps1','CVGoogleCloudSizingScript.ps1')) {
+    $path   = Join-Path $srcRoot $f
+    $body   = Get-Content -Raw $path
+    $fAst   = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null)
+
+    # The files this script dot-sources, read from its own $cvRequired literal.
+    $required = @([regex]::Matches($body, "'(CVSizing\.[A-Za-z0-9.]+\.ps1)'") | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+    Assert-CV "$f declares a non-empty `$cvRequired" ([bool]$required.Count) $true
+
+    # Commands it defines itself don't need to come from common/.
+    $selfDefined = @($fAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true) |
+                        ForEach-Object { $_.Name })
+
+    $called = @($fAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true) |
+                    ForEach-Object { $_.GetCommandName() } |
+                    Where-Object { $_ -and $_ -match '^(Get|Set|New|Write|Add|Install|Initialize|Assert|Test|Resolve|Export|Convert|ConvertTo|ConvertFrom|Update|Start|Complete|Reset|Receive|Sort|Invoke|Measure)-CV' } |
+                    Sort-Object -Unique)
+
+    $unsourced = @($called | Where-Object {
+        $_ -notin $selfDefined -and $cvDefinedIn.ContainsKey($_) -and $cvDefinedIn[$_] -notin $required
+    })
+    Assert-CV "$f dot-sources every CV command it calls" $unsourced.Count 0
+    if ($unsourced.Count) {
+        $unsourced | ForEach-Object {
+            Write-Host ("        {0} is defined in {1}, which {2} does not dot-source" -f $_, $cvDefinedIn[$_], $f) -ForegroundColor DarkYellow
+        }
+    }
+}
+
+Write-Host "`n[7c] Azure's module-requirement map is keyed by real canonical -Types keys"
+<#
+    The defect this catches: the module map said UNMANAGEDISKS (one D) while every gate used UNMANAGEDDISKS, so
+    Az.Compute was never imported for -Types UnmanagedDisks and the collection failed on a clean session. A key
+    that matches no canonical type is dead weight; a canonical type with no key imports no modules.
+#>
+$azAstEnv = [System.Management.Automation.Language.Parser]::ParseFile(
+                (Join-Path $srcRoot 'CVAzureCloudSizingScript.ps1'), [ref]$null, [ref]$null)
+
+function Get-CVHashtableKeys {
+    <# .SYNOPSIS  Keys of the hashtable literal assigned to $<Variable>, quotes stripped. #>
+    param([string]$Variable)
+    $keys = @()
+    $azAstEnv.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
+        Where-Object { $_.Left.Extent.Text -eq "`$$Variable" } | ForEach-Object {
+            $ht = $_.Right.Find({ param($n) $n -is [System.Management.Automation.Language.HashtableAst] }, $true)
+            if ($ht) { $keys += @($ht.KeyValuePairs | ForEach-Object { $_.Item1.Extent.Text -replace '^[''"]|[''"]$', '' }) }
+        }
+    return @($keys | Sort-Object -Unique)
+}
+
+$canonical = Get-CVHashtableKeys 'ResourceTypeMap'
+$mapKeys   = Get-CVHashtableKeys 'ResourceTypeModules'
+$aliasKeys = Get-CVHashtableKeys 'TypeAliases'
+Assert-CV 'canonical -Types keys discovered' ([bool]($canonical.Count -ge 8)) $true
+Assert-CV 'module-map keys discovered'       ([bool]($mapKeys.Count   -ge 8)) $true
+
+# A module-map key matching no canonical type imports nothing for anybody (this was UNMANAGEDISKS).
+$orphanKeys = @($mapKeys | Where-Object { $_ -notin $canonical })
+Assert-CV 'no module-map key that is not a canonical -Types key' $orphanKeys.Count 0
+if ($orphanKeys.Count) { Write-Host "        orphan keys (typo?): $($orphanKeys -join ', ')" -ForegroundColor DarkYellow }
+
+# And the reverse: a canonical type with no module entry silently imports no Az module for that type.
+$typesMissingModules = @($canonical | Where-Object { $_ -notin $mapKeys })
+Assert-CV 'every canonical -Types key has a module entry' $typesMissingModules.Count 0
+if ($typesMissingModules.Count) { Write-Host "        no modules declared for: $($typesMissingModules -join ', ')" -ForegroundColor DarkYellow }
+
+# Aliases must resolve to canonical keys, not to each other or to nothing.
+$aliasTargets = @()
+$azAstEnv.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
+    Where-Object { $_.Left.Extent.Text -eq '$TypeAliases' } | ForEach-Object {
+        $ht = $_.Right.Find({ param($n) $n -is [System.Management.Automation.Language.HashtableAst] }, $true)
+        if ($ht) { $aliasTargets += @($ht.KeyValuePairs | ForEach-Object { $_.Item2.Extent.Text -replace '^[''"]|[''"]$', '' }) }
+    }
+$badAliases = @($aliasTargets | Where-Object { $_ -notin $canonical } | Sort-Object -Unique)
+Assert-CV 'every -Types alias resolves to a canonical key' $badAliases.Count 0
+if ($badAliases.Count) { Write-Host "        aliases pointing nowhere: $($badAliases -join ', ')" -ForegroundColor DarkYellow }
+Assert-CV 'the historical UNMANAGEDISKS typo is still accepted as an alias' ([bool]('UNMANAGEDISKS' -in $aliasKeys)) $true
+
 Write-Host "`n[8] Output root is deterministic, not CWD-derived"
 . (Join-Path $PSScriptRoot '..' 'src' 'common' 'CVSizing.Console.ps1')
 $noRepo = Join-Path ([IO.Path]::GetTempPath()) ("cv-norepo-" + [guid]::NewGuid().ToString('N').Substring(0,8))

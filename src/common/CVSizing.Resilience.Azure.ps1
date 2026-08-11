@@ -18,6 +18,42 @@
 # Azure Storage/File SKU encodes geo-redundancy: *GRS / *RAGRS / *GZRS / *RAGZRS replicate cross-region; LRS/ZRS don't.
 function Test-CVAzureGeoSku { param([string]$Sku) if ([string]::IsNullOrWhiteSpace($Sku)) { return $null } return [bool]($Sku -match 'GRS|GZRS') }
 
+# Backup/redundancy fields report a word rather than a SKU: Local | Zone | Geo | GeoZone. Blank/absent must stay
+# $null (Unknown) - "we did not read it" is not "it is local-only".
+function Test-CVAzureGeoRedundancy { param([string]$Value) if ([string]::IsNullOrWhiteSpace($Value)) { return $null } return [bool]($Value -match 'Geo') }
+
+function Resolve-CVAzureFlexServerCmk {
+    <#
+      .SYNOPSIS  Tri-state CMK verdict for a MySQL/PostgreSQL Flexible Server object.
+      .DESCRIPTION
+        Az.MySql / Az.PostgreSql expose data encryption differently across versions - flattened
+        (DataEncryptionType) on some, nested (DataEncryption.Type) on others, and NOT AT ALL on others: the
+        versions installed here surface no encryption property on the server model whatsoever.
+
+        So this probes rather than assumes, and returns $null when no candidate property exists. That matters:
+        a server whose module build cannot report encryption is Unknown, not "platform-key encrypted". Reporting
+        $false there would be exactly the fabricated-gap failure this codebase keeps having to undo.
+      .OUTPUTS  $true (CMK) | $false (service/system-managed) | $null (module does not expose it)
+    #>
+    [CmdletBinding()]
+    param($Server)
+    if (-not $Server) { return $null }
+
+    # A key URI is only ever present for CMK, so finding one is conclusive.
+    $uri = Get-CVFirstProperty -Resource $Server -Name @('DataEncryptionPrimaryKeyUri','DataEncryptionPrimaryKeyURI')
+    if (-not $uri -and $Server.PSObject.Properties['DataEncryption']) {
+        $uri = Get-CVFirstProperty -Resource $Server.DataEncryption -Name @('PrimaryKeyUri','PrimaryKeyURI','PrimaryUserAssignedIdentityId')
+    }
+    if ($uri) { return $true }
+
+    $type = Get-CVFirstProperty -Resource $Server -Name @('DataEncryptionType')
+    if (-not $type -and $Server.PSObject.Properties['DataEncryption']) {
+        $type = Get-CVFirstProperty -Resource $Server.DataEncryption -Name @('Type')
+    }
+    if ([string]::IsNullOrWhiteSpace("$type")) { return $null }   # property absent -> Unknown, never a gap
+    return [bool]("$type" -match 'KeyVault|Customer')
+}
+
 function Get-CVAzureResilienceControls {
     <# .OUTPUTS  hashtable: ResourceType -> [CVControl[]] #>
     [CmdletBinding()] param()
@@ -29,7 +65,6 @@ function Get-CVAzureResilienceControls {
     )
 
     $disk = @(
-        New-CVControl -Id 'disk-schedule' -Title 'Automated snapshot/backup schedule configured' -Category RecoveryReady -Severity High -Test { param($r) Get-CVTri $r.HasBackupSchedule }
         New-CVControl -Id 'disk-cmek'     -Title 'Encrypted with a customer-managed key'          -Category DataExposure   -Severity High -Test { param($r) Get-CVTri $r.CmkEncrypted }
     )
 
@@ -53,7 +88,13 @@ function Get-CVAzureResilienceControls {
             [bool](([int]$r.PITR_Days -ge 35) -or $ltrSet)
         }
         New-CVControl -Id 'db-pitr'    -Title 'Point-in-time recovery enabled'      -Category RecoveryReady -Severity High -Test { param($r) if ($null -eq $r.PITR_Days) { $null } else { [bool]([int]$r.PITR_Days -gt 0) } }
-        New-CVControl -Id 'db-xregion' -Title 'Geo-redundant backup / geo-replica'  -Category Availability   -Severity High -Test { param($r) Get-CVTri $r.GeoRedundant }
+        New-CVControl -Id 'db-xregion' -Title 'Geo-redundant backup storage'        -Category Availability   -Severity High -Test {
+            param($r)
+            # BackupStorageRedundancy (Local|Zone|Geo|GeoZone) is collected on the SQL DB row. This previously read
+            # a GeoRedundant field that nothing ever set, so the control never evaluated. Retitled because it
+            # measures backup storage redundancy, not the presence of a geo-replica.
+            Test-CVAzureGeoRedundancy "$($r.BackupStorageRedundancy)"
+        }
         New-CVControl -Id 'db-cmek'    -Title 'TDE with a customer-managed key'      -Category DataExposure   -Severity High -Test { param($r) Get-CVTri $r.CmkEncrypted }
         New-CVControl -Id 'db-delprot' -Title 'Deletion protection (resource lock)'  -Category Immutability    -Severity High -Test { param($r) Get-CVTri $r.DeletionProtected }
     )
@@ -61,14 +102,32 @@ function Get-CVAzureResilienceControls {
     # MySQL / PostgreSQL Flexible Server.
     $flexdb = @(
         New-CVControl -Id 'fx-retention' -Title 'Backup retention >= 35 days'        -Category RecoveryReady -Severity High -Test { param($r) if ($null -eq $r.BackupRetentionDays) { $null } else { [bool]([int]$r.BackupRetentionDays -ge 35) } }
-        New-CVControl -Id 'fx-xregion'   -Title 'Geo-redundant backup'               -Category Availability   -Severity High -Test { param($r) Get-CVTri $r.GeoRedundant }
+        New-CVControl -Id 'fx-xregion'   -Title 'Geo-redundant backup'               -Category Availability   -Severity High -Test {
+            param($r)
+            # GeoRedundantBackup is now collected on the MySQL/PostgreSQL rows ('Enabled' | 'Disabled'). This read
+            # a GeoRedundant field that nothing set.
+            if ([string]::IsNullOrWhiteSpace("$($r.GeoRedundantBackup)")) { return $null }
+            [bool]("$($r.GeoRedundantBackup)" -match '^(Enabled|True)$')
+        }
         New-CVControl -Id 'fx-cmek'      -Title 'Encrypted with a customer-managed key' -Category DataExposure -Severity High -Test { param($r) Get-CVTri $r.CmkEncrypted }
     )
 
     # Cosmos DB (NoSQL / document).
     $cosmos = @(
-        New-CVControl -Id 'cos-pitr'    -Title 'Continuous backup / PITR enabled'       -Category RecoveryReady -Severity Critical -Test { param($r) Get-CVTri $r.ContinuousBackup }
-        New-CVControl -Id 'cos-xregion' -Title 'Geo-redundant / multi-region'           -Category Availability   -Severity High     -Test { param($r) Get-CVTri $r.GeoRedundant }
+        New-CVControl -Id 'cos-pitr'    -Title 'Continuous backup / PITR enabled'       -Category RecoveryReady -Severity Critical -Test {
+            param($r)
+            # Reads BackupPolicyBackupType ('Periodic' | 'Continuous'), which is what the inventory collects.
+            # It previously read a ContinuousBackup field that nothing ever set, so this never evaluated.
+            if ([string]::IsNullOrWhiteSpace("$($r.BackupPolicyBackupType)")) { return $null }
+            [bool]("$($r.BackupPolicyBackupType)" -match 'Continuous')
+        }
+        New-CVControl -Id 'cos-xregion' -Title 'Geo-redundant backup storage'           -Category Availability   -Severity High     -Test {
+            param($r)
+            # Retitled from 'Geo-redundant / multi-region': BackupPolicyBackupStorageRedundancy is what we collect,
+            # and it describes BACKUP storage, not the account's read-region topology. Continuous-backup accounts
+            # legitimately report nothing here, which stays Unknown rather than a gap.
+            Test-CVAzureGeoRedundancy "$($r.BackupPolicyBackupStorageRedundancy)"
+        }
         New-CVControl -Id 'cos-cmek'    -Title 'Encrypted with a customer-managed key'  -Category DataExposure   -Severity Critical -Test { param($r) Get-CVTri $r.CmkEncrypted }
         New-CVControl -Id 'cos-delprot' -Title 'Deletion protection (resource lock)'    -Category Immutability   -Severity High     -Test { param($r) Get-CVTri $r.DeletionProtected }
     )

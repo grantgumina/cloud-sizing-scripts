@@ -2765,7 +2765,6 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
   try {
     Write-CVSection 'Cyber Resilience Posture'
     $gcpControls  = Get-CVGcpResilienceControls
-    $resilResults = New-Object System.Collections.Generic.List[psobject]
 
     # Snapshot-derived signals (presence + cross-region) per source disk, from data already collected.
     $snapByDisk = @{}
@@ -2873,8 +2872,8 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         @{ Type='Filestore'; Set=$gcpControls.Filestore; Rows=@($invResults.FilestoreInstances) }
         @{ Type='GKE';       Set=$gcpControls.GKE;       Rows=@($invResults.GKEClusters) }
     )
-    # Name and size are the only genuinely per-type fields; resource group/region/id are probed by New-CVGapRow.
-    $gcpGapFields = @{
+    # Name and size are the only genuinely per-type fields; resource group/region/id are probed by New-CVSignalRow.
+    $gcpSignalFields = @{
         Database  = @{ Name = 'InstanceName';  SizeGB = 'StorageGB' }
         VM        = @{ Name = 'VMName';        SizeGB = 'VMDiskSizeGB' }
         Disk      = @{ Name = 'DiskName';      SizeGB = 'SizeGB' }
@@ -2882,7 +2881,8 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         Filestore = @{ Name = 'ShareName';     SizeGB = 'CapacityGB'; Parent = 'InstanceName' }
         GKE       = @{ Name = 'ClusterName';   SizeGB = 'PersistentVolumeCapacityGB' }
     }
-    $gapRows = New-Object System.Collections.Generic.List[psobject]
+    $gcpSignalMap = Get-CVSignalFieldMap -ControlSets $gcpControls
+    $signalRows   = New-Object System.Collections.Generic.List[psobject]
     $resilShownErr = $false
     foreach ($c in $collections) {
         if (-not $c.Set) { continue }
@@ -2890,48 +2890,33 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
             if (-not $row) { continue }
             # Isolate per-row failures so one problematic resource can't sink the whole report.
             try {
-                $ev = Invoke-CVResilience -Resource $row -Controls $c.Set
-                foreach ($kv in (ConvertTo-CVResilienceColumns -Evaluation $ev).GetEnumerator()) {
-                    Add-Member -InputObject $row -NotePropertyName $kv.Key -NotePropertyValue $kv.Value -Force
-                }
-                foreach ($res in $ev.Results) {
-                    Add-Member -InputObject $res -NotePropertyName ResourceType -NotePropertyValue $c.Type -Force
-                    $resilResults.Add($res)
-                }
-                $gr = New-CVGapRow -Resource $row -ResourceType $c.Type -Evaluation $ev -FieldMap $gcpGapFields[$c.Type]
-                if ($gr) { $gapRows.Add($gr) }
+                # No evaluation: controls declare WHICH fields are signals; thresholds belong to the backend.
+                # Ctl_*/ResilienceScore are no longer written onto the inventory rows either.
+                $signalRows.Add((New-CVSignalRow -Resource $row -ResourceType $c.Type `
+                                    -SignalFields $gcpSignalMap[$c.Type] -FieldMap $gcpSignalFields[$c.Type]))
             } catch {
                 if (-not $resilShownErr) {
                     $resilShownErr = $true
-                    Write-Host ("[Resilience] eval error on a $($c.Type) row: $($_.Exception.GetType().Name): $($_.Exception.Message) :: " + ($_.ScriptStackTrace -replace "`r?`n", ' <- ')) -ForegroundColor DarkYellow
+                    Write-Host ("[Resilience] signal export error on a $($c.Type) row: $($_.Exception.GetType().Name): $($_.Exception.Message)") -ForegroundColor DarkYellow
                 }
             }
         }
     }
 
-    # Summary + report CSVs (single-table each, consistent with the rest of the output).
-    $resilSummary = Get-CVResilienceSummary -Results $resilResults
-    if ($null -ne $resilSummary.OverallScore) {
-        Write-CVLog ("Overall native resilience score: {0}/100  ({1} controls assessed, {2} not assessed)" -f $resilSummary.OverallScore, $resilSummary.Assessed, $resilSummary.Excluded) -Level Success -Source 'Resilience'
-        foreach ($cat in $resilSummary.ByCategory) { Write-CVLog ("  {0,-14} {1,3}% met ({2}/{3})" -f $cat.Category, $cat.PercentMet, $cat.ControlsMet, $cat.ControlsTotal) -Level Info -Source 'Resilience' }
-    } else {
-        Write-CVLog "No resilience controls could be assessed (no eligible resources or signals)." -Level Warning -Source 'Resilience'
-    }
+    # No score is printed - a score is a judgement, and the export is deliberately judgement-free.
 
     # One file: every resource with a gap or an incomplete assessment, ranked. The static control catalog and the
     # per-category rollup are no longer written - neither told you WHICH resources to go look at.
-    if ($gapRows.Count) {
-        Sort-CVGapRows -Rows $gapRows | Export-CVCsv -Path (Join-Path $outDir ("gcp_resilience_gaps_" + $dateStr + ".csv")) `
-            -PreferredOrder (Get-CVGapReportColumns -ControlSets $gcpControls)
-        $withGaps    = @($gapRows | Where-Object { $_.Status -eq 'Gap' }).Count
-        $noneAssessed = @($gapRows | Where-Object { $_.Status -eq 'NotAssessed' }).Count
-$partial      = @($gapRows | Where-Object { $_.Status -eq 'Gap' -and -not $_.AssessmentComplete }).Count
-        $tbAtRisk    = [math]::Round((@($gapRows | Where-Object { $_.Status -eq 'Gap' -and $null -ne $_.SizeGB } |
-                            Measure-Object -Property SizeGB -Sum).Sum / 1000), 3)
-        Write-CVLog ("Resilience gaps: {0} resource(s) with at least one gap ({1} TB of sized data); {2} could not be assessed at all; {3} of the flagged resources were only partially assessed." -f $withGaps, $tbAtRisk, $noneAssessed, $partial) -Level Info -Source 'Resilience'
-        Write-Host "gcp_resilience_gaps_$dateStr.csv written to $outDir" -ForegroundColor Cyan
+    if ($signalRows.Count) {
+        Sort-CVSignalRows -Rows $signalRows |
+            Export-CVCsv -Path (Join-Path $outDir ("gcp_resilience_signals_" + $dateStr + ".csv")) `
+                         -PreferredOrder (Get-CVSignalColumns -ControlSets $gcpControls) -KeepDeclaredColumns
+        Write-CVLog ("Resilience signals: {0} resource(s) exported across {1} resource type(s)." -f `
+                     $signalRows.Count, @($signalRows | Select-Object -ExpandProperty ResourceType -Unique).Count) `
+                    -Level Info -Source 'Resilience'
+        Write-Host "gcp_resilience_signals_$dateStr.csv written to $outDir" -ForegroundColor Cyan
     } else {
-        Write-CVLog "No resilience gaps found (and nothing left unassessed) - no gap CSV written." -Level Info -Source 'Resilience'
+        Write-CVLog "No resources of an assessed type were found - no signals CSV written." -Level Info -Source 'Resilience'
     }
   } catch {
     Write-CVLog "Resilience report failed: $($_.Exception.Message)" -Level Warning -Source 'Resilience'
