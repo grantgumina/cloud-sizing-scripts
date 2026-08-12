@@ -19,14 +19,15 @@ of an assessed type with the relevant configuration values read from the cloud A
 | `Region` | Region / location |
 | `ResourceId` | ARM ID (Azure), ARN (AWS), self-link (GCP). Blank where the type does not expose one |
 | `SizeGB` / `SizeTB` | Size. **Blank means unmeasured, not zero** — a resource we could not size is not a small one |
-| `BackupDataStatus` | Whether backup collection succeeded for this scope: `Ok` / `Failed` / `Skipped` |
-| `SnapshotDataStatus` | Same for snapshot collection |
+| `BackupDataStatus` | Whether backup collection succeeded for this scope: `Ok` / `Failed` / `Skipped`. On GCP this covers the Filestore backup listing |
+| `SnapshotDataStatus` | Same for snapshot collection. On GCP, `Skipped` is what a run without `-Types SNAPSHOT` produces — which is why `XRegionBackup` is blank rather than `FALSE` on those runs |
 | `LockDataStatus` | **Azure only.** Resource-lock read (deletion protection). Blank column on AWS/GCP |
 | `VaultSettingsDataStatus` | **Azure only.** Recovery Services vault posture read — tracked apart from `BackupDataStatus` because listing backup *items* and reading vault *settings* can fail independently |
 | `LtrDataStatus` | **Azure only.** SQL long-term-retention policy read |
 | `AksBackupDataStatus` | **Azure only.** DataProtection backup-instance read (Backup for AKS) |
 | `VaultLockDataStatus` | **AWS only.** AWS Backup Vault Lock read (region-scoped) |
 | `S3PostureDataStatus` | **AWS only.** Per-bucket posture reads: `Ok` (all six succeeded) / `Partial` / `Failed`. Six independent calls back the S3 signals, so one can fail while the rest succeed — this says which rows to distrust |
+| `GkeBackupDataStatus` | **GCP only.** Backup for GKE backup-plan read. `Skipped` means `gcloud container backup-restore` exists on no release track, so nothing was attempted; `Failed` means it was attempted and denied or errored. Blank column on Azure/AWS |
 | *signal columns* | The raw configuration values, named exactly as collected. See the tables below |
 
 **A blank signal means the value was not collected** — the API was not reachable, permission was denied, the
@@ -196,14 +197,14 @@ means *no customer-managed key* — the table is still encrypted with an AWS-own
 
 | Resource type | Signal | Collected | Values / meaning |
 |---|---|---|---|
-| **VM** | `XRegionBackup` | ✅ | `TRUE`/`FALSE` — a snapshot of one of its disks is stored outside the disk's region |
-| | `DeletionProtection` | ✅ | `TRUE`/`FALSE` — instance deletion protection |
+| **VM** | `XRegionBackup` | ✅ | `TRUE`/`FALSE` — a snapshot of one of its disks is stored outside the disk's region. **Blank on a run without `-Types SNAPSHOT`**: the listing was never attempted, so `SnapshotDataStatus` reads `Skipped` |
+| | `DeletionProtection` | ✅ | `TRUE`/`FALSE` — instance deletion protection, from the instances-list `deletionProtection` field |
 | | `HasSnapshotSchedule` | ❌ not yet | Needs the disk's `resourcePolicies`. Distinct from snapshots merely existing |
 | | `BackupImmutable` | ❌ not yet | GCP exposes no per-disk snapshot immutability |
 | **Disk** | `XRegionBackup` | ✅ | As above, per disk |
-| | `CmkEncrypted` | ✅ | `TRUE`/`FALSE` — customer-managed encryption key |
+| | `CmkEncrypted` | ✅ | `TRUE`/`FALSE` — from `diskEncryptionKey.kmsKeyName`. A customer-**supplied** key (CSEK, `rawKey`) is `FALSE`: it is not a managed key. The row's separate `Encrypted` column is `Yes` for both, so it is not a substitute |
+| | `SurvivesVmDelete` | ✅ | `TRUE`/`FALSE` — **inverted** from the attachment's `autoDelete`. `autoDelete=true`, the default for a boot disk, is therefore `FALSE` here. An unattached disk is `TRUE`: it has no attachment that could delete it, which is measured, not assumed |
 | | `HasSnapshotSchedule` | ❌ not yet | Needs `resourcePolicies` |
-| | `SurvivesVmDelete` | ❌ not yet | Needs the instance attachment's `autoDelete` flag |
 | **Storage** (GCS) | `Versioning` | ✅ | `TRUE`/`FALSE` — object versioning |
 | | `SoftDeleteEnabled` | ✅ | `TRUE`/`FALSE` — soft-delete retention configured |
 | | `RetentionLocked` | ✅ | `TRUE`/`FALSE` — Bucket Lock retention policy is locked (WORM) |
@@ -218,12 +219,15 @@ means *no customer-managed key* — the table is still encrypted with an AWS-own
 | | `CmkEncrypted` | ✅ | `TRUE`/`FALSE` |
 | | `DeletionProtection` | ✅ | `TRUE`/`FALSE` |
 | | `PublicIPs` | ✅ | Semicolon-separated public IPs. **Empty string means none** — distinct from blank (not collected) |
-| **Filestore** | `HasBackup` | ✅ | `TRUE`/`FALSE` — a Filestore backup exists in the project |
+| **Filestore** | `HasBackup` | ✅ | `TRUE`/`FALSE` — a backup exists **for this instance**, matched on the backup's `sourceInstance`. This was previously project-scoped, so one backup anywhere marked every share in the project as protected; expect values to flip `TRUE`→`FALSE` |
 | | `EncryptedAtRest` | ✅ | `TRUE`/`FALSE` (encrypted by default) |
-| | `BackupXRegion` | ❌ not yet | Needs backup location vs instance location |
-| **GKE** | `HasBackupPlan` | ✅ | `TRUE`/`FALSE` — Backup for GKE plan covers the cluster |
-| | `BackupXRegion` | ❌ not yet | Needs the backup plan's region |
-| | `SecretsEncryptionCmk` | ❌ not yet | Needs `databaseEncryption` from cluster describe |
+| | `BackupXRegion` | ✅ | `TRUE`/`FALSE` — a backup for this instance is stored outside its region. BASIC tiers are zonal, so the instance's zone suffix is stripped before comparing: an instance in `us-central1-a` backed up to `us-central1` is **not** cross-region |
+| | `FilestoreBackupLocations` | ✅ | `;`-joined backup locations, or the token `None` when the listing succeeded and found none. Never blank unless the listing failed |
+| **GKE** | `HasBackupPlan` | ✅ | `TRUE`/`FALSE` — an **active** Backup for GKE plan targets **this cluster**, matched on the plan's `cluster` field; deactivated plans are excluded. Previously project-scoped, same as Filestore above; expect `TRUE`→`FALSE` flips |
+| | `BackupXRegion` | ✅ | `TRUE`/`FALSE` — the plan's location differs from the cluster's, zone suffix stripped |
+| | `GkeBackupPlanLocations` | ✅ | `;`-joined plan locations, or `None` |
+| | `SecretsEncryptionCmk` | ✅ | `TRUE`/`FALSE` — `databaseEncryption.state` is `ENCRYPTED`. `DECRYPTED`, and an absent `databaseEncryption` block, are both a **measured** `FALSE`: the cluster object was read either way. Blank only when the cluster read itself failed |
+| | `SecretsEncryptionKeyName` | ✅ | The KMS key, or the token `None` |
 
 
 ## Where this lives in the code

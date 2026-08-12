@@ -2801,6 +2801,20 @@ $script:SnapshotLookupFailed = @{}
 # Keying off "collected" instead means a project has to be positively proven readable to be scored.
 $script:SnapshotCollected = @{}
 
+function Get-GcpSnapshotStatus {
+    <#
+      .SYNOPSIS  Ok | Failed | Skipped for one project's snapshot listing - why a snapshot signal is blank.
+      .DESCRIPTION Every blank in gcp_resilience_signals_*.csv used to be unattributable: "API disabled",
+                   "permission denied", "-Types omitted SNAPSHOT" and "not implemented for GCP" were
+                   indistinguishable. This is the fact about the COLLECTION, not a judgement about the resource.
+                   Only these three values are legal - Set-CVCollectionStatus's ValidateSet defines them.
+    #>
+    param([string]$Project)
+    if ($script:SnapshotCollected[$Project])    { return 'Ok' }
+    if ($script:SnapshotLookupFailed[$Project]) { return 'Failed' }
+    return 'Skipped'   # never attempted: -Types without SNAPSHOT, or the project was not reached
+}
+
 function Get-GcpSnapshotInventory {
     param([string[]]$ProjectIds)
     $results = @()
@@ -2889,6 +2903,7 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
             # Positive marker, not the failure map - see the note at $script:SnapshotCollected.
             $xr = if (-not $script:SnapshotCollected[$d.Project]) { $null } else { [bool]($e -and $e.XRegion) }
             Add-Member -InputObject $d -NotePropertyName XRegionBackup -NotePropertyValue $xr -Force
+            Add-Member -InputObject $d -NotePropertyName SnapshotDataStatus -NotePropertyValue (Get-GcpSnapshotStatus $d.Project) -Force
         }
     }
     $vmXRegion = @{}
@@ -2903,6 +2918,7 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         if (-not $v) { continue }
         $xr = if (-not $script:SnapshotCollected[$v.Project]) { $null } else { [bool]$vmXRegion["$($v.Project)|$($v.VMName)".ToLower()] }
         Add-Member -InputObject $v -NotePropertyName XRegionBackup -NotePropertyValue $xr -Force
+        Add-Member -InputObject $v -NotePropertyName SnapshotDataStatus -NotePropertyValue (Get-GcpSnapshotStatus $v.Project) -Force
     }
 
     # Full-reach enrichment (defensive: any failure leaves the field absent -> Unknown).
@@ -2964,12 +2980,15 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         if (-not $f) { continue }
         Add-Member -InputObject $f -NotePropertyName EncryptedAtRest -NotePropertyValue $true -Force   # GCP encrypts Filestore at rest by default
         if (-not $fsLookupOk.ContainsKey($f.Project)) {
-            # The listing failed for this project: everything backup-derived is genuinely unknown.
+            # The listing failed for this project: everything backup-derived is genuinely unknown. The status
+            # column is what makes that blank readable as "denied" rather than "no backups configured".
             Add-Member -InputObject $f -NotePropertyName HasBackup     -NotePropertyValue $null -Force
             Add-Member -InputObject $f -NotePropertyName BackupXRegion -NotePropertyValue $null -Force
             Add-Member -InputObject $f -NotePropertyName FilestoreBackupLocations -NotePropertyValue $null -Force
+            Add-Member -InputObject $f -NotePropertyName BackupDataStatus -NotePropertyValue 'Failed' -Force
             continue
         }
+        Add-Member -InputObject $f -NotePropertyName BackupDataStatus -NotePropertyValue 'Ok' -Force
         $e = $fsByInstance["$($f.Project)|$($f.InstanceName)".ToLower()]
         Add-Member -InputObject $f -NotePropertyName HasBackup     -NotePropertyValue ([bool]($e -and $e.Count -gt 0)) -Force
         Add-Member -InputObject $f -NotePropertyName BackupXRegion -NotePropertyValue ([bool]($e -and $e.XRegion))     -Force
@@ -2984,6 +3003,7 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
     # once (GA first, so this keeps working when the command graduates) and reuse it across projects.
     $gkeBackups   = @{}
     $gkeLookupOk  = @{}
+    $gkeCommandMissing = $false
     $gkeBrTrack   = $null
     foreach ($p in @($targetProjects)) {
         $gkeArgs = @('container','backup-restore','backup-plans','list','--project',$p,'--location','-')
@@ -2991,6 +3011,7 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
              else                       { Invoke-CVGcloudJsonAnyTrack -Arguments $gkeArgs }
         if ($r.Ok) { $gkeBrTrack = $r.Track; $gkeLookupOk[$p] = $true; $gkeBackups[$p] = @($r.Data) }
         else {
+            if ($r.CommandMissing) { $gkeCommandMissing = $true }   # drives Skipped-vs-Failed on the row below
             if (-not $r.CommandMissing) { $gkeBrTrack = $r.Track }
             $why = if ($r.CommandMissing) { 'command not available on any release track' }
                    elseif ($r.ApiDisabled) { 'Backup for GKE API disabled' }
@@ -3031,8 +3052,14 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
             Add-Member -InputObject $g -NotePropertyName HasBackupPlan -NotePropertyValue $null -Force
             Add-Member -InputObject $g -NotePropertyName BackupXRegion -NotePropertyValue $null -Force
             Add-Member -InputObject $g -NotePropertyName GkeBackupPlanLocations -NotePropertyValue $null -Force
+            # 'Skipped' when the command exists on no release track (nothing was ever attempted against the
+            # API); 'Failed' when it was attempted and denied or errored. The classification is already computed
+            # by Invoke-CVGcloudJsonAnyTrack - it was only being logged, never carried onto the row.
+            $gkeStatus = $(if ($gkeCommandMissing) { 'Skipped' } else { 'Failed' })
+            Add-Member -InputObject $g -NotePropertyName GkeBackupDataStatus -NotePropertyValue $gkeStatus -Force
             continue
         }
+        Add-Member -InputObject $g -NotePropertyName GkeBackupDataStatus -NotePropertyValue 'Ok' -Force
         $e = $gkeByCluster["$($g.Project)|$($g.ClusterName)".ToLower()]
         Add-Member -InputObject $g -NotePropertyName HasBackupPlan -NotePropertyValue ([bool]($e -and $e.Count -gt 0)) -Force
         Add-Member -InputObject $g -NotePropertyName BackupXRegion -NotePropertyValue ([bool]($e -and $e.XRegion))     -Force

@@ -171,8 +171,9 @@ $script:CVSignalIdentityColumns = @(
 # Collection status, where a cloud script records it. These explain WHY a signal is blank - a fact about the
 # collection, not a judgement about the resource - so a blank can be read as "denied"/"skipped" vs "absent".
 #
-# This list is CLOUD-AGNOSTIC and every cloud's export gets every column, so the Azure-specific ones below appear
-# (blank) in the AWS and GCP files too. That is a deliberate trade: a fixed schema was chosen over per-cloud
+# This list is CLOUD-AGNOSTIC and every cloud's export gets every column, so the cloud-specific ones below appear
+# (blank) in the other clouds' files too - the Azure-only four in AWS/GCP, the AWS-only two in Azure/GCP, and
+# GkeBackupDataStatus in Azure/AWS. That is a deliberate trade: a fixed schema was chosen over per-cloud
 # status plumbing. The doc marks which are Azure-only, because a blank LockDataStatus in an AWS export would
 # otherwise read as "we did not look for locks" in a cloud that has no equivalent.
 $script:CVSignalStatusColumns = @(
@@ -182,7 +183,8 @@ $script:CVSignalStatusColumns = @(
     'LtrDataStatus',           # Azure: SQL long-term-retention policy read
     'AksBackupDataStatus',     # Azure: DataProtection backup-instance read
     'VaultLockDataStatus',     # AWS:   Backup Vault Lock read (region-scoped immutability)
-    'S3PostureDataStatus'      # AWS:   per-bucket posture reads - Ok | Partial | Failed
+    'S3PostureDataStatus',     # AWS:   per-bucket posture reads - Ok | Partial | Failed
+    'GkeBackupDataStatus'      # GCP:   Backup for GKE backup-plan read (analogue of AksBackupDataStatus)
 )
 
 function Get-CVFirstProperty {
