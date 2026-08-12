@@ -46,7 +46,18 @@ $script:KnownUnwired = @{
     'GCP/gke-secretenc'   = 'needs GKE databaseEncryption (CMEK) from cluster describe'
     'GCP/vm-backup'       = 'needs resourcePolicies (snapshot schedule) - distinct from snapshots merely existing'
     'GCP/vm-immutable'    = 'needs snapshot/vault immutability, which GCP does not expose per-disk today'
+    # Found the moment GCP was wired into section [4]. DeletionProtection IS set in the GCP source - on Cloud SQL
+    # rows ($items) - so section [1] passed this control while VM rows never carried it and the control could
+    # never produce a verdict. CYBER_RESILIENCE_SIGNALS.md claims it is collected; it is not.
+    'GCP/vm-delprot'      = 'DeletionProtection is set on Cloud SQL rows but never on VM rows - collect it from the instances-list deletionProtection field already in the payload'
 }
+<#
+    A BLIND SPOT worth writing down rather than discovering twice: GCP/pd-cmek is also dead on Disk rows, and
+    section [4] CANNOT catch it. CmkEncrypted reaches the $enriched escape hatch below because the GCP script
+    Add-Member's it onto BUCKET rows, and enrichment fields are accepted cloud-globally by design (see the
+    "floor, not a ceiling" note in section [4]). It is deliberately NOT listed above - an entry would be reported
+    stale, since section [1] sees the field as populated. The only remedy for pd-cmek is to collect it.
+#>
 
 # Every file that could populate a field on an inventory row. The control definitions themselves are excluded -
 # they READ fields, and counting a control's own reference as "set" would defeat the whole check.
@@ -155,12 +166,11 @@ if ($unexpected.Count) {
     Write-Host "        signal, or add it to `$script:KnownUnwired with a reason." -ForegroundColor DarkYellow
 }
 
-# And the reverse: an allow-list entry that is now wired should be REMOVED, or the list rots into a lie.
-$staleAllow = @($script:KnownUnwired.Keys | Where-Object { $_ -notin $unwired })
-Assert-CV 'allow-list has no stale entries' $staleAllow.Count 0
-if ($staleAllow.Count) {
-    Write-Host "        Now wired - delete from \$script:KnownUnwired: $($staleAllow -join ', ')" -ForegroundColor DarkYellow
-}
+# The reverse check - an allow-list entry that is now wired must be REMOVED, or the list rots into a lie - is
+# deliberately NOT here. It has to run after section [4], because the two detectors find different things: a
+# control can be wired cloud-wide (invisible to section [1]) while still being dead for its own resource type
+# (only section [4] sees it). Comparing the allow-list against section [1]'s $unwired alone would report every
+# such entry as stale. See the staleness check below section [4].
 
 Write-Host "`n[2] The five field-name mismatches found in the field stay fixed"
 # Each of these was a control reading an invented name while the data sat on the row under another.
@@ -272,12 +282,26 @@ $script:CVTypeBuilders = @{
         EC2 = @('ec2Obj'); EBS = @('volumeObj'); RDS = @('rdsObj'); S3 = @('s3Obj')
         EFS = @('efsObj'); DynamoDB = @('ddbObj'); Redshift = @('rsObj')
     }
+    # GCP was absent from this map and from the loop below, so none of its 27 controls were ever checked against
+    # their own row builder. bucketObj/fsObj/gkeObj only became addressable when the GCP script stopped using a
+    # bare `return [PSCustomObject]@{}` for buckets and stopped sharing $results with snapshots and $obj with
+    # BigQuery tables - see the comments at those three sites.
+    GCP = @{
+        VM        = @('projectVMs')
+        Disk      = @('attachedObj', 'diskObj')
+        Storage   = @('bucketObj')
+        Filestore = @('fsObj')
+        Database  = @('items')
+        GKE       = @('gkeObj')
+    }
 }
 
 $perTypeUnwired = @()
-foreach ($cloud in @('Azure', 'AWS')) {
+foreach ($cloud in @('Azure', 'AWS', 'GCP')) {
     $builders = $script:CVTypeBuilders[$cloud]
-    $sets = & $(if ($cloud -eq 'Azure') { 'Get-CVAzureResilienceControls' } else { 'Get-CVAwsResilienceControls' })
+    $sets = & $(switch ($cloud) { 'Azure' { 'Get-CVAzureResilienceControls' }
+                                  'AWS'   { 'Get-CVAwsResilienceControls'   }
+                                  'GCP'   { 'Get-CVGcpResilienceControls'   } })
 
     # Enrichment fields (Add-Member -NotePropertyName X) applied post-hoc to whole collections. Scoped to this
     # cloud - a global sweep here was the second half of the cross-cloud leak.
@@ -325,12 +349,29 @@ Assert-CV 'extraction works (Azure vmObj has VMName)'      ([bool](Get-CVBuilder
 Assert-CV 'extraction is scoped (vmObj lacks DiskName)'    ([bool](Get-CVBuilderFields -Builder 'vmObj'  -Cloud Azure).Contains('DiskName')) $false
 Assert-CV 'extraction works (AWS rdsObj has MultiAZ)'      ([bool](Get-CVBuilderFields -Builder 'rdsObj' -Cloud AWS).Contains('MultiAZ'))    $true
 Assert-CV 'extraction is cloud-scoped (rdsObj not in Azure)' (Get-CVBuilderFields -Builder 'rdsObj' -Cloud Azure).Count                     0
+# GCP's three de-aliased builders. Each assertion fails if the corresponding rename is ever reverted: bucketObj
+# extracted ZERO fields while it was a bare `return`, and gkeObj/fsObj were unioned with the BigQuery-table and
+# snapshot builders respectively, which is what let a foreign field mark a control as wired.
+Assert-CV 'extraction works (GCP projectVMs has VMName)'    ([bool](Get-CVBuilderFields -Builder 'projectVMs' -Cloud GCP).Contains('VMName'))  $true
+Assert-CV 'extraction is scoped (projectVMs lacks SizeGB)'  ([bool](Get-CVBuilderFields -Builder 'projectVMs' -Cloud GCP).Contains('SizeGB'))  $false
+Assert-CV 'GCP bucketObj is addressable (was a bare return)' ([bool]((Get-CVBuilderFields -Builder 'bucketObj' -Cloud GCP).Count -gt 0))       $true
+Assert-CV 'GCP gkeObj is not aliased to BigQuery tables'    ([bool](Get-CVBuilderFields -Builder 'gkeObj' -Cloud GCP).Contains('TableId'))     $false
+Assert-CV 'GCP fsObj is not aliased to snapshots'           ([bool](Get-CVBuilderFields -Builder 'fsObj'  -Cloud GCP).Contains('SnapshotName')) $false
 
 $perTypeUnexpected = @($perTypeUnwired | Where-Object { -not $script:KnownUnwired.ContainsKey($_.Key) })
 Assert-CV 'no control is blank for its own resource type' $perTypeUnexpected.Count 0
 if ($perTypeUnexpected.Count) {
     Write-Host "        These read no field their own resource type's row builder ever sets:" -ForegroundColor DarkYellow
     $perTypeUnexpected | ForEach-Object { Write-Host "          $($_.Display)" -ForegroundColor DarkYellow }
+}
+
+# Relocated from section [1] (see the note there). An allow-list entry that is now wired must be deleted, or the
+# list rots into a lie - but "wired" has to mean wired by EITHER detector, so the two sets are unioned first.
+$allUnwiredKeys = @(@($unwired) + @($perTypeUnwired | ForEach-Object { $_.Key }) | Sort-Object -Unique)
+$staleAllow = @($script:KnownUnwired.Keys | Where-Object { $_ -notin $allUnwiredKeys })
+Assert-CV 'allow-list has no stale entries' $staleAllow.Count 0
+if ($staleAllow.Count) {
+    Write-Host "        Now wired - delete from `$script:KnownUnwired: $($staleAllow -join ', ')" -ForegroundColor DarkYellow
 }
 
 Write-Host "`n[5] A signal field must not be fed from a variable nothing ever assigns"
@@ -399,7 +440,7 @@ function Get-CVUnassignedBuilderVars {
 }
 
 $unassigned = @()
-foreach ($cloud in @('Azure', 'AWS')) {
+foreach ($cloud in @('Azure', 'AWS', 'GCP')) {
     $unassigned += @(Get-CVUnassignedBuilderVars -Cloud $cloud -Builder @($script:CVTypeBuilders[$cloud].Values | ForEach-Object { $_ }))
 }
 Assert-CV 'no builder field is fed from an unassigned variable' $unassigned.Count 0

@@ -1173,7 +1173,10 @@ $bucketSizingScriptBlock = {
         $sizeGBDec   = if ($bytes -gt 0) { [math]::Round($bytes / $GBDecimalDivisor, 4) } else { 0 }
         $sizeTBDec   = if ($bytes -gt 0) { [math]::Round($bytes / $TBDecimalDivisor, 6) } else { 0 }
         
-        return [PSCustomObject]@{
+        # Named, not `return [PSCustomObject]@{...}`: Get-CVBuilderFields in the wiring test extracts signal
+        # fields from ASSIGNMENTS to a named builder variable. A bare return yields zero fields, which would
+        # make Storage's per-resource-type check silently vacuous - the same defect AKS = 'aksObj' had.
+        $bucketObj = [PSCustomObject]@{
             StorageBucket       = $bucket.name
             Project             = $projectName
             Location            = $bucket.location
@@ -1186,6 +1189,7 @@ $bucketSizingScriptBlock = {
             UsedCapacityGB      = $sizeGBDec
             UsedCapacityTB      = $sizeTBDec
         }
+        return $bucketObj
     }
 
 
@@ -2533,7 +2537,9 @@ function Get-GcpGkeInventory {
             $network = if ($c.network) { ($c.network -split '/')[-1] } else { '' }
             $subnet  = if ($c.subnetwork) { ($c.subnetwork -split '/')[-1] } else { '' }
             $releaseChannel = if ($c.releaseChannel.channel) { $c.releaseChannel.channel } else { '' }
-            $obj = [PSCustomObject]@{
+            # $gkeObj, not $obj: the BigQuery-table builder also assigns $obj, so the shared name unioned
+            # GKE's field set with LogicalBytes/PhysicalBytes/TableId and weakened GKE's per-type check.
+            $gkeObj = [PSCustomObject]@{
                 Project       = $proj
                 ClusterName   = $name
                 Region        = $region
@@ -2554,9 +2560,9 @@ function Get-GcpGkeInventory {
                 PermissionIssue = $clResult.PermIssue
             }
             # Attach detail arrays (for downstream harvesting to remain compatible)
-            $null = $obj | Add-Member -NotePropertyName _PvDetails  -NotePropertyValue ($pvInfo.PvDetails.ToArray())  -Force
-            $null = $obj | Add-Member -NotePropertyName _PvcDetails -NotePropertyValue ($pvInfo.PvcDetails.ToArray()) -Force
-            $allClusters.Add($obj)|Out-Null
+            $null = $gkeObj | Add-Member -NotePropertyName _PvDetails  -NotePropertyValue ($pvInfo.PvDetails.ToArray())  -Force
+            $null = $gkeObj | Add-Member -NotePropertyName _PvcDetails -NotePropertyValue ($pvInfo.PvcDetails.ToArray()) -Force
+            $allClusters.Add($gkeObj)|Out-Null
             Write-Log -Level INFO -Message ("[GKE] Project={0} Cluster={1} Nodes={2} PVCapGB={3} PVCount={4} Source={5}" -f $proj,$name,$npRes.NodeCount,$pvInfo.CapacityGiB,$pvInfo.Count,$pvInfo.Source)
         }
         $dur=[math]::Round(([DateTime]::UtcNow-$projStart).TotalSeconds,2)
@@ -2680,7 +2686,10 @@ function Get-GcpFilestoreInventory {
             if (-not $raw) { continue }
             foreach ($inst in $raw) {
                 foreach ($fs in $inst.fileShares) {
-                    $results += [PSCustomObject]@{
+                    # $fsObj rather than appending the literal straight into $results: $results is also the
+                    # snapshot builder's accumulator, and the wiring extractor keys on the variable name, so
+                    # sharing it unions Filestore's fields with Snapshot's and loosens both checks.
+                    $fsObj = [PSCustomObject]@{
                         Project       = $proj
                         InstanceName  = $inst.name -replace '.*/instances/',''
                         Region        = $inst.location
@@ -2693,6 +2702,7 @@ function Get-GcpFilestoreInventory {
                         Networks      = ($inst.networks | ForEach-Object { $_.network }) -join ';'
                         CreateTime    = $inst.createTime
                     }
+                    $results += $fsObj
                 }
             }
         } catch { Write-Log "Filestore inventory failed for project ${proj}: $_" -Level WARN }
