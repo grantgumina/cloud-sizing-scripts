@@ -26,7 +26,7 @@ Every run needs three things: **PowerShell 7**, the **cloud vendor's CLI/SDK** (
 |---|---|---|---|
 | PowerShell 7+ | Required | Required | Required |
 | Vendor CLI | **AWS CLI v2** — required (credential profiles, SSO, EKS kubeconfig) | Azure CLI **not** required — Azure runs on the Az PowerShell modules | **gcloud CLI** — required, including the `gsutil` and `bq` components |
-| PowerShell modules | `AWS.Tools.*`, `ImportExcel` | `Az.*` | none (beyond the shared console UI) |
+| PowerShell modules | `AWS.Tools.*` | `Az.*` | none (beyond the shared console UI) |
 | Interactive console UI | `PwshSpectreConsole` (not needed with `-NonInteractive`) | same | same |
 | `kubectl` | Auto-installed when needed | Auto-installed when needed | Auto-installed when needed |
 
@@ -91,7 +91,7 @@ Install-Module PwshSpectreConsole -Scope CurrentUser -Force
 
 **AWS**
 ```powershell
-Install-Module ImportExcel,AWS.Tools.Installer -Scope CurrentUser -Force -Confirm:$false
+Install-Module AWS.Tools.Installer -Scope CurrentUser -Force -Confirm:$false
 Install-AWSToolsModule -Name AWS.Tools.Common,AWS.Tools.EC2,AWS.Tools.S3,AWS.Tools.SecurityToken,AWS.Tools.IdentityManagement,AWS.Tools.CloudWatch,AWS.Tools.RDS,AWS.Tools.DynamoDBv2,AWS.Tools.Redshift,AWS.Tools.FSx,AWS.Tools.ElasticFileSystem,AWS.Tools.EKS,AWS.Tools.DocDB,AWS.Tools.ElastiCache,AWS.Tools.Backup,AWS.Tools.ResourceGroupsTaggingAPI -Scope CurrentUser -CleanUp -Force -Confirm:$false
 ```
 
@@ -184,7 +184,7 @@ CYBER_RESILIENCE_SIGNALS.md  Resilience signal export: schema + every signal per
 tests/               Dependency-free test suite for the shared console layer
 tools/               Show-CVConsoleDemo.ps1 - visual demo of the console layer
 k8s/                 Dockerfiles, entrypoints and Job manifests for containerized runs
-Output/              Run output (CSV/JSON/Excel + ZIP), one timestamped subfolder per run   (git-ignored)
+Output/              Run output (CSV/JSON + ZIP), one timestamped subfolder per run         (git-ignored)
 Logs/                Run logs, one file per run                                              (git-ignored)
 ```
 

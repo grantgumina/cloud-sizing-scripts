@@ -269,7 +269,8 @@ $cvRequired  = @(
     'CVSizing.Backup.Azure.ps1'       # Azure backup attribution
     'CVSizing.Metrics.Azure.ps1'      # Azure Monitor metric wrapper
     'CVSizing.Arm.Azure.ps1'          # ARM REST list helper (HTTP status drives the tri-state)
-    'CVSizing.Summary.Azure.ps1'      # azure_inventory_summary rollup (descriptor-driven, golden-pinned)
+    'CVSizing.Summary.ps1'            # shared four-pass inventory rollup engine (cloud-agnostic)
+    'CVSizing.Summary.Azure.ps1'      # Azure descriptor table for it (golden-pinned)
     'CVSizing.Kubectl.ps1'            # cross-platform kubectl provisioning (Install-CVKubectl, used by AKS)
     'CVSizing.CloudRewind.ps1'        # provider-neutral Cloud Rewind engine
     'CVSizing.CloudRewind.Azure.ps1'  # Azure billable taxonomy + inclusion rules

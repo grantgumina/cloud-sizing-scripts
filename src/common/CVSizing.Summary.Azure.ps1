@@ -26,38 +26,12 @@
     PowerShell Hashtable. .NET randomises string hashing per process, so three consecutive runs produced the
     overall rows in three different orders and no two runs of the tool were diffable. The order is now the
     declaration order below, which is what the pass's own if/elseif chain always intended.
+
+    The generic four-pass engine, the unit conversions and the size formatters now live beside this file in
+    CVSizing.Summary.ps1, shared with AWS. What stays here is only what is genuinely Azure: the descriptor
+    table below and the elastic-pool de-duplication that SQL needs.
+
 #>
-
-# ---- unit conversions, named once ------------------------------------------------------------------------
-# Decimal (SI) gigabytes/terabytes and binary (IEC) tebibytes, matching what the inline code did.
-function ConvertTo-CVGB  { param([double]$Bytes) [math]::Round($Bytes / 1000000000, 2) }
-function ConvertTo-CVTB  { param([double]$Bytes) [math]::Round($Bytes / 1000000000000, 4) }
-function ConvertTo-CVTiB { param([double]$Bytes) [math]::Round($Bytes / 1099511627776, 4) }
-
-function Measure-CVSum {
-    <# .SYNOPSIS  Sum a property across rows, coalescing an all-null result to 0 as the inline code did. #>
-    param($Rows, [string]$Property)
-    $s = ($Rows | Measure-Object -Property $Property -Sum).Sum
-    if ($null -eq $s) { return 0 }
-    return $s
-}
-
-function Measure-CVLooseSum {
-    <#
-      .SYNOPSIS  Sum a property, skipping $null AND empty string.
-      .DESCRIPTION Cosmos/MySQL/PostgreSQL/AKS accumulate in a foreach with an explicit `-ne $null -and -ne ''`
-                   guard rather than using Measure-Object. Kept separate because Measure-Object would coerce ''
-                   and change the total.
-    #>
-    param($Rows, [string]$Property)
-    $total = 0.0
-    foreach ($r in @($Rows)) {
-        if (-not $r) { continue }
-        $v = $r.$Property
-        if ($null -ne $v -and "$v" -ne '') { $total += [double]$v }
-    }
-    return $total
-}
 
 function Get-CVSqlDbSizeTotal {
     <#
@@ -86,34 +60,6 @@ function Get-CVSqlDbSizeTotal {
     }
     return [math]::Round($total, 3)
 }
-
-# ---- size formatters -------------------------------------------------------------------------------------
-# Each returns @{ GB; TB; TiB }. Named after what varies, so a descriptor reads as a choice not a formula.
-
-# Raw gigabyte sum, published unrounded (VM). TB/TiB derive from it.
-function Format-CVSizeRawGB { param([double]$Gb) @{ GB = $Gb; TB = [math]::Round($Gb / 1000, 4); TiB = [math]::Round($Gb / 1024, 4) } }
-
-# Gigabyte sum rounded to N places; TB/TiB derive from the ROUNDED value for 2dp callers and the raw value for
-# 4dp callers - which is exactly how the two passes differed.
-function Format-CVSizeGB2 { param([double]$Gb) $g = [math]::Round($Gb, 2); @{ GB = $g; TB = [math]::Round($g / 1000, 4); TiB = [math]::Round($g / 1024, 4) } }
-function Format-CVSizeGB4 {
-    param([double]$Gb)
-    @{ GB  = [math]::Round($Gb, 4)
-       TB  = if ($Gb -gt 0) { [math]::Round($Gb / 1000, 4) } else { 0 }
-       TiB = if ($Gb -gt 0) { [math]::Round($Gb / 1024, 4) } else { 0 } }
-}
-# SQL MI / SQL DB round GB to 2dp but derive TB/TiB from the UNROUNDED total.
-function Format-CVSizeGB2Raw { param([double]$Gb) @{ GB = [math]::Round($Gb, 2); TB = [math]::Round($Gb / 1000, 4); TiB = [math]::Round($Gb / 1024, 4) } }
-
-# Byte totals (storage, file shares, NetApp).
-function Format-CVSizeBytes { param([double]$Bytes) @{ GB = (ConvertTo-CVGB $Bytes); TB = (ConvertTo-CVTB $Bytes); TiB = (ConvertTo-CVTiB $Bytes) } }
-# Cosmos measures bytes too, but zero stays a hard 0 and the regional pass wants 4dp gigabytes.
-function Format-CVSizeBytes2 { param([double]$Bytes) @{ GB = $(if ($Bytes -gt 0) { [math]::Round($Bytes / 1000000000, 2) } else { 0 })
-                                                        TB = $(if ($Bytes -gt 0) { ConvertTo-CVTB  $Bytes } else { 0 })
-                                                        TiB = $(if ($Bytes -gt 0) { ConvertTo-CVTiB $Bytes } else { 0 }) } }
-function Format-CVSizeBytes4 { param([double]$Bytes) @{ GB = $(if ($Bytes -gt 0) { [math]::Round($Bytes / 1000000000, 4) } else { 0 })
-                                                        TB = $(if ($Bytes -gt 0) { ConvertTo-CVTB  $Bytes } else { 0 })
-                                                        TiB = $(if ($Bytes -gt 0) { ConvertTo-CVTiB $Bytes } else { 0 }) } }
 
 # ---- the type table -------------------------------------------------------------------------------------
 <#
@@ -188,44 +134,7 @@ $script:CVAzSummaryTypes = @(
        Label={ param($r) "AVS Private Clouds (Total Hosts: $([int](Measure-CVSum $r 'TotalHostCount')))" } }
 )
 
-# ---- row builders ---------------------------------------------------------------------------------------
-
-function New-CVAzSummaryRow {
-    <# .SYNOPSIS  One summary row. Property ORDER defines the CSV column order. #>
-    param([string]$Subscription, [string]$ResourceType, $Region, $Count, $GB, $TB, $TiB)
-    [PSCustomObject]@{
-        Subscription = $Subscription
-        ResourceType = $ResourceType
-        Region       = $Region
-        Count        = $Count
-        TotalSizeGB  = $GB
-        TotalSizeTB  = $TB
-        TotalSizeTiB = $TiB
-    }
-}
-
-# The two spacer shapes are NOT interchangeable. The first sets every field to ''; the second omits Subscription
-# altogether, so Export-Csv renders it as an unquoted empty. Both appear in the shipped file.
-function New-CVAzSummarySpacer { New-CVAzSummaryRow -Subscription '' -ResourceType '' -Region '' -Count '' -GB '' -TB '' -TiB '' }
-function New-CVAzSummarySpacerNoSub {
-    [PSCustomObject]@{ ResourceType = ''; Region = $null; Count = $null; TotalSizeGB = $null; TotalSizeTB = $null; TotalSizeTiB = $null }
-}
-
-function Get-CVAzSummaryLabel {
-    param($Descriptor, $Rows, [switch]$Overall)
-    $spec = if ($Overall -and $Descriptor.LabelOverall) { $Descriptor.LabelOverall } else { $Descriptor.Label }
-    if ($spec -is [scriptblock]) { return [string](& $spec $Rows) }
-    return [string]$spec
-}
-
-function Get-CVAzSummarySize {
-    <# .SYNOPSIS  Measure + format a row set, choosing the pass-specific formatter. #>
-    param($Descriptor, $Rows, [switch]$Overall)
-    if (-not $Descriptor.Measure) { return @{ GB = ''; TB = ''; TiB = '' } }   # count-only types
-    $raw = & $Descriptor.Measure $Rows
-    $fmt = if ($Overall -and $Descriptor.FmtOverall) { $Descriptor.FmtOverall } else { $Descriptor.Fmt }
-    return (& $fmt ([double]$raw))
-}
+# ---- entry point ----------------------------------------------------------------------------------------
 
 function Get-CVAzureInventorySummary {
     <#
@@ -242,65 +151,9 @@ function Get-CVAzureInventorySummary {
         $Subscriptions = @()
     )
 
-    $rows  = [System.Collections.Generic.List[psobject]]::new()
-    $types = $script:CVAzSummaryTypes
-
-    function Get-Rows { param($Name) @($Inventory[$Name] | Where-Object { $_ }) }
-
-    # ---- Pass A: overall totals, one row per type -------------------------------------------------------
-    # Sorted by SeqOverall: this pass orders types differently from the others (see the table's note).
-    foreach ($d in ($types | Where-Object { $_.SeqOverall } | Sort-Object { $_.SeqOverall })) {
-        if ($d.SubOnly) { continue }
-        if (-not $Selected[$d.Key]) { continue }
-        $all = Get-Rows $d.Source
-        if (-not $all.Count) { continue }
-        $sz = Get-CVAzSummarySize -Descriptor $d -Rows $all -Overall
-        $rows.Add((New-CVAzSummaryRow -Subscription 'All' -ResourceType (Get-CVAzSummaryLabel -Descriptor $d -Rows $all -Overall) `
-                                      -Region 'All' -Count $all.Count -GB $sz.GB -TB $sz.TB -TiB $sz.TiB))
-    }
-
-    $rows.Add((New-CVAzSummarySpacer))
-
-    # ---- Pass B: regional totals across all subscriptions -----------------------------------------------
-    foreach ($d in $types) {
-        if ($d.SubOnly) { continue }
-        if (-not $Selected[$d.Key]) { continue }
-        $all = Get-Rows $d.Source
-        if (-not $all.Count) { continue }
-        foreach ($g in ($all | Group-Object $d.Group | Sort-Object Name)) {
-            $sz = Get-CVAzSummarySize -Descriptor $d -Rows $g.Group
-            $rows.Add((New-CVAzSummaryRow -Subscription 'All' -ResourceType (Get-CVAzSummaryLabel -Descriptor $d -Rows $g.Group) `
-                                          -Region $g.Name -Count $g.Count -GB $sz.GB -TB $sz.TB -TiB $sz.TiB))
-        }
-    }
-
-    $rows.Add((New-CVAzSummarySpacerNoSub))
-    $rows.Add((New-CVAzSummaryRow -Subscription '[ Subscription level Summary ]' -ResourceType '' -Region '' -Count '' -GB '' -TB '' -TiB ''))
-
-    # ---- Pass C/D: per subscription, a total then its regional breakdown --------------------------------
-    foreach ($sub in @($Subscriptions)) {
-        $subName = "$($sub.Name)"
-        $rows.Add((New-CVAzSummaryRow -Subscription $subName -ResourceType '' -Region '' -Count '' -GB '' -TB '' -TiB ''))
-
-        foreach ($d in $types) {
-            if (-not $Selected[$d.Key]) { continue }
-            $mine = @((Get-Rows $d.Source) | Where-Object { "$($_.Subscription)" -eq $subName })
-            if (-not $mine.Count) { continue }
-
-            $sz = Get-CVAzSummarySize -Descriptor $d -Rows $mine
-            $rows.Add((New-CVAzSummaryRow -Subscription $subName -ResourceType (Get-CVAzSummaryLabel -Descriptor $d -Rows $mine) `
-                                          -Region 'All' -Count $mine.Count -GB $sz.GB -TB $sz.TB -TiB $sz.TiB))
-
-            # SubOnly types are counts against the subscription; they have no regional breakdown.
-            if ($d.SubOnly -or -not $d.Group) { continue }
-            foreach ($g in ($mine | Group-Object $d.Group | Sort-Object Name)) {
-                $gsz = Get-CVAzSummarySize -Descriptor $d -Rows $g.Group
-                $rows.Add((New-CVAzSummaryRow -Subscription $subName -ResourceType (Get-CVAzSummaryLabel -Descriptor $d -Rows $g.Group) `
-                                              -Region $g.Name -Count $g.Count -GB $gsz.GB -TB $gsz.TB -TiB $gsz.TiB))
-            }
-        }
-        $rows.Add((New-CVAzSummarySpacer))
-    }
-
-    return $rows
+    # Azure's scope column and its inventory-row property are both literally 'Subscription', so the engine's
+    # defaults are already correct; they are named anyway so a reader does not have to go look them up.
+    Get-CVInventorySummary -Types $script:CVAzSummaryTypes -Inventory $Inventory -Selected $Selected `
+                           -Scopes $Subscriptions -ScopeColumn 'Subscription' -ScopeProperty 'Subscription' `
+                           -ScopeHeaderLabel '[ Subscription level Summary ]'
 }

@@ -12,6 +12,7 @@
 #>
 [CmdletBinding()] param()
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot '..' 'src' 'common' 'CVSizing.Summary.ps1')
 . (Join-Path $PSScriptRoot '..' 'src' 'common' 'CVSizing.Summary.Azure.ps1')
 
 $script:Pass = 0; $script:Fail = 0

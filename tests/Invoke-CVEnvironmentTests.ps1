@@ -137,15 +137,22 @@ Write-Host "`n[7a1] Archiving must COPY, not MOVE - the output directory keeps i
       2. It was a data-loss path. The add loop logs a per-file archive failure as a Warning and continues; the
          delete then ran because the ZIP *existed*, without checking that this file made it in. One
          CreateEntryFromFile failure destroyed that output permanently.
+
+    AWS now zips the directory too, so the curated add loop - and the omission it could cause - is gone at the
+    mechanism level rather than being reported after the fact.
 #>
 $awsBodyArch = Get-Content -Raw (Join-Path $srcRoot 'CVAWSCloudSizingScript.ps1')
 # No unconditional Remove-Item over the archived-file list.
 $delLoop = [regex]::Matches($awsBodyArch, '(?ms)foreach \(\$file in \$filesToArchive\)\s*\{[^}]*Remove-Item')
 Assert-CV 'AWS: archived files are not deleted' $delLoop.Count 0
 Assert-CV 'AWS: the "Removed individual file" message is gone' ([bool]($awsBodyArch -match 'Removed individual file')) $false
-# And the archive is cross-checked, so an omission is visible rather than silent.
-Assert-CV 'AWS: archive contents are verified' ([bool]($awsBodyArch -match 'Archive is INCOMPLETE')) $true
-Assert-CV 'AWS: unregistered output files are reported' ([bool]($awsBodyArch -match 'are NOT in the archive')) $true
+# All three clouds must zip the DIRECTORY. AWS used to add files one at a time from a curated
+# $script:AllOutputFiles list - a whitelist, and the reason aws_resilience_signals_*.csv shipped for several
+# revisions without ever reaching the ZIP the customer was handed. CreateFromDirectory cannot omit a file, so
+# assert the mechanism rather than the after-the-fact warning that used to compensate for it.
+Assert-CV 'AWS: zips the output directory'          ([bool]($awsBodyArch -match 'CreateFromDirectory')) $true
+Assert-CV 'AWS: no per-file curated add loop'       ([bool]($awsBodyArch -match 'CreateEntryFromFile'))  $false
+Assert-CV 'AWS: no -SelectiveZipping gate remains'  ([bool]($awsBodyArch -match 'SelectiveZipping\s*\)')) $false
 # Azure/GCP must not acquire the delete-after-zip behaviour either.
 foreach ($f in @('CVAzureCloudSizingScript.ps1', 'CVGoogleCloudSizingScript.ps1')) {
     $b = Get-Content -Raw (Join-Path $srcRoot $f)

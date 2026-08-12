@@ -29,7 +29,6 @@ Results are exported as timestamped Excel workbooks, consolidated ZIP archives, 
 - **AWS CLI** (for local powershell runs)  
   Install guide: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html  
 - **PowerShell Modules**  
-  - ImportExcel  
   - AWS.Tools.Common  
   - AWS.Tools.EC2  
   - AWS.Tools.S3  
@@ -58,9 +57,9 @@ Method 1 — Run in AWS CloudShell
    ```powershell
    pwsh
    ```
-3. (Install ImportExcel + PwshSpectreConsole in CloudShell)
+3. (Install PwshSpectreConsole in CloudShell)
    ```powershell
-   Install-Module -Name ImportExcel,PwshSpectreConsole -Scope CurrentUser -Force
+   Install-Module -Name PwshSpectreConsole -Scope CurrentUser -Force
    ```
    Note: most AWS.Tools modules are pre-installed in CloudShell, but `AWS.Tools.ElastiCache` and `AWS.Tools.Backup`
    may not be — the script now **requires all** of them, so install any the preflight reports missing with
@@ -94,15 +93,15 @@ Method 2 — Run locally
    # remove any loaded AWSTools modules first (optional)
    Get-Module AWS.Tools.* | Remove-Module -Force
 
-   # install ImportExcel and AWSTools installer then required AWSTools modules
-   Install-Module -Name ImportExcel,PwshSpectreConsole -Scope CurrentUser -Force -Confirm:$false
+   # install the console UI and the AWSTools installer, then the required AWSTools modules
+   Install-Module -Name PwshSpectreConsole -Scope CurrentUser -Force -Confirm:$false
    Install-Module -Name AWS.Tools.Installer -Scope CurrentUser -Force -Confirm:$false
 
    Install-AWSToolsModule -Name AWS.Tools.Common,AWS.Tools.EC2,AWS.Tools.S3,AWS.Tools.SecurityToken,AWS.Tools.IdentityManagement,AWS.Tools.CloudWatch,AWS.Tools.RDS,AWS.Tools.DynamoDBv2,AWS.Tools.Redshift,AWS.Tools.FSx,AWS.Tools.ElasticFileSystem,AWS.Tools.EKS,AWS.Tools.DocDB,AWS.Tools.ElastiCache,AWS.Tools.Backup,AWS.Tools.ResourceGroupsTaggingAPI -Scope CurrentUser -CleanUp -Force -Confirm:$false
    ```
 4. Verify required modules are installed:
    ```powershell
-   Get-Module -ListAvailable AWS.Tools.* , ImportExcel | Select-Object Name, Version, Path
+   Get-Module -ListAvailable AWS.Tools.* | Select-Object Name, Version, Path
    ```
 5. Fix unsigned script error:
    If you encounter the following error when running the script on Windows:
@@ -164,11 +163,24 @@ Example invocations
 
 Outputs
 -------
-Files are written to the working directory with timestamps:
-- `<AccountId>_summary_YYYY-MM-DD_HHMMSS.xlsx` — per-account Excel summary & detail sheets (EC2, S3, RDS, FSx, EFS, DynamoDB, Redshift, EKS, Aurora, ElastiCache, AWS Backup)
-- `comprehensive_all_aws_accounts_summary_YYYY-MM-DD_HHMMSS.xlsx` — consolidated workbook
-- `aws_sizing_script_output_YYYY-MM-DD_HHMMSS.log` — execution log
-- `aws_sizing_results_YYYY-MM-DD_HHMMSS.zip` — ZIP archive
+Everything lands in `Output/aws_YYYY-MM-DD_HHMMSS/`, and the whole directory is zipped to
+`Output/aws_YYYY-MM-DD_HHMMSS.zip`. The loose files are kept — the ZIP is a copy, not a move.
+
+**CSV only. There are no Excel workbooks**, and `ImportExcel` is no longer a dependency. Each file spans every
+account in the run; `AwsAccountId` / `AwsAccountAlias` columns identify the owner, so filenames carry no account
+segment. This matches the Azure and GCP scripts.
+
+- `aws_inventory_summary_YYYY-MM-DD_HHMMSS.csv` — the rollup, in four tiers: overall totals, overall by region,
+  per account, then per account by region. Columns: `Account`, `ResourceType`, `Region`, `Count`, `TotalSizeGB`,
+  `TotalSizeTB`, `TotalSizeTiB`. Object / item / node counts ride inside the `ResourceType` label.
+- `aws_<service>_info_YYYY-MM-DD_HHMMSS.csv` — one row per resource, all metadata. One file per service:
+  `ec2_instance`, `ec2_unattached_volume`, `s3`, `efs`, `fsx`, `fsx_ontap_svms`, `rds`, `dynamodb`, `redshift`,
+  `eks`, `documentdb`, `aurora`, `elasticache`, `backup_protected_resources`.
+- `aws_resilience_signals_YYYY-MM-DD_HHMMSS.csv` *(unless `-SkipResilienceReport`)* — raw cyber-resilience signal
+  values; the backend applies the thresholds. A blank cell means **not collected**, never "no". See
+  [CYBER_RESILIENCE_SIGNALS.md](../CYBER_RESILIENCE_SIGNALS.md).
+- `aws_cloudrewind_*_YYYY-MM-DD_HHMMSS.csv` *(unless `-SkipCloudRewind`)* — billable-resource sizing, per account.
+- `aws_sizing_script_output_YYYY-MM-DD_HHMMSS.log` — execution log (under `Logs/`)
 - `aws_sizing_YYYY-MM-DD_HHMMSS.json` *(when `-OutputFormat json|both`)* — structured JSON with `metadata`, `summary`, `protection_summary`, and per-service `workloads` arrays; ideal for AI-generated sizing deliverables
 
 ### JSON protection_summary fields

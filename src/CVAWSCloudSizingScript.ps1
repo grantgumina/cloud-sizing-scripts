@@ -27,11 +27,12 @@
       - Default AWS CLI profile (IAM role assumed automatically in CloudShell/EC2)
       - Cross-account role assumption
 
-    Generates detailed Excel reports with both workload summaries and details,
-    at the account level and across all accounts.
+    Generates one CSV per service covering every account in the run, plus a four-tier inventory rollup
+    (overall, overall by region, per account, per account by region) - the same output shape the Azure and GCP
+    scripts produce. There are no Excel workbooks and no ImportExcel dependency.
 
     Includes hierarchical progress tracking and detailed logging.
-    Outputs timestamped Excel files and creates a ZIP archive of all results.
+    Outputs timestamped CSVs and zips the whole run directory.
 
 .PARAMETER DefaultProfile
     Use the default AWS CLI profile (IAM role) for authentication.
@@ -67,13 +68,20 @@
     Writes to the repository top level (or the current directory when run outside the repo):
 
     Output/aws_YYYY-MM-DD_HHMMSS/
-        - <AccountID>_summary_YYYY-MM-DD_HHMMSS.xlsx
-            – Account-level report (workload summaries + detailed sheets per service)
-        - comprehensive_all_aws_accounts_summary_YYYY-MM-DD_HHMMSS.xlsx
-            – Consolidated report across all AWS accounts
+        - aws_inventory_summary_YYYY-MM-DD_HHMMSS.csv
+            – The rollup: overall totals, overall by region, then per account and per account by region.
+              Columns: Account, ResourceType, Region, Count, TotalSizeGB, TotalSizeTB, TotalSizeTiB.
+        - aws_<service>_info_YYYY-MM-DD_HHMMSS.csv
+            – One file per service, one row per resource, EVERY account in the run. AwsAccountId and
+              AwsAccountAlias identify the owner, so the files no longer carry an account name segment.
+              Services: ec2_instance, ec2_unattached_volume, s3, efs, fsx, fsx_ontap_svms, rds, dynamodb,
+              redshift, eks, documentdb, aurora, elasticache, backup_protected_resources.
+        - aws_resilience_signals_YYYY-MM-DD_HHMMSS.csv   (unless -SkipResilienceReport)
+            – Raw cyber-resilience signal values; the backend applies the thresholds. See
+              CYBER_RESILIENCE_SIGNALS.md for the blank-means-not-collected rule.
         - aws_sizing_YYYY-MM-DD_HHMMSS.json        (only with -OutputFormat json|both)
     Output/aws_YYYY-MM-DD_HHMMSS.zip
-        – ZIP archive of the run's output files
+        – The whole output directory, zipped. The loose files are kept: the ZIP is a copy, not a move.
     Logs/aws_YYYY-MM-DD_HHMMSS.log
         – Complete execution log
 
@@ -114,7 +122,6 @@ param (
     [string]$RegionToQuery,
     [switch]$SkipBucketTags,
     [switch]$DebugBucketTags,
-    [switch]$SelectiveZipping = $true,
     [ValidateSet("csv","json","both")][string]$OutputFormat = "csv",  # Output format: csv (default), json, or both
     [switch]$NonInteractive,   # force plain, non-interactive output (no progress bars / rich UI) - for CI / automation
     [switch]$Quiet,            # minimal console output (still writes the full log file)
@@ -141,6 +148,8 @@ $cvRequired  = @(
     'CVSizing.Console.ps1'          # console / diagnostics / run paths
     'CVSizing.Resilience.ps1'       # provider-neutral scoring engine
     'CVSizing.Resilience.AWS.ps1'   # AWS control definitions
+    'CVSizing.Summary.ps1'          # shared four-pass inventory rollup engine (cloud-agnostic)
+    'CVSizing.Summary.AWS.ps1'      # AWS descriptor table for it
     'CVSizing.Kubectl.ps1'          # cross-platform kubectl provisioning
     'CVSizing.CloudRewind.ps1'      # provider-neutral Cloud Rewind engine
     'CVSizing.CloudRewind.AWS.ps1'  # AWS billable taxonomy (derived)
@@ -1451,18 +1460,6 @@ function Process-EFSFileSystem {
     return $efsObj
 }
 
-function Get-EmptyRow {
-    return [PSCustomObject]@{
-        "ResourceType" = ""
-        "Region" = ""
-        "Count" = ""
-        "Total Size (GiB)" = ""
-        "Total Size (GB)" = ""
-        "Total Size (TiB)" = ""
-        "Total Size (TB)" = ""
-    }
-}
-
 function Process-FSXFileSystem {
     param($Item, $Credential, $Region, $AccountInfo, $AccountAlias)
 
@@ -2567,545 +2564,80 @@ function Process-RedshiftCluster {
 }
 
 
-function New-ServiceSummaryData {
-    param(
-        [string]$ServiceName,
-        [array]$ServiceList
-    )
-
-    $serviceConfig = $script:ServiceRegistry[$ServiceName]
-    $summaryData = @()
-    $totalCount = if ($ServiceList) { $ServiceList.Count } else { 0 }
-
-    $totals = if ($ServiceName -eq "S3") {
-        Get-S3ServiceTotals -ServiceList $ServiceList
-    } elseif ($ServiceName -eq "FSX") {
-        Get-FSxServiceTotals -ServiceList $ServiceList
-    } else {
-        Get-StandardServiceTotals -ServiceList $ServiceList -SizeProperty $serviceConfig.SizeProperty
-    }
-
-    if ($ServiceName -eq "DynamoDB") {
-        $totalTableBytes = 0
-        $totalItemCount = 0
-        if ($ServiceList -and $ServiceList.Count -gt 0) {
-            $totalTableBytes = ($ServiceList | ForEach-Object { if ($_.TableSizeBytes -ne $null -and $_.TableSizeBytes -ne '') { [double]$_.TableSizeBytes } else { 0 } } | Measure-Object -Sum).Sum
-            $totalItemCount  = ($ServiceList | ForEach-Object { if ($_.ItemCount -ne $null -and $_.ItemCount -ne '') { [double]$_.ItemCount } else { 0 } } | Measure-Object -Sum).Sum
-        }
-    }
-
-    if ($ServiceName -eq "FSX" -and $ServiceList -and $ServiceList.Count -gt 0) {
-        $fsxTypes = $ServiceList | Select-Object -ExpandProperty Type -Unique | Sort-Object
-
-        foreach ($fsxType in $fsxTypes) {
-            $typeItems = $ServiceList | Where-Object { $_.Type -eq $fsxType }
-            $typeTotals = Get-FSxServiceTotals -ServiceList $typeItems
-
-            $summaryData += [PSCustomObject]@{
-                "ResourceType" = $fsxType
-                "Region" = "All"
-                "Count" = $typeItems.Count
-                "Total Size (GiB)" = [math]::Round($typeTotals.GiB, 3)
-                "Total Size (GB)" = [math]::Round($typeTotals.GB, 3)
-                "Total Size (TiB)" = [math]::Round($typeTotals.TiB, 4)
-                "Total Size (TB)" = [math]::Round($typeTotals.TB, 4)
-            }
-        }
-
-        $summaryData += [PSCustomObject]@{
-            "ResourceType" = "Total"
-            "Region" = "All"
-            "Count" = $totalCount
-            "Total Size (GiB)" = [math]::Round($totals.GiB, 3)
-            "Total Size (GB)" = [math]::Round($totals.GB, 3)
-            "Total Size (TiB)" = [math]::Round($totals.TiB, 4)
-            "Total Size (TB)" = [math]::Round($totals.TB, 4)
-        }
-    } else {
-        $displayName = "$ServiceName $($serviceConfig.DisplayName)"
-        $row = [ordered]@{
-            "ResourceType" = $displayName
-            "Region" = "All"
-            "Count" = $totalCount
-            "Total Size (GiB)" = [math]::Round($totals.GiB, 3)
-            "Total Size (GB)" = [math]::Round($totals.GB, 3)
-            "Total Size (TiB)" = [math]::Round($totals.TiB, 4)
-            "Total Size (TB)" = [math]::Round($totals.TB, 4)
-        }
-        if ($ServiceName -eq "DynamoDB") {
-            $row["Total Table Size (Bytes)"] = $totalTableBytes
-            $row["Total Item Count"] = $totalItemCount
-        }
-        if ($ServiceName -eq "S3") {
-            $totalObjectCount = ($ServiceList | ForEach-Object { if ($_.ObjectCount -ne $null -and $_.ObjectCount -ne '') { [long]$_.ObjectCount } else { 0 } } | Measure-Object -Sum).Sum
-            $row["Total Object Count"] = $totalObjectCount  
-        }
-        if ($ServiceName -eq "EKS") {
-            $totalNodeCount = ($ServiceList | ForEach-Object { if ($_.NodeCount -ne $null) { [int]$_.NodeCount } else { 0 } } | Measure-Object -Sum).Sum
-            $row["Total Node Count"] = $totalNodeCount
-        }
-        $summaryData += [PSCustomObject]$row
-    }
-
-    $summaryData += Get-EmptyRow
-    $summaryData += Get-EmptyRow
-
-    $summaryData += Get-RegionalBreakdown -ServiceName $ServiceName -ServiceList $ServiceList
-
-    return $summaryData
-}
-
-function Get-RegionalBreakdown {
-    param([string]$ServiceName, [array]$ServiceList)
-
-    $regions = if ($ServiceList) {
-        $ServiceList | Select-Object -ExpandProperty Region -Unique | Sort-Object
-    } else { @() }
-
-    if ($regions.Count -eq 0) { return @() }
-
-    $breakdownData = @()
-
-    $header = [ordered]@{
-        "ResourceType" = "--- $($ServiceName.ToUpper()) REGIONAL BREAKDOWN ---"
-        "Region" = ""
-        "Count" = ""
-        "Total Size (GiB)" = ""
-        "Total Size (GB)" = ""
-        "Total Size (TiB)" = ""
-        "Total Size (TB)" = ""
-    }
-    if ($ServiceName -eq "DynamoDB") {
-        $header["Total Table Size (Bytes)"] = ""
-        $header["Total Item Count"] = ""
-    }
-    if ($ServiceName -eq "EKS") {
-        $header["Total Node Count"] = ""
-    }
-    $breakdownData += [PSCustomObject]$header
-
-    if ($ServiceName -eq "FSX") {
-        $breakdownData += [PSCustomObject]@{
-            "ResourceType" = "Region"
-            "Region" = "Type"
-            "Count" = "Count"
-            "Total Size (GiB)" = "Total Size (GiB)"
-            "Total Size (GB)" = "Total Size (GB)"
-            "Total Size (TiB)" = "Total Size (TiB)"
-            "Total Size (TB)" = "Total Size (TB)"
-        }
-    } else {
-        $colHeader = [ordered]@{
-            "ResourceType" = "Region"
-            "Region" = ""
-            "Count" = "Count"
-            "Total Size (GiB)" = "Total Size (GiB)"
-            "Total Size (GB)" = "Total Size (GB)"
-            "Total Size (TiB)" = "Total Size (TiB)"
-            "Total Size (TB)" = "Total Size (TB)"
-        }
-        if ($ServiceName -eq "DynamoDB") {
-            $colHeader["Total Table Size (Bytes)"] = "Total Table Size (Bytes)"
-            $colHeader["Total Item Count"] = "Total Item Count"
-        }
-        if ($ServiceName -eq "S3") {
-            $colHeader["Total Object Count"] = "Total Object Count"
-        }
-        $breakdownData += [PSCustomObject]$colHeader
-    }
-
-    if ($ServiceName -eq "FSX") {
-        $breakdownData += Get-FSxRegionalBreakdown -ServiceList $ServiceList -Regions $regions
-    } else {
-        foreach ($region in $regions) {
-            $regionItems = $ServiceList | Where-Object Region -eq $region
-            if ($regionItems.Count -gt 0) {
-                $regionTotals = if ($ServiceName -eq "S3") {
-                    Get-S3ServiceTotals -ServiceList $regionItems
-                } else {
-                    Get-StandardServiceTotals -ServiceList $regionItems -SizeProperty $script:ServiceRegistry[$ServiceName].SizeProperty
-                }
-
-                $row = [ordered]@{
-                    "ResourceType" = $region
-                    "Region" = ""
-                    "Count" = $regionItems.Count
-                    "Total Size (GiB)" = [math]::Round($regionTotals.GiB, 3)
-                    "Total Size (GB)" = [math]::Round($regionTotals.GB, 3)
-                    "Total Size (TiB)" = [math]::Round($regionTotals.TiB, 4)
-                    "Total Size (TB)" = [math]::Round($regionTotals.TB, 4)
-                }
-
-                if ($ServiceName -eq "DynamoDB") {
-                    $regionBytes = ($regionItems | ForEach-Object { if ($_.TableSizeBytes -ne $null -and $_.TableSizeBytes -ne '') { [double]$_.TableSizeBytes } else { 0 } } | Measure-Object -Sum).Sum
-                    $regionItemsCount = ($regionItems | ForEach-Object { if ($_.ItemCount -ne $null -and $_.ItemCount -ne '') { [double]$_.ItemCount } else { 0 } } | Measure-Object -Sum).Sum
-                    $row["Total Table Size (Bytes)"] = $regionBytes
-                    $row["Total Item Count"] = $regionItemsCount
-                }
-                if ($ServiceName -eq "EKS") {
-                    $regionNodeCount = ($regionItems | ForEach-Object { if ($_.NodeCount -ne $null) { [int]$_.NodeCount } else { 0 } } | Measure-Object -Sum).Sum
-                    $row["Total Node Count"] = $regionNodeCount
-                }
-                if ($ServiceName -eq "S3") {
-                    $regionObjectCount = ($regionItems | ForEach-Object { if ($_.ObjectCount -ne $null -and $_.ObjectCount -ne '') { [long]$_.ObjectCount } else { 0 } } | Measure-Object -Sum).Sum
-                    $row["Total Object Count"] = $regionObjectCount
-                }
-
-                $breakdownData += [PSCustomObject]$row
-            }
-        }
-    }
-
-    return $breakdownData
-}
-
-function Get-StandardServiceTotals {
-    param([array]$ServiceList, [string]$SizeProperty)
-
-    if (-not $ServiceList -or $ServiceList.Count -eq 0) {
-        return @{ GiB = 0; TiB = 0; GB = 0; TB = 0 }
-    }
-
-    if ($SizeProperty -and $SizeProperty -eq 'Custom') { $SizeProperty = $null }
-
-    if ($SizeProperty -and ($SizeProperty.ToLower().Contains('byte'))) {
-        $rawSum = ($ServiceList | ForEach-Object { if ($_.$SizeProperty -ne $null -and $_.$SizeProperty -ne '') { [double]($_.$SizeProperty) } else { 0 } } | Measure-Object -Sum).Sum
-        return @{
-            GiB = $rawSum / 1GB
-            TiB = $rawSum / 1TB
-            GB  = $rawSum / 1e9
-            TB  = $rawSum / 1e12
-        }
-    }
-
-    try {
-        if ($SizeProperty -and (($ServiceList | Select-Object -First 1).PSObject.Properties.Name -contains $SizeProperty)) {
-            $giB = ($ServiceList | ForEach-Object { if ($_.$SizeProperty -ne $null -and $_.$SizeProperty -ne '') { [double]($_.$SizeProperty) } else { 0 } } | Measure-Object -Sum).Sum
-            $tib = ($ServiceList | ForEach-Object { if ($_.SizeTiB -ne $null -and $_.SizeTiB -ne '') { [double]$_.SizeTiB } else { 0 } } | Measure-Object -Sum).Sum
-            $gb  = ($ServiceList | ForEach-Object { if ($_.SizeGB -ne $null -and $_.SizeGB -ne '') { [double]$_.SizeGB } else { 0 } } | Measure-Object -Sum).Sum
-            $tb  = ($ServiceList | ForEach-Object { if ($_.SizeTB -ne $null -and $_.SizeTB -ne '') { [double]$_.SizeTB } else { 0 } } | Measure-Object -Sum).Sum
-
-            return @{ GiB = $giB; TiB = $tib; GB = $gb; TB = $tb }
-        }
-
-        $sumProp = {
-            param($names)
-            ($ServiceList | ForEach-Object {
-                foreach ($n in $names) { if ($_.PSObject.Properties.Name -contains $n -and $_.$n -ne $null -and $_.$n -ne '') { return [double]($_.$n) } }
-                return 0
-            } | Measure-Object -Sum).Sum
-        }
-
-        $giB = & $sumProp @('TotalSizeGiB','SizeGiB','StorageCapacityGiB','TableSizeGiB','VolumesSizeGiB')
-        $tib = & $sumProp @('TotalSizeTiB','SizeTiB','StorageCapacityTiB','TableSizeTiB','VolumesSizeTiB')
-        $gb  = & $sumProp @('TotalSizeGB','SizeGB','StorageCapacityGB','TableSizeGB','VolumesSizeGB')
-        $tb  = & $sumProp @('TotalSizeTB','SizeTB','StorageCapacityTB','TableSizeTB','VolumesSizeTB')
-
-        if ($giB -eq 0 -and $gb -gt 0) {
-            $giB = $gb / (1024/1000)
-        }
-        if ($tib -eq 0 -and $giB -gt 0) { $tib = $giB / 1024 }
-        if ($tb -eq 0 -and $gb -gt 0) { $tb = $gb / 1000 }
-
-        return @{ GiB = $giB; TiB = $tib; GB = $gb; TB = $tb }
-    } catch {
-        return @{ GiB = 0; TiB = 0; GB = 0; TB = 0 }
-    }
-}
-
-function Get-S3ServiceTotals {
-    param([array]$ServiceList)
-
-    if (-not $ServiceList -or $ServiceList.Count -eq 0) {
-        return @{ GiB = 0; TiB = 0; GB = 0; TB = 0 }
-    }
-
-    $totalGiB = 0.0
-    $totalGB  = 0.0
-    $totalTiB = 0.0
-    $totalTB  = 0.0
-
-    foreach ($item in $ServiceList) {
-        if (-not $item -or -not $item.PSObject) { continue }
-        $props = $item.PSObject.Properties.Name
-
-        foreach ($p in $props) {
-            $val = $null
-            try { $val = $item.$p } catch { continue }
-            if ($null -eq $val -or $val -eq '') { continue }
-
-            try { $d = [double]$val } catch { continue }
-
-            if ($p -match '(_SizeGiB$|^SizeGiB$)')       { $totalGiB += $d; continue }
-            if ($p -match '(_SizeGB$|^SizeGB$)')         { $totalGB  += $d; continue }
-            if ($p -match '(_SizeTiB$|^SizeTiB$)')       { $totalTiB += $d; continue }
-            if ($p -match '(_SizeTB$|^SizeTB$)')         { $totalTB  += $d; continue }
-        }
-    }
-
-    if ($totalGiB -eq 0 -and $totalGB -gt 0) { $totalGiB = $totalGB / (1024/1000) }   
-    if ($totalTiB -eq 0 -and $totalGiB -gt 0) { $totalTiB = $totalGiB / 1024 }
-    if ($totalTB -eq 0 -and $totalGB -gt 0) { $totalTB = $totalGB / 1000 }
-
-    return @{ GiB = $totalGiB; TiB = $totalTiB; GB = $totalGB; TB = $totalTB }
-}
-function Get-FSxServiceTotals {
-    param([array]$ServiceList)
-
-    if (-not $ServiceList -or $ServiceList.Count -eq 0) {
-        return @{ GiB = 0; TiB = 0; GB = 0; TB = 0 }
-    }
-
-    return @{
-        GiB = ($ServiceList.StorageCapacityGiB | Measure-Object -Sum).Sum
-        TiB = ($ServiceList.StorageCapacityTiB | Measure-Object -Sum).Sum
-        GB = ($ServiceList.StorageCapacityGB | Measure-Object -Sum).Sum
-        TB = ($ServiceList.StorageCapacityTB | Measure-Object -Sum).Sum
-    }
-}
-
-function Get-FSxRegionalBreakdown {
-    param([array]$ServiceList, [array]$Regions)
-
-    $breakdownData = @()
-    $fsxTypes = $ServiceList | Select-Object -ExpandProperty Type -Unique | Sort-Object
-
-    foreach ($region in $Regions) {
-        $breakdownData += [PSCustomObject]@{
-            "ResourceType" = $region
-            "Region" = ""
-            "Count" = ""
-            "Total Size (GiB)" = ""
-            "Total Size (GB)" = ""
-            "Total Size (TiB)" = ""
-            "Total Size (TB)" = ""
-        }
-
-        foreach ($fsxType in $fsxTypes) {
-            $regionTypeFsx = $ServiceList | Where-Object { $_.Region -eq $region -and $_.Type -eq $fsxType }
-            if ($regionTypeFsx.Count -gt 0) {
-                $typeTotals = Get-FSxServiceTotals -ServiceList $regionTypeFsx
-
-                $breakdownData += [PSCustomObject]@{
-                    "ResourceType" = ""
-                    "Region" = $fsxType
-                    "Count" = $regionTypeFsx.Count
-                    "Total Size (GiB)" = [math]::Round($typeTotals.GiB, 3)
-                    "Total Size (GB)" = [math]::Round($typeTotals.GB, 3)
-                    "Total Size (TiB)" = [math]::Round($typeTotals.TiB, 4)
-                    "Total Size (TB)" = [math]::Round($typeTotals.TB, 4)
-                }
-            }
-        }
-    }
-
-    return $breakdownData
-}
-
-
-
-function New-AccountLevelSummary {
-    param([string]$AccountId, [string]$AccountAlias)
-
-    try {
-        $accountSummaryFile = Join-Path $script:Config.OutputPath "${AccountId}_summary_$date_string.xlsx"
-        $dataSheets = [ordered]@{}
-
-        foreach ($serviceName in $script:ServiceRegistry.Keys) {
-            $serviceList = $script:ServiceDataByAccount[$AccountId][$serviceName]
-            $summarySheetName = if ($serviceName -eq "UnattachedVolumes") {
-                "Unattached Volume Summary"
-            } elseif ($serviceName -eq "FSX_SVM") {
-                "FSx SVM Summary"
-            } else {
-                "$serviceName Summary"
-            }
-            if ($serviceList -and $serviceList.Count -gt 0) {
-                $dataSheets[$summarySheetName] = New-ServiceSummaryData -ServiceName $serviceName -ServiceList $serviceList
-            }        }
-
-        $detailSheets = @{
-            "EC2 Details" = $script:ServiceDataByAccount[$AccountId]["EC2"]
-            "S3 Details" = $script:ServiceDataByAccount[$AccountId]["S3"]
-            "Unattached Volumes" = $script:ServiceDataByAccount[$AccountId]["UnattachedVolumes"]
-            "EFS Details" = $script:ServiceDataByAccount[$AccountId]["EFS"]
-            "FSx Details" = $script:ServiceDataByAccount[$AccountId]["FSX"]
-            "FSx SVM Details" = $script:ServiceDataByAccount[$AccountId]["FSX_SVM"]
-            "RDS Details" = $script:ServiceDataByAccount[$AccountId]["RDS"]
-            "DynamoDB Details" = $script:ServiceDataByAccount[$AccountId]["DynamoDB"]
-            "Redshift Details" = $script:ServiceDataByAccount[$AccountId]["Redshift"]
-            "EKS Details" = $script:ServiceDataByAccount[$AccountId]["EKS"]
-            "DocumentDB Details" = $script:ServiceDataByAccount[$AccountId]["DocumentDB"]
-        }
-
-        foreach ($sheetName in $detailSheets.Keys) {
-            if ($detailSheets[$sheetName] -and $detailSheets[$sheetName].Count -gt 0) {
-                if ($sheetName -eq "S3 Details") {
-                    $dataSheets[$sheetName] = $detailSheets[$sheetName] |
-                        Select-Object AwsAccountId, AwsAccountAlias, Region, BucketName, ObjectCount, CreationDate, SizeGiB, SizeTiB, SizeGB, SizeTB
-                }
-                elseif ($sheetName -eq "FSx SVM Details") {
-                    $svmItems = $detailSheets[$sheetName]
-                    $tagProps = ($svmItems | ForEach-Object { $_.PSObject.Properties.Name } | Where-Object { $_ -like 'Tag_*' } | Sort-Object -Unique)
-                    $cols = @(
-                        'AwsAccountId','AwsAccountAlias','Region','FileSystemId','StorageVirtualMachineId','Name',
-                        'OperationalState','UUID','VolumeCount',
-                        @{Name='SizeGiB';Expression={ $_.VolumesSizeGiB }},
-                        @{Name='SizeTiB';Expression={ $_.VolumesSizeTiB }},
-                        @{Name='SizeGB';Expression={ $_.VolumesSizeGB }},
-                        @{Name='SizeTB';Expression={ $_.VolumesSizeTB }},
-                        'VolumeDetails'
-                    ) + $tagProps
-                    $dataSheets[$sheetName] = $svmItems | Select-Object $cols
-                }
-                else {
-                    $dataSheets[$sheetName] = $detailSheets[$sheetName]
-                }
-            }
-        }
-
-        $result = Export-DataToExcel -FilePath $accountSummaryFile -DataSheets $dataSheets
-
-        if ($result) {
-            Write-ScriptOutput "Account-level summary created: $accountSummaryFile" -Level Success
-            $script:AllOutputFiles.Add($accountSummaryFile) | Out-Null
-        }
-
-        return $result
-    }
-    catch {
-        Write-ScriptOutput "Error creating account-level summary for account ${AccountId}: $_" -Level Error
-        return $false
-    }
-}
 
 function Export-ServiceCSVFiles {
-    param([string]$AccountId, [string]$AccountAlias)
+    <#
+      .SYNOPSIS  Write one CSV per service, covering EVERY account in the run.
+      .DESCRIPTION Was called once per account and produced <service>_<accountAlias>_<date>.csv, so a
+                   three-account run left ~21 files that a human had to concatenate before they could pivot.
+                   Azure emits one CSV per resource type for the whole run with a Subscription column; this is
+                   the AWS equivalent, keyed by the AwsAccountId / AwsAccountAlias that Process-* already stamps
+                   on every row. Filenames therefore lose the account segment.
 
+                   Called ONCE, after every account has been collected and scored - not inside the account loop.
+    #>
     try {
-        $accountSuffix = if ($AccountAlias -and $AccountAlias -ne "Unknown") { $AccountAlias } else { $AccountId }
-
-        $outputFileEc2Instance = "${baseOutputEc2Instance}_${accountSuffix}_$date_string.csv"
-        $outputFileEc2UnattachedVolume = "${baseOutputEc2UnattachedVolume}_${accountSuffix}_$date_string.csv"
-        $outputFileS3 = "${baseOutputS3}_${accountSuffix}_$date_string.csv"
-        $outputFileEFS = "${baseOutputEFS}_${accountSuffix}_$date_string.csv"
-        $outputFileFSx = "${baseOutputFSx}_${accountSuffix}_$date_string.csv"
-
-        $outputFileFSxSVM = "${baseOutputFSxSVM}_${accountSuffix}_$date_string.csv"
-        $outputFileRDS = "${baseOutputRDS}_${accountSuffix}_$date_string.csv"
-        $outputFileDynamoDB = "${baseOutputDynamoDB}_${accountSuffix}_$date_string.csv"
-        $outputFileRedshift = "${baseOutputRedshift}_${accountSuffix}_$date_string.csv"
-        $outputFileEKS = "${baseOutputEKS}_${accountSuffix}_$date_string.csv"
-        $outputFileDocumentDB   = "${baseOutputDocumentDB}_${accountSuffix}_$date_string.csv"
-        $outputFileAurora       = "${baseOutputAurora}_${accountSuffix}_$date_string.csv"
-        $outputFileElastiCache  = "${baseOutputElastiCache}_${accountSuffix}_$date_string.csv"
-        $outputFileAWSBackup    = "${baseOutputAWSBackup}_${accountSuffix}_$date_string.csv"
-
-
-        $serviceExports = @{
-            EC2 = @{ File = $outputFileEc2Instance; Data = $script:ServiceDataByAccount[$AccountId]["EC2"] }
-            UnattachedVolumes = @{ File = $outputFileEc2UnattachedVolume; Data = $script:ServiceDataByAccount[$AccountId]["UnattachedVolumes"] }
-            S3 = @{ File = $outputFileS3; Data = $script:ServiceDataByAccount[$AccountId]["S3"] }
-            EFS = @{ File = $outputFileEFS; Data = $script:ServiceDataByAccount[$AccountId]["EFS"] }
-            FSX = @{ File = $outputFileFSx; Data = $script:ServiceDataByAccount[$AccountId]["FSX"] }
-            FSX_SVM = @{ File = $outputFileFSxSVM; Data = $script:ServiceDataByAccount[$AccountId]["FSX_SVM"] }
-            RDS = @{ File = $outputFileRDS; Data = $script:ServiceDataByAccount[$AccountId]["RDS"] }
-            DynamoDB = @{ File = $outputFileDynamoDB; Data = $script:ServiceDataByAccount[$AccountId]["DynamoDB"] }
-            Redshift = @{ File = $outputFileRedshift; Data = $script:ServiceDataByAccount[$AccountId]["Redshift"] }
-            EKS = @{ File = $outputFileEKS; Data = $script:ServiceDataByAccount[$AccountId]["EKS"] }
-            DocumentDB = @{ File = $outputFileDocumentDB; Data = $script:ServiceDataByAccount[$AccountId]["DocumentDB"] }
-            Aurora = @{ File = $outputFileAurora; Data = $script:ServiceDataByAccount[$AccountId]["Aurora"] }
-            ElastiCache = @{ File = $outputFileElastiCache; Data = $script:ServiceDataByAccount[$AccountId]["ElastiCache"] }
-            AWSBackup = @{ File = $outputFileAWSBackup; Data = $script:ServiceDataByAccount[$AccountId]["AWSBackup"] }
+        # Service -> base filename. Registry order is not meaningful here; the map is authoritative.
+        $serviceFiles = [ordered]@{
+            EC2               = $baseOutputEc2Instance
+            UnattachedVolumes = $baseOutputEc2UnattachedVolume
+            S3                = $baseOutputS3
+            EFS               = $baseOutputEFS
+            FSX               = $baseOutputFSx
+            FSX_SVM           = $baseOutputFSxSVM
+            RDS               = $baseOutputRDS
+            DynamoDB          = $baseOutputDynamoDB
+            Redshift          = $baseOutputRedshift
+            EKS               = $baseOutputEKS
+            DocumentDB        = $baseOutputDocumentDB
+            Aurora            = $baseOutputAurora
+            ElastiCache       = $baseOutputElastiCache
+            AWSBackup         = $baseOutputAWSBackup
         }
 
-        foreach ($serviceName in $serviceExports.Keys) {
-            $export = $serviceExports[$serviceName]
-            if ($export.Data -and $export.Data.Count -gt 0) {
-                if (-not $export.File -or [string]::IsNullOrWhiteSpace($export.File)) {
-                    Write-ScriptOutput "Skipping export for $serviceName because target file path is empty" -Level Warning
-                    continue
-                }
-
-                # One CSV per service type, one row per instance, full metadata - matching the Azure layout.
-                # (No per-service column subsetting: every discovered property is emitted.)
-                $csvPath = Join-Path $script:Config.OutputPath $export.File
-                $export.Data | Export-Csv -Path $csvPath -NoTypeInformation
-
-                Write-ScriptOutput "$($export.File) written to $($script:Config.OutputPath)" -Level Info
-                $script:AllOutputFiles.Add($csvPath) | Out-Null
+        foreach ($serviceName in $serviceFiles.Keys) {
+            $baseName = $serviceFiles[$serviceName]
+            if ([string]::IsNullOrWhiteSpace($baseName)) {
+                Write-ScriptOutput "Skipping export for $serviceName because its base file name is empty" -Level Warning
+                continue
             }
+
+            # Concatenate every account's rows for this service, preserving account processing order.
+            $rows = [System.Collections.Generic.List[psobject]]::new()
+            foreach ($account in $script:AccountsProcessed) {
+                $perAccount = $script:ServiceDataByAccount["$($account.Account)"]
+                if (-not $perAccount) { continue }
+                foreach ($row in @($perAccount[$serviceName])) { if ($row) { $rows.Add($row) } }
+            }
+            if (-not $rows.Count) { continue }
+
+            # Export-Csv takes its header from the FIRST object and silently drops properties later objects add.
+            # Accounts are scored independently, so a control that only resolved in account 2 would otherwise
+            # vanish from the file entirely. Union the property names and project every row onto that union, so a
+            # column missing from one account reads as blank - which is this repo's "not collected" - rather than
+            # disappearing for everyone.
+            $columns = [System.Collections.Generic.List[string]]::new()
+            $seen    = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+            foreach ($row in $rows) {
+                foreach ($name in $row.PSObject.Properties.Name) {
+                    if ($seen.Add($name)) { $columns.Add($name) }
+                }
+            }
+
+            $outputFile = "${baseName}_$date_string.csv"
+            $csvPath    = Join-Path $script:Config.OutputPath $outputFile
+            $rows | Select-Object -Property $columns | Export-Csv -Path $csvPath -NoTypeInformation
+
+            $accountCount = @($rows | Group-Object AwsAccountId).Count
+            Write-ScriptOutput "$outputFile written to $($script:Config.OutputPath) ($($rows.Count) rows across $accountCount account(s))" -Level Info
+            $script:AllOutputFiles.Add($csvPath) | Out-Null
         }
     }
     catch {
-        Write-ScriptOutput "Error exporting CSV files for account ${AccountId}: $_" -Level Error
+        Write-ScriptOutput "Error exporting service CSV files: $_" -Level Error
     }
 }
 
-function Export-DataToExcel {
-    param(
-        [string]$FilePath,
-        [System.Collections.IDictionary]$DataSheets
-    )
-
-    try {
-        if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
-            Write-ScriptOutput "ImportExcel module not found. Install it with: Install-Module ImportExcel -Scope CurrentUser" -Level Warning
-            return $false
-        }
-
-        Import-Module ImportExcel -Force -ErrorAction Stop
-        Write-ScriptOutput "Using ImportExcel module for Excel generation..." -Level Success
-
-        if (Test-Path $FilePath) {
-            Remove-Item $FilePath -Force
-        }
-        $worksheetOrder = @(
-            "EC2 Summary", "S3 Summary","EFS Summary", "FSX Summary","FSx SVM Summary",
-            "RDS Summary", "DynamoDB Summary", "Redshift Summary","DocumentDB Summary","EKS Summary", "Unattached Volume Summary",
-            "EC2 Details", "S3 Details", "EFS Details", "FSx Details", "FSx SVM Details",
-            "RDS Details", "DynamoDB Details", "Redshift Details", "DocumentDB Details", "EKS Details","Unattached Volumes Details"
-        )
-        foreach ($sheetName in $worksheetOrder) {
-            if ($DataSheets.Keys -contains $sheetName) {
-                $data = $DataSheets[$sheetName]
-                $data | Export-Excel -Path $FilePath -WorksheetName $sheetName -AutoSize -FreezeTopRow -BoldTopRow
-
-                if ($sheetName -like "*Summary*") {
-                    try {
-                        $excel = Open-ExcelPackage -Path $FilePath
-                        $worksheet = $excel.Workbook.Worksheets[$sheetName]
-
-                        for ($row = 1; $row -le $worksheet.Dimension.End.Row; $row++) {
-                            $cellValue = $worksheet.Cells[$row, 1].Value
-                            if ($cellValue -and ($cellValue.ToString() -eq "Region" -or
-                                ($cellValue.ToString() -eq "Region" -and $worksheet.Cells[$row, 2].Value -eq "Type"))) {
-
-                                $prevRowValue = if ($row -gt 1) { $worksheet.Cells[$row-1, 1].Value } else { $null }
-                                if ($prevRowValue -and $prevRowValue.ToString() -like "*BREAKDOWN*") {
-                                    for ($col = 1; $col -le $worksheet.Dimension.End.Column; $col++) {
-                                        $worksheet.Cells[$row, $col].Style.Font.Bold = $true
-                                    }
-                                }
-                            }
-                        }
-                        Close-ExcelPackage $excel -Save
-                    }
-                    catch {
-                        Write-ScriptOutput "Warning: Could not apply additional formatting to $sheetName : $_" -Level Warning
-                    }
-                }
-
-            }
-        }
-        Write-ScriptOutput "Excel summary file created: $FilePath" -Level Success
-        return $true
-    }
-    catch {
-        Write-ScriptOutput "Failed to create Excel summary file: $_" -Level Error
-        return $false
-    }
-}
 function Get-S3BucketSize {
     param([string]$BucketName, [object]$Credential, [string]$Region)
 
@@ -3456,9 +2988,8 @@ function Invoke-AWSDataCollection {
             # Score native resilience posture BEFORE the CSVs are written so the Ctl_* columns land on them.
             Invoke-AWSResiliencePass -AccountId $accountInfo.Account
 
-            # Per-service CSVs (one file per discovered service type) plus the Excel summary workbook.
-            Export-ServiceCSVFiles -AccountId $accountInfo.Account -AccountAlias $accountInfo.AccountAlias
-            New-AccountLevelSummary -AccountId $accountInfo.Account -AccountAlias $accountInfo.AccountAlias
+            # CSVs are NOT written here. Both the per-service files and the rollup span every account, so they
+            # are written once at the end of the run - see Export-ServiceCSVFiles / Export-InventorySummaryCSV.
         }
 
         # Cloud Rewind billable-resource sizing (independent of the Data Protection inventory above).
@@ -3876,452 +3407,98 @@ function Invoke-AuthenticationScenarios {
     & $authFunctions[$scenario]
 }
 
-function ComprehensiveSummary {
+function Export-InventorySummaryCSV {
+    <#
+      .SYNOPSIS  Write aws_inventory_summary_<date>.csv - the cross-account inventory rollup.
+      .DESCRIPTION Replaces the two Excel workbooks this script used to emit (a per-account
+                   <AccountId>_summary_<date>.xlsx and a consolidated one). The rollup shape, the arithmetic
+                   and the column set now come from the same engine Azure uses - see
+                   common/CVSizing.Summary.ps1 for the four passes and common/CVSizing.Summary.AWS.ps1 for the
+                   AWS descriptor table, which also documents the S3 double-count the workbook had.
+    #>
     try {
-        Write-ScriptOutput "Creating comprehensive summary across all accounts..." -Level Info
+        $summaryFile = Join-Path $script:Config.OutputPath "aws_inventory_summary_$date_string.csv"
 
-        $comprehensiveData = @{}
-
+        # Flatten the per-account collections into one list per service. The engine's per-account pass re-splits
+        # them on AwsAccountId, which Process-* stamps on every row, so nothing has to be threaded through here.
+        $inventory = @{}
+        $selected  = @{}
         foreach ($serviceName in $script:ServiceRegistry.Keys) {
-            $allServiceData = @()
+            $svcRows = [System.Collections.Generic.List[psobject]]::new()
             foreach ($accountId in $script:ServiceDataByAccount.Keys) {
-                $accountData = $script:ServiceDataByAccount[$accountId][$serviceName]
-                if ($accountData) {
-                    $allServiceData += $accountData
+                foreach ($row in @($script:ServiceDataByAccount[$accountId][$serviceName])) {
+                    if ($row) { $svcRows.Add($row) }
                 }
             }
-            $comprehensiveData[$serviceName] = $allServiceData
+            $inventory[$serviceName] = $svcRows
+            $selected[$serviceName]  = $true    # AWS has no -Types gate; every registered service is in scope.
         }
 
-        $comprehensiveFile = Join-Path $script:Config.OutputPath "comprehensive_all_aws_accounts_summary_$date_string.xlsx"
-        $dataSheets = [ordered]@{}
+        # Scope objects need a .Name holding the value AwsAccountId is matched against.
+        $accounts = @($script:AccountsProcessed | ForEach-Object { [PSCustomObject]@{ Name = "$($_.Account)" } })
 
-        foreach ($serviceName in $script:ServiceRegistry.Keys) {
-            $serviceList = $comprehensiveData[$serviceName]
-            $summarySheetName = if ($serviceName -eq "UnattachedVolumes") {
-                "Unattached Volume Summary"
-            } elseif ($serviceName -eq "FSX_SVM") {
-                "FSx SVM Summary"
-            }else {
-                "$serviceName Summary"
-            }
-            if ($serviceList -and $serviceList.Count -gt 0) {
-                $dataSheets[$summarySheetName] = MultiAccountComprehensiveSummaryData -ServiceName $serviceName -ServiceList $serviceList
-            }        
+        $summaryRows = @(Get-CVAwsInventorySummary -Inventory $inventory -Selected $selected -Accounts $accounts)
+        if (-not $summaryRows.Count) {
+            Write-ScriptOutput "No inventory collected; skipping the inventory summary CSV." -Level Warning
+            return $false
         }
 
-        $detailSheets = @{
-            "EC2 Details" = $comprehensiveData["EC2"]
-            "S3 Details" = $comprehensiveData["S3"]
-            "Unattached Volumes" = $comprehensiveData["UnattachedVolumes"]
-            "EFS Details" = $comprehensiveData["EFS"]
-            "FSx Details" = $comprehensiveData["FSX"]
-            "FSx SVM Details" = $comprehensiveData["FSX_SVM"]
-            "RDS Details" = $comprehensiveData["RDS"]
-            "EKS Details" = $comprehensiveData["EKS"]
-            "DynamoDB Details" = $comprehensiveData["DynamoDB"]
-            "Redshift Details" = $comprehensiveData["Redshift"]
-            "DocumentDB Details" = $comprehensiveData["DocumentDB"]
-        }
-
-        foreach ($sheetName in $detailSheets.Keys) {
-            if ($detailSheets[$sheetName] -and $detailSheets[$sheetName].Count -gt 0) {
-                if ($sheetName -eq "S3 Details") {
-                    $dataSheets[$sheetName] = $detailSheets[$sheetName] |
-                        Select-Object AwsAccountId, AwsAccountAlias, Region, BucketName, ObjectCount, CreationDate, SizeGiB, SizeTiB, SizeGB, SizeTB
-                }
-                elseif ($sheetName -eq "FSx SVM Details") {
-                    $svmItems = $detailSheets[$sheetName]
-                    $tagProps = ($svmItems | ForEach-Object { $_.PSObject.Properties.Name } | Where-Object { $_ -like 'Tag_*' } | Sort-Object -Unique)
-                    $cols = @(
-                        'AwsAccountId','AwsAccountAlias','Region','FileSystemId','StorageVirtualMachineId','Name',
-                        'OperationalState','UUID','VolumeCount',
-                        @{Name='SizeGiB';Expression={ $_.VolumesSizeGiB }},
-                        @{Name='SizeTiB';Expression={ $_.VolumesSizeTiB }},
-                        @{Name='SizeGB';Expression={ $_.VolumesSizeGB }},
-                        @{Name='SizeTB';Expression={ $_.VolumesSizeTB }},
-                        'VolumeDetails'
-                    ) + $tagProps
-                    $dataSheets[$sheetName] = $svmItems | Select-Object $cols
-                }
-                else {
-                    $dataSheets[$sheetName] = $detailSheets[$sheetName]
-                }
-            }
-        }
-
-        $result = Export-DataToExcel -FilePath $comprehensiveFile -DataSheets $dataSheets
-
-        if ($result) {
-            Write-ScriptOutput "Comprehensive summary created: $comprehensiveFile" -Level Success
-            $script:AllOutputFiles.Add($comprehensiveFile) | Out-Null
-        }
+        $summaryRows | Export-Csv -Path $summaryFile -NoTypeInformation
+        Write-ScriptOutput "Inventory summary: $summaryFile" -Level Success
+        return $true
     }
     catch {
-        Write-ScriptOutput "Error creating comprehensive summary: $_" -Level Error
+        Write-ScriptOutput "Error creating inventory summary CSV: $_" -Level Error
+        return $false
     }
-}
-
-function MultiAccountComprehensiveSummaryData {
-    param(
-        [string]$ServiceName,
-        [array]$ServiceList
-    )
-
-    $serviceConfig = $script:ServiceRegistry[$ServiceName]
-    $summaryData = @()
-
-    if (-not $ServiceList -or $ServiceList.Count -eq 0) {
-        $displayName = "$ServiceName $($serviceConfig.DisplayName)"
-        $row = [ordered]@{
-            "ResourceType" = $displayName
-            "Region" = "All"
-            "Count" = 0
-            "Total Size (GiB)" = 0
-            "Total Size (GB)" = 0
-            "Total Size (TiB)" = 0
-            "Total Size (TB)" = 0
-        }
-        if ($ServiceName -eq "DynamoDB") {
-            $row["Total Table Size (Bytes)"] = 0
-            $row["Total Item Count"] = 0
-        }
-        if ($ServiceName -eq "EKS") {
-            $row["Total Node Count"] = 0
-        }
-        if ($ServiceName -eq "S3") {
-            $row["Total Object Count"] = 0
-        }
-        $summaryData += [PSCustomObject]$row
-        return $summaryData
-    }
-
-    $accounts = $ServiceList | Select-Object -ExpandProperty AwsAccountId -Unique | Sort-Object
-
-    foreach ($accountId in $accounts) {
-        $accountItems = $ServiceList | Where-Object { $_.AwsAccountId -eq $accountId }
-        $accountTotals = if ($ServiceName -eq "S3") {
-            Get-S3ServiceTotals -ServiceList $accountItems
-        } elseif ($ServiceName -eq "FSX") {
-            Get-FSxServiceTotals -ServiceList $accountItems
-        } else {
-            Get-StandardServiceTotals -ServiceList $accountItems -SizeProperty $serviceConfig.SizeProperty
-        }
-
-        $row = [ordered]@{
-            "ResourceType" = "`u{200B}$accountId"
-            "Region" = "All"
-            "Count" = $accountItems.Count
-            "Total Size (GiB)" = [math]::Round($accountTotals.GiB, 3)
-            "Total Size (GB)" = [math]::Round($accountTotals.GB, 3)
-            "Total Size (TiB)" = [math]::Round($accountTotals.TiB, 4)
-            "Total Size (TB)" = [math]::Round($accountTotals.TB, 4)
-        }
-
-        if ($ServiceName -eq "DynamoDB") {
-            $acctBytes = ($accountItems | ForEach-Object { if ($_.TableSizeBytes -ne $null -and $_.TableSizeBytes -ne '') { [double]$_.TableSizeBytes } else { 0 } } | Measure-Object -Sum).Sum
-            $acctItems  = ($accountItems | ForEach-Object { if ($_.ItemCount -ne $null -and $_.ItemCount -ne '') { [double]$_.ItemCount } else { 0 } } | Measure-Object -Sum).Sum
-            $row["Total Table Size (Bytes)"] = $acctBytes
-            $row["Total Item Count"] = $acctItems
-        }
-        if ($ServiceName -eq "S3") {
-            $acctObjectCount = ($accountItems | ForEach-Object { if ($_.ObjectCount -ne $null -and $_.ObjectCount -ne '') { [long]$_.ObjectCount } else { 0 } } | Measure-Object -Sum).Sum
-            $row["Total Object Count"] = $acctObjectCount
-        }
-
-        $summaryData += [PSCustomObject]$row
-    }
-
-    $grandTotals = if ($ServiceName -eq "S3") {
-        Get-S3ServiceTotals -ServiceList $ServiceList
-    } elseif ($ServiceName -eq "FSX") {
-        Get-FSxServiceTotals -ServiceList $ServiceList
-    } else {
-        Get-StandardServiceTotals -ServiceList $ServiceList -SizeProperty $serviceConfig.SizeProperty
-    }
-
-    $totalRow = [ordered]@{
-        "ResourceType" = "Total"
-        "Region" = "All"
-        "Count" = $ServiceList.Count
-        "Total Size (GiB)" = [math]::Round($grandTotals.GiB, 3)
-        "Total Size (GB)" = [math]::Round($grandTotals.GB, 3)
-        "Total Size (TiB)" = [math]::Round($grandTotals.TiB, 4)
-        "Total Size (TB)" = [math]::Round($grandTotals.TB, 4)
-    }
-    if ($ServiceName -eq "DynamoDB") {
-        $grandBytes = ($ServiceList | ForEach-Object { if ($_.TableSizeBytes -ne $null -and $_.TableSizeBytes -ne '') { [double]$_.TableSizeBytes } else { 0 } } | Measure-Object -Sum).Sum
-        $grandItems = ($ServiceList | ForEach-Object { if ($_.ItemCount -ne $null -and $_.ItemCount -ne '') { [double]$_.ItemCount } else { 0 } } | Measure-Object -Sum).Sum
-        $totalRow["Total Table Size (Bytes)"] = $grandBytes
-        $totalRow["Total Item Count"] = $grandItems
-    }
-    if ($ServiceName -eq "EKS") {
-        $grandNodeCount = ($ServiceList | ForEach-Object { if ($_.NodeCount -ne $null) { [int]$_.NodeCount } else { 0 } } | Measure-Object -Sum).Sum
-        $totalRow["Total Node Count"] = $grandNodeCount
-    }
-    if ($ServiceName -eq "S3") {
-        $grandObjectCount = ($ServiceList | ForEach-Object { if ($_.ObjectCount -ne $null -and $_.ObjectCount -ne '') { [long]$_.ObjectCount } else { 0 } } | Measure-Object -Sum).Sum
-        $totalRow["Total Object Count"] = $grandObjectCount
-    }
-    $summaryData += [PSCustomObject]$totalRow
-
-    $summaryData += Get-EmptyRow
-    $summaryData += Get-EmptyRow
-
-    $summaryData += Get-MultiAccountRegionalBreakdown -ServiceName $ServiceName -ServiceList $ServiceList -Accounts $accounts
-
-    return $summaryData
-}
-
-function Get-MultiAccountRegionalBreakdown {
-    param([string]$ServiceName, [array]$ServiceList, [array]$Accounts)
-
-    $regions = if ($ServiceList) {
-        $ServiceList | Select-Object -ExpandProperty Region -Unique | Sort-Object
-    } else { @() }
-
-    if ($regions.Count -eq 0) { return @() }
-
-    $breakdownData = @()
-
-    $header = [ordered]@{
-        "ResourceType" = "--- $($ServiceName.ToUpper()) REGIONAL BREAKDOWN ---"
-        "Region" = ""
-        "Count" = ""
-        "Total Size (GiB)" = ""
-        "Total Size (GB)" = ""
-        "Total Size (TiB)" = ""
-        "Total Size (TB)" = ""
-    }
-    if ($ServiceName -eq "DynamoDB") {
-        $header["Total Table Size (Bytes)"] = ""
-        $header["Total Item Count"] = ""
-    }
-    if ($ServiceName -eq "EKS") {
-        $header["Total Node Count"] = ""
-    }
-    if ($ServiceName -eq "S3") {
-        $header["Total Object Count"] = ""
-    }
-    $breakdownData += [PSCustomObject]$header
-
-    $colHeader = [ordered]@{
-        "ResourceType" = "Region"
-        "Region" = "Account"
-        "Count" = "Count"
-        "Total Size (GiB)" = "Total Size (GiB)"
-        "Total Size (GB)" = "Total Size (GB)"
-        "Total Size (TiB)" = "Total Size (TiB)"
-        "Total Size (TB)" = "Total Size (TB)"
-    }
-    if ($ServiceName -eq "DynamoDB") {
-        $colHeader["Total Table Size (Bytes)"] = "Total Table Size (Bytes)"
-        $colHeader["Total Item Count"] = "Total Item Count"
-    }
-    if ($ServiceName -eq "EKS") {
-        $colHeader["Total Node Count"] = "Total Node Count"
-    }
-    if ($ServiceName -eq "S3") {
-        $colHeader["Total Object Count"] = "Total Object Count"
-    }
-    $breakdownData += [PSCustomObject]$colHeader
-
-    foreach ($region in $regions) {
-        $regionItems = $ServiceList | Where-Object Region -eq $region
-
-        if ($regionItems.Count -gt 0) {
-            $regionTotals = if ($ServiceName -eq "S3") {
-                Get-S3ServiceTotals -ServiceList $regionItems
-            } elseif ($ServiceName -eq "FSX") {
-                Get-FSxServiceTotals -ServiceList $regionItems
-            } else {
-                Get-StandardServiceTotals -ServiceList $regionItems -SizeProperty $script:ServiceRegistry[$ServiceName].SizeProperty
-            }
-
-            $regionRow = [ordered]@{
-                "ResourceType" = $region
-                "Region" = ""
-                "Count" = $regionItems.Count
-                "Total Size (GiB)" = [math]::Round($regionTotals.GiB, 3)
-                "Total Size (GB)" = [math]::Round($regionTotals.GB, 3)
-                "Total Size (TiB)" = [math]::Round($regionTotals.TiB, 4)
-                "Total Size (TB)" = [math]::Round($regionTotals.TB, 4)
-            }
-            if ($ServiceName -eq "DynamoDB") {
-                $regionBytes = ($regionItems | ForEach-Object { if ($_.TableSizeBytes -ne $null -and $_.TableSizeBytes -ne '') { [double]$_.TableSizeBytes } else { 0 } } | Measure-Object -Sum).Sum
-                $regionItemsCount = ($regionItems | ForEach-Object { if ($_.ItemCount -ne $null -and $_.ItemCount -ne '') { [double]$_.ItemCount } else { 0 } } | Measure-Object -Sum).Sum
-                $regionRow["Total Table Size (Bytes)"] = $regionBytes
-                $regionRow["Total Item Count"] = $regionItemsCount
-            }
-            if ($ServiceName -eq "EKS") {
-                $regionNodeCount = ($regionItems | ForEach-Object { if ($_.NodeCount -ne $null) { [int]$_.NodeCount } else { 0 } } | Measure-Object -Sum).Sum
-                $regionRow["Total Node Count"] = $regionNodeCount
-            }
-            if ($ServiceName -eq "S3") {
-                $regionObjectCount = ($regionItems | ForEach-Object { if ($_.ObjectCount -ne $null -and $_.ObjectCount -ne '') { [long]$_.ObjectCount } else { 0 } } | Measure-Object -Sum).Sum
-                $regionRow["Total Object Count"] = $regionObjectCount
-            }
-            $breakdownData += [PSCustomObject]$regionRow
-
-            foreach ($accountId in $Accounts) {
-                $regionAccountItems = $regionItems | Where-Object { $_.AwsAccountId -eq $accountId }
-                if ($regionAccountItems.Count -gt 0) {
-                    $accountTotals = if ($ServiceName -eq "S3") {
-                        Get-S3ServiceTotals -ServiceList $regionAccountItems
-                    } elseif ($ServiceName -eq "FSX") {
-                        Get-FSxServiceTotals -ServiceList $regionAccountItems
-                    } else {
-                        Get-StandardServiceTotals -ServiceList $regionAccountItems -SizeProperty $script:ServiceRegistry[$ServiceName].SizeProperty
-                    }
-
-                    $acctRow = [ordered]@{
-                        "ResourceType" = ""
-                        "Region" = "`u{200B}$accountId"
-                        "Count" = $regionAccountItems.Count
-                        "Total Size (GiB)" = [math]::Round($accountTotals.GiB, 3)
-                        "Total Size (GB)" = [math]::Round($accountTotals.GB, 3)
-                        "Total Size (TiB)" = [math]::Round($accountTotals.TiB, 4)
-                        "Total Size (TB)" = [math]::Round($accountTotals.TB, 4)
-                    }
-                    if ($ServiceName -eq "DynamoDB") {
-                        $acctBytes = ($regionAccountItems | ForEach-Object { if ($_.TableSizeBytes -ne $null -and $_.TableSizeBytes -ne '') { [double]$_.TableSizeBytes } else { 0 } } | Measure-Object -Sum).Sum
-                        $acctItems  = ($regionAccountItems | ForEach-Object { if ($_.ItemCount -ne $null -and $_.ItemCount -ne '') { [double]$_.ItemCount } else { 0 } } | Measure-Object -Sum).Sum
-                        $acctRow["Total Table Size (Bytes)"] = $acctBytes
-                        $acctRow["Total Item Count"] = $acctItems
-                    }
-                    if ($ServiceName -eq "EKS") {
-                        $accountRegionNodeCount = ($regionAccountItems | ForEach-Object { if ($_.NodeCount -ne $null) { [int]$_.NodeCount } else { 0 } } | Measure-Object -Sum).Sum
-                        $acctRow["Total Node Count"] = $accountRegionNodeCount
-                    }
-                    if ($ServiceName -eq "S3") {
-                        $accountRegionObjectCount = ($regionAccountItems | ForEach-Object { if ($_.ObjectCount -ne $null -and $_.ObjectCount -ne '') { [long]$_.ObjectCount } else { 0 } } | Measure-Object -Sum).Sum
-                        $acctRow["Total Object Count"] = $accountRegionObjectCount
-                    }
-                    $breakdownData += [PSCustomObject]$acctRow
-                }
-            }
-        }
-    }
-
-    return $breakdownData
 }
 
 function New-OutputArchive {
+    <#
+      .SYNOPSIS  Zip the whole run directory, matching what Azure and GCP do.
+      .DESCRIPTION Was a curated add-one-file-at-a-time loop over $script:AllOutputFiles. That is a whitelist,
+                   and a whitelist you have to remember to update is a whitelist that goes stale: it is why
+                   aws_resilience_signals_*.csv shipped for several revisions without ever reaching the ZIP the
+                   customer was handed. CreateFromDirectory cannot omit a file, so the failure mode is gone by
+                   construction rather than by a cross-check that warns after the fact.
+
+                   ZipPath is a SIBLING of OutputDir (see Initialize-CVRunPaths), so this never zips the archive
+                   into itself. The loose files are deliberately left in place - the ZIP is a copy, not a move.
+    #>
     try {
         Write-ScriptOutput "Creating output archive..." -Level Info
-        Start-Sleep -Seconds 2
-        
-        if (Test-Path $archiveFile) {
-            Remove-Item $archiveFile -Force
+
+        $runDir = if ($script:Config.OutputPath) { $script:Config.OutputPath } else { $script:RunPaths.OutputDir }
+        if (-not $runDir -or -not (Test-Path -LiteralPath $runDir)) {
+            Write-ScriptOutput "Output directory not found; nothing to archive: $runDir" -Level Warning
+            return
         }
 
-        $filesToArchive = @()
-        foreach ($file in $script:AllOutputFiles) {
-            if (Test-Path $file) {
-                $fileInfo = Get-Item $file
-                Write-ScriptOutput "Verified file: $($fileInfo.Name) (Size: $($fileInfo.Length) bytes)" -Level Info
-                $filesToArchive += $file
-            } else {
-                Write-ScriptOutput "Skipping missing file: $file" -Level Warning
-            }
+        $onDisk = @(Get-ChildItem -LiteralPath $runDir -File -Recurse)
+        if (-not $onDisk.Count) {
+            Write-ScriptOutput "Output directory is empty; no archive created." -Level Warning
+            return
         }
 
-        if ($filesToArchive.Count -gt 0) {
-            Add-Type -AssemblyName System.IO.Compression
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            
-            try {
-                $archive = [System.IO.Compression.ZipFile]::Open($archiveFile, [System.IO.Compression.ZipArchiveMode]::Create)
+        if (Test-Path -LiteralPath $archiveFile) { Remove-Item -LiteralPath $archiveFile -Force }
 
-                foreach ($file in $filesToArchive) {
-                    try {
-                        $fileName = Split-Path $file -Leaf
-                        $fullPath = (Resolve-Path $file).Path
-                        Write-ScriptOutput "Adding $fileName to archive..." -Level Info
-                        
-                        if (Test-Path $fullPath) {
-                            $entry = [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile($archive, $fullPath, $fileName)
-                            Write-ScriptOutput "Successfully added $fileName (Entry size: $($entry.CompressedLength))" -Level Info
-                        } else {
-                            Write-ScriptOutput "File disappeared before archiving: $fullPath" -Level Warning
-                        }
-                    }
-                    catch {
-                        Write-ScriptOutput "Error adding file $file to archive: $_" -Level Warning
-                    }
-                }
-            }
-            catch {
-                Write-ScriptOutput "Failed to create or access archive: $_" -Level Error
-                try {
-                    Write-ScriptOutput "Attempting fallback using Compress-Archive..." -Level Info
-                    Compress-Archive -Path $filesToArchive -DestinationPath $archiveFile -Force
-                    Write-ScriptOutput "Archive created using Compress-Archive fallback" -Level Success
-                }
-                catch {
-                    Write-ScriptOutput "Compress-Archive fallback also failed: $_" -Level Error
-                    return
-                }
-            }
-            finally {
-                try {
-                    if ($archive) { $archive.Dispose() }
-                } catch {
-                    Write-ScriptOutput "Warning during archive disposal: $_" -Level Warning
-                }
-            }
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($runDir, $archiveFile)
 
-            if (Test-Path $archiveFile) {
-                $archiveSize = (Get-Item $archiveFile).Length
-                Write-ScriptOutput "Archive created successfully: $archiveFile (Size: $archiveSize bytes)" -Level Success
-
-                # The individual files are DELIBERATELY LEFT IN PLACE.
-                #
-                # This used to delete every archived file, which left the uncompressed output directory empty -
-                # so anyone who wanted to open a CSV had to unzip first, and Azure/GCP behave the opposite way
-                # (Azure zips the directory with CreateFromDirectory and keeps it). That inconsistency was the
-                # reported symptom.
-                #
-                # It was also a data-loss path. The add loop above logs a per-file failure as a Warning and
-                # continues; the delete then ran on the strength of "the zip file exists" alone, without checking
-                # that this particular file made it in. A single CreateEntryFromFile failure therefore destroyed
-                # that output permanently. Keeping the files makes the archive a copy rather than a move.
-                #
-                # Cross-check what actually landed in the archive, so an omission is visible instead of silent -
-                # exactly the class of bug that kept aws_resilience_signals_*.csv out of the ZIP for so long.
-                try {
-                    $zipCheck  = [System.IO.Compression.ZipFile]::OpenRead($archiveFile)
-                    $entries   = @($zipCheck.Entries | ForEach-Object { $_.Name })
-                    $zipCheck.Dispose()
-                    $missing   = @($filesToArchive | ForEach-Object { Split-Path $_ -Leaf } | Where-Object { $_ -notin $entries })
-                    if ($missing.Count) {
-                        Write-ScriptOutput ("Archive is INCOMPLETE - {0} file(s) did not make it in: {1}. The originals are still in the output directory." -f `
-                                            $missing.Count, ($missing -join ', ')) -Level Warning
-                    }
-                    # And the reverse: a file sitting in the output directory that nobody registered for the
-                    # archive. The ZIP is what gets handed over, so an unregistered file is invisible to whoever
-                    # receives it.
-                    # Use the configured output directory rather than deriving it from the zip's filename - the
-                    # two happen to share a stem today, but that is a coincidence to not depend on.
-                    $runDir = if ($script:Config.OutputPath) { $script:Config.OutputPath } else { $script:RunPaths.OutputDir }
-                    if ($runDir -and (Test-Path $runDir)) {
-                        $onDisk    = @(Get-ChildItem -Path $runDir -File | ForEach-Object { $_.Name })
-                        $unzipped  = @($onDisk | Where-Object { $_ -notin $entries })
-                        if ($unzipped.Count) {
-                            Write-ScriptOutput ("{0} output file(s) are NOT in the archive: {1}. Register them via `$script:AllOutputFiles so they reach the recipient." -f `
-                                                $unzipped.Count, ($unzipped -join ', ')) -Level Warning
-                        }
-                    }
-                } catch {
-                    Write-ScriptOutput "Could not verify archive contents: $($_.Exception.Message)" -Level Warning
-                }
-            }
-            else {
-                Write-ScriptOutput "Archive creation failed: file not found after compression" -Level Error
-            }
+        if (-not (Test-Path -LiteralPath $archiveFile)) {
+            Write-ScriptOutput "Archive creation failed: file not found after compression" -Level Error
+            return
         }
-        else {
-            Write-ScriptOutput "No files found to archive" -Level Warning
+
+        $archiveSize = (Get-Item -LiteralPath $archiveFile).Length
+        Write-ScriptOutput ("Archive created: {0} ({1} file(s), {2:N0} bytes)" -f $archiveFile, $onDisk.Count, $archiveSize) -Level Success
+
+        # Anything registered for output that never made it to disk is still worth reporting - the archive is
+        # complete with respect to the DIRECTORY, which says nothing about a write that failed earlier.
+        $names   = @($onDisk | ForEach-Object { $_.Name })
+        $missing = @($script:AllOutputFiles | ForEach-Object { Split-Path $_ -Leaf } | Where-Object { $_ -notin $names })
+        if ($missing.Count) {
+            Write-ScriptOutput ("{0} expected output file(s) were never written: {1}" -f $missing.Count, ($missing -join ', ')) -Level Warning
         }
     }
     catch {
@@ -4338,7 +3515,6 @@ try {
     # interactive UI and is required unless running headless (container/CI), where output is plain by design.
     $peek = Get-CVConsoleCapability -NonInteractive:$NonInteractive -Quiet:$Quiet
     $fatalModules = @(
-        'ImportExcel',
         'AWS.Tools.Common', 'AWS.Tools.EC2', 'AWS.Tools.S3', 'AWS.Tools.SecurityToken',
         'AWS.Tools.IdentityManagement', 'AWS.Tools.CloudWatch', 'AWS.Tools.RDS', 'AWS.Tools.DynamoDBv2',
         'AWS.Tools.Redshift', 'AWS.Tools.FSx', 'AWS.Tools.ElasticFileSystem', 'AWS.Tools.EKS', 'AWS.Tools.DocDB',
@@ -4378,7 +3554,9 @@ try {
     # DP cross-account summary + per-service counts - only meaningful when the Data Protection pass ran.
     if (-not $SkipDataProtection) {
         if ($script:AccountsProcessed.Count -gt 0) {
-            ComprehensiveSummary
+            # Order matters only for the log: per-service detail first, then the rollup that summarises it.
+            Export-ServiceCSVFiles
+            Export-InventorySummaryCSV | Out-Null
         }
 
         foreach ($account in $script:AccountsProcessed) {
@@ -4578,9 +3756,11 @@ try {
         Write-ScriptOutput "JSON sizing report written: $jsonPath" -Level Success
     }
 
-    if ($SelectiveZipping -and $script:AllOutputFiles.Count -gt 1) {
-        New-OutputArchive
-    }
+    # Unconditional. This was gated on -SelectiveZipping (a switch that defaulted to $true, so it could only
+    # ever be turned off) AND on having produced more than one output file - so a single-service run wrote its
+    # CSV and then silently shipped no archive at all. New-OutputArchive now zips the run directory and handles
+    # the empty case itself, so there is nothing left for a caller to select.
+    New-OutputArchive
 
     if ($script:KubectlInstalled -and $script:KubectlDir) {
         try {
