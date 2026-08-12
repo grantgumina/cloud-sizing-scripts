@@ -374,6 +374,71 @@ if ($staleAllow.Count) {
     Write-Host "        Now wired - delete from `$script:KnownUnwired: $($staleAllow -join ', ')" -ForegroundColor DarkYellow
 }
 
+Write-Host "`n[4b] The FieldMap's Name/SizeGB must be properties the row builder actually sets"
+<#
+    Sections [1] and [4] guard the CONTROL side: the signal fields a Test reads must exist on the row. They say
+    nothing about the FieldMap - the per-type @{ Name = '...'; SizeGB = '...' } table each script hands to
+    New-CVSignalRow to fill in ResourceName and SizeGB.
+
+    That gap shipped: GCP mapped Database to @{ Name = 'InstanceName' } while all four database builders set
+    'Name' (InstanceName is a FILESTORE property), so EVERY database row in gcp_resilience_signals_*.csv had a
+    blank ResourceName and the backend could not identify the resource. No test failed, because the control
+    fields were all fine.
+
+    Probed names (ResourceId etc.) are deliberately not checked - New-CVSignalRow tries a candidate list for
+    those. Name and SizeGB are named explicitly by the script, so a wrong one is simply wrong.
+#>
+function Get-CVSignalFieldMapFromSource {
+    <# .SYNOPSIS  Extract <cloud>SignalFields as @{ Type = @{ Key = 'PropertyName' } } from a script's AST. #>
+    param([Parameter(Mandatory)][string]$Cloud, [Parameter(Mandatory)][string]$VariableName)
+    $path = Join-Path $repoRoot 'src' $script:CVCloudScript[$Cloud]
+    $ast  = [System.Management.Automation.Language.Parser]::ParseFile($path, [ref]$null, [ref]$null)
+    $out  = @{}
+    foreach ($a in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true)) {
+        if ($a.Left.Extent.Text -ne $VariableName) { continue }
+        $outer = $a.Right.FindAll({ param($n) $n -is [System.Management.Automation.Language.HashtableAst] }, $true)[0]
+        foreach ($kv in $outer.KeyValuePairs) {
+            $type  = $kv.Item1.Extent.Text.Trim().Trim([char]39).Trim([char]34)
+            $inner = $kv.Item2.FindAll({ param($n) $n -is [System.Management.Automation.Language.HashtableAst] }, $true)
+            if (-not $inner.Count) { continue }
+            $map = @{}
+            foreach ($ikv in $inner[0].KeyValuePairs) {
+                $map[$ikv.Item1.Extent.Text.Trim().Trim([char]39).Trim([char]34)] =
+                    $ikv.Item2.Extent.Text.Trim().Trim([char]39).Trim([char]34)
+            }
+            $out[$type] = $map
+        }
+    }
+    return $out
+}
+
+$fieldMapSpecs = @(
+    @{ Cloud = 'Azure'; Var = '$azSignalFields' }
+    @{ Cloud = 'AWS';   Var = '$script:AwsSignalFields' }
+    @{ Cloud = 'GCP';   Var = '$gcpSignalFields' }
+)
+$badFieldMap = @()
+foreach ($spec in $fieldMapSpecs) {
+    $maps = Get-CVSignalFieldMapFromSource -Cloud $spec.Cloud -VariableName $spec.Var
+    Assert-CV "$($spec.Cloud): FieldMap extracted from source" ([bool]($maps.Keys.Count -gt 0)) $true
+    foreach ($type in ($maps.Keys | Sort-Object)) {
+        $builders = $script:CVTypeBuilders[$spec.Cloud][$type]
+        if (-not $builders) { continue }        # type has no builder mapping; section [4] reports that separately
+        $all = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($b in $builders) { foreach ($f in (Get-CVBuilderFields -Builder $b -Cloud $spec.Cloud)) { [void]$all.Add($f) } }
+        if (-not $all.Count) { continue }
+        foreach ($key in @('Name', 'SizeGB', 'Parent')) {
+            if (-not $maps[$type].ContainsKey($key)) { continue }
+            $prop = $maps[$type][$key]
+            if (-not $all.Contains($prop)) {
+                $badFieldMap += "$($spec.Cloud)/$type FieldMap.$key = '$prop' - not set by $(($builders | ForEach-Object { '$' + $_ }) -join ' or ')"
+            }
+        }
+    }
+}
+Assert-CV 'every FieldMap Name/SizeGB/Parent is a real builder property' $badFieldMap.Count 0
+if ($badFieldMap.Count) { $badFieldMap | ForEach-Object { Write-Host "        $_" -ForegroundColor DarkYellow } }
+
 Write-Host "`n[5] A signal field must not be fed from a variable nothing ever assigns"
 <#
     Section [4] proves the FIELD is on the row builder. It cannot prove the field has a value: a builder can

@@ -628,8 +628,11 @@ $script:AwsSignalFields = @{
     RDS      = @{ Name = 'DBInstanceIdentifier'; SizeGB = 'SizeGB' }
     S3       = @{ Name = 'BucketName';           SizeGB = 'SizeGB' }
     EFS      = @{ Name = 'FileSystemId';         SizeGB = 'SizeGB' }
-    DynamoDB = @{ Name = 'TableName';            SizeGB = 'SizeGB' }
-    Redshift = @{ Name = 'ClusterIdentifier';    SizeGB = 'SizeGB' }
+    # Not 'SizeGB' for these two: Process-DynamoDBTable sets TableSizeGB and Process-RedshiftCluster sets
+    # TotalSizeGB. The generic name meant SizeGB was blank on every DynamoDB and Redshift row in
+    # aws_resilience_signals_*.csv. Found by the FieldMap guard added for the equivalent GCP defect.
+    DynamoDB = @{ Name = 'TableName';            SizeGB = 'TableSizeGB' }
+    Redshift = @{ Name = 'ClusterIdentifier';    SizeGB = 'TotalSizeGB' }
 }
 $script:ResilienceErrShown = $false
 

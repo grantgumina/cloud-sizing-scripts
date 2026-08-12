@@ -128,6 +128,32 @@ $addMemberOffenders = @(Get-ChildItem -Path $srcRoot -Recurse -Filter *.ps1 | Fo
 Assert-CV 'every Add-Member -NotePropertyName passes -Force' $addMemberOffenders.Count 0
 if ($addMemberOffenders.Count) { $addMemberOffenders | ForEach-Object { Write-Host "        $_" -ForegroundColor DarkYellow } }
 
+Write-Host "`n[7a-] `(if ...`) is a command invocation, not an expression"
+<#
+    `$x = (if ($c) { 'a' } else { 'b' })` does NOT assign 'a'. PowerShell parses a parenthesised statement in
+    argument position as a COMMAND, looks for a cmdlet named 'if', throws "The term 'if' is not recognized", and
+    leaves $x empty. The valid forms are `$x = if (...) {...}` (assignment) and `$( if (...) {...} )`
+    (subexpression) - note the leading dollar.
+
+    This shipped in the GCP disk-list loop, where it silently blanked the disk identity AND collapsed the dedup
+    key so same-named disks in different zones were dropped from the inventory entirely. Confirmed by execution.
+    Guard the whole repo: the failure is invisible without $ErrorActionPreference = 'Stop'.
+#>
+$ifCmdForm = @()
+foreach ($f in (Get-ChildItem -Path $srcRoot -Recurse -Filter *.ps1)) {
+    $lines = Get-Content $f.FullName
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $ln = $lines[$i]
+        if ($ln -match '^\s*#') { continue }
+        # '(if (' where the '(' is not preceded by '$'. The $(...) subexpression form is legal and common.
+        if ($ln -match '(^|[^$])\(\s*if\s+\(') { $ifCmdForm += "$($f.Name):$($i + 1)" }
+    }
+}
+Assert-CV 'no `(if ...`) command-invocation form in any script' $ifCmdForm.Count 0
+if ($ifCmdForm.Count) {
+    $ifCmdForm | ForEach-Object { Write-Host "        $_  - use `$x = if (...) or `$( if (...) )" -ForegroundColor DarkYellow }
+}
+
 Write-Host "`n[7a0] A data CSV is pure CSV - one header, one row per resource, nothing appended"
 <#
     The GCP script used to append a summary block into gcp_gke_clusters_*, gcp_gke_persistent_volumes_*,

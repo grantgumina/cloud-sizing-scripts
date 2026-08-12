@@ -927,8 +927,24 @@ function Get-GcpVMInventory {
         foreach ($disk in $diskListAll) {
             if (-not $script:__AllDiskKeys) { $script:__AllDiskKeys = @{} }
             $isRegional = ($null -ne $disk.region)
-            $diskSelf = (if ($disk.PSObject.Properties.Name -contains 'selfLink') { $disk.selfLink } else { $null })
-            $diskKeyForAll = if ($diskSelf) { $diskSelf.ToLower() } else { ((if ($disk.region) { ($disk.region -split '/')[-1] } elseif ($disk.zone) { ($disk.zone -split '/')[-1] } else { '' }) + '|' + $disk.name).ToLower() }
+            # `(if ...)` is a COMMAND invocation, not an expression: PowerShell looks for a cmdlet named 'if'.
+            # Both of these were written that form, so every disk emitted "The term 'if' is not recognized" and
+            # left the target empty. Consequences, in order of severity:
+            #   1. $diskKeyForAll fell back to '' + '|' + name, dropping the region/zone component entirely, so
+            #      two same-named disks in different zones collided on one key and the SECOND was silently
+            #      skipped by the ContainsKey guard below - it never reached the inventory at all.
+            #   2. DiskSelfLink was blank on every disk-list row, so New-CVSignalRow could not resolve a
+            #      ResourceId (it probes ResourceId/Id/Arn/SelfLink/DiskSelfLink) and the signals CSV carried
+            #      unidentifiable disks.
+            # The attached-disk path a few lines up already used the correct assignment form, which is why only
+            # unattached / disk-list rows were affected.
+            $diskSelf  = if ($disk.PSObject.Properties.Name -contains 'selfLink') { $disk.selfLink } else { $null }
+            # Hoisted rather than nested: the inner (if ...) had the same defect, and a subexpression inside a
+            # string concatenation is exactly where it is least visible.
+            $diskScope = if ($disk.region) { ($disk.region -split '/')[-1] }
+                         elseif ($disk.zone) { ($disk.zone -split '/')[-1] }
+                         else { '' }
+            $diskKeyForAll = if ($diskSelf) { $diskSelf.ToLower() } else { ($diskScope + '|' + $disk.name).ToLower() }
             # Skip if already added during VM attachment processing
             if ($script:__AllDiskKeys.ContainsKey($diskKeyForAll)) { continue }
             $script:__AllDiskKeys[$diskKeyForAll] = $true
@@ -1130,39 +1146,55 @@ $bucketSizingScriptBlock = {
             } catch {
                 Write-Log -Level WARN -Message ("gsutil du failed for {0} in {1}: {2}" -f $BucketName, $Project, ($_.Exception.Message))
             }
-            # Fallback (can be slow for very large buckets): enumerate objects
+            # Fallback (can be slow for very large buckets): enumerate objects.
             $sizeBytes = 0
             try {
                 $sizes = gcloud --quiet storage objects list "gs://$BucketName" --project $Project --format="value(size)" 2>$null
-                foreach ($s in $sizes) { if ($s -match '^[0-9]+$') { $sizeBytes += [int64]$s } }
-                return [int64]$sizeBytes
+                # $LASTEXITCODE, captured BEFORE anything else can clobber it, is the whole point. Without it a
+                # 403 or a throttled listing produced an empty $sizes, the loop added nothing, and 0 was returned
+                # as though measured. An EMPTY bucket also yields no output - but with exit code 0 - so the code
+                # is the only thing that separates "nothing in it" from "we were not allowed to look".
+                $listExit = $LASTEXITCODE
+                if ($listExit -eq 0) {
+                    foreach ($s in $sizes) { if ($s -match '^[0-9]+$') { $sizeBytes += [int64]$s } }
+                    return [int64]$sizeBytes
+                }
+                Write-Log -Level WARN -Message ("Object enumeration for {0} in {1} exited {2}; size is UNKNOWN, not 0." -f $BucketName, $Project, $listExit)
             } catch {
                 Write-Log -Level WARN -Message ("Fallback object enumeration failed for {0} in {1}: {2}" -f $BucketName, $Project, ($_.Exception.Message))
             }
-            Write-Log -Level WARN -Message ("Unable to determine size for bucket {0} in {1} (returning 0)." -f $BucketName, $Project)
-            return 0
+            # Neither path succeeded. $null, never 0: a 0 here is indistinguishable from an empty bucket and
+            # understates the customer's estate. The caller leaves the size cells blank, which is this repo's
+            # single meaning for "not collected". This WARN used to be unreachable, because the fallback's
+            # `return` sat inside the try and ran on every path.
+            Write-Log -Level WARN -Message ("Unable to determine size for bucket {0} in {1}; reporting UNKNOWN." -f $BucketName, $Project)
+            return $null
         }
 
         $bucketName = $bucket.name
         
         # Get Bucket size in Bytes
         $sizeBytes = Get-BucketSizeBytes -BucketName $bucketName -Project $projectName
-    if (-not $minimalFlag) { Write-Host ("[Sizing] Bucket: {0} | Project={1} | SizeBytes={2}" -f $bucketName, $projectName, $sizeBytes) -ForegroundColor DarkGray }
+    if (-not $minimalFlag) { Write-Host ("[Sizing] Bucket: {0} | Project={1} | SizeBytes={2}" -f $bucketName, $projectName, $(if ($null -eq $sizeBytes) { 'UNKNOWN' } else { $sizeBytes })) -ForegroundColor DarkGray }
         
-        # Precise size conversions (binary vs decimal) with more precision
-        $bytes = [int64]$sizeBytes
+        # Precise size conversions (binary vs decimal) with more precision.
+        # $null means the size could not be determined (see Get-BucketSizeBytes). It must NOT be cast to
+        # [int64], which would silently make it 0 and republish the fabricated zero this fix removes. Every
+        # size cell stays $null so the CSV shows blank, and the rollup's Measure-CVSum skips the row.
+        $sizeUnknown = ($null -eq $sizeBytes)
+        $bytes = if ($sizeUnknown) { $null } else { [int64]$sizeBytes }
         $GiBBytes = 1GB              # 1,073,741,824
         $MiBBytes = 1MB              # 1,048,576
         $TiBBytes = $GiBBytes * 1024 # 1,099,511,627,776
         $GBDecimalDivisor = 1e9
         $MBDecimalDivisor = 1e6
         $TBDecimalDivisor = 1e12
-        $sizeMiB     = if ($bytes -gt 0) { [math]::Round($bytes / $MiBBytes, 3) } else { 0 }
-        $sizeGiB     = if ($bytes -gt 0) { [math]::Round($bytes / $GiBBytes, 4) } else { 0 }
-        $sizeTiB     = if ($bytes -gt 0) { [math]::Round($bytes / $TiBBytes, 6) } else { 0 }
-        $sizeMBDec   = if ($bytes -gt 0) { [math]::Round($bytes / $MBDecimalDivisor, 3) } else { 0 }
-        $sizeGBDec   = if ($bytes -gt 0) { [math]::Round($bytes / $GBDecimalDivisor, 4) } else { 0 }
-        $sizeTBDec   = if ($bytes -gt 0) { [math]::Round($bytes / $TBDecimalDivisor, 6) } else { 0 }
+        $sizeMiB     = if ($sizeUnknown) { $null } elseif ($bytes -gt 0) { [math]::Round($bytes / $MiBBytes, 3) } else { 0 }
+        $sizeGiB     = if ($sizeUnknown) { $null } elseif ($bytes -gt 0) { [math]::Round($bytes / $GiBBytes, 4) } else { 0 }
+        $sizeTiB     = if ($sizeUnknown) { $null } elseif ($bytes -gt 0) { [math]::Round($bytes / $TiBBytes, 6) } else { 0 }
+        $sizeMBDec   = if ($sizeUnknown) { $null } elseif ($bytes -gt 0) { [math]::Round($bytes / $MBDecimalDivisor, 3) } else { 0 }
+        $sizeGBDec   = if ($sizeUnknown) { $null } elseif ($bytes -gt 0) { [math]::Round($bytes / $GBDecimalDivisor, 4) } else { 0 }
+        $sizeTBDec   = if ($sizeUnknown) { $null } elseif ($bytes -gt 0) { [math]::Round($bytes / $TBDecimalDivisor, 6) } else { 0 }
         
         # Named, not `return [PSCustomObject]@{...}`: Get-CVBuilderFields in the wiring test extracts signal
         # fields from ASSIGNMENTS to a named builder variable. A bare return yields zero fields, which would
@@ -2430,9 +2462,16 @@ function Get-GcpGkeInventory {
                             $pvCap += [double]([math]::Round($gi,4)); $pvCount++
                             $backingDisk = ''
                             if ($pv.spec.gcePersistentDisk -and $pv.spec.gcePersistentDisk.pdName) { $backingDisk = $pv.spec.gcePersistentDisk.pdName }
+                            # TryParse, not [datetime]. A bare cast on an unparseable creationTimestamp THROWS,
+                            # and the enclosing try has only a finally (no catch), so it escaped to the
+                            # top-level handler and killed the whole run before any CSV was written. The PVC
+                            # loop below was already protected by its own catch; this path was not.
+                            $pvCreated = $null
+                            $pvParsed  = [datetime]::MinValue
+                            if ($pv.metadata.creationTimestamp -and [datetime]::TryParse([string]$pv.metadata.creationTimestamp, [ref]$pvParsed)) { $pvCreated = $pvParsed }
                             $pvDetails.Add([PSCustomObject]@{Project=$ProjectId;ClusterName=$ClusterName;PVName=$pv.metadata.name;Phase=$pv.status.phase;CapacityGiB=[math]::Round($gi,4);StorageClass=$pv.spec.storageClassName;
                                 ReclaimPolicy=$pv.spec.persistentVolumeReclaimPolicy;AccessModes=(($pv.spec.accessModes) -join ';');VolumeMode=$pv.spec.volumeMode;ClaimNamespace=$pv.spec.claimRef.namespace;ClaimName=$pv.spec.claimRef.name;
-                                Provisioner=$pv.metadata.annotations.'pv.kubernetes.io/provisioned-by';BackingDisk=$backingDisk;CreationTimestamp=([datetime]$pv.metadata.creationTimestamp);AgeDays=[math]::Round((New-TimeSpan -Start ([datetime]$pv.metadata.creationTimestamp) -End (Get-Date)).TotalDays,2) }) | Out-Null
+                                Provisioner=$pv.metadata.annotations.'pv.kubernetes.io/provisioned-by';BackingDisk=$backingDisk;CreationTimestamp=$pvCreated;AgeDays=$(if ($pvCreated) { [math]::Round((New-TimeSpan -Start $pvCreated -End (Get-Date)).TotalDays,2) } else { $null }) }) | Out-Null
                         }
                     }
                 }
@@ -2451,7 +2490,12 @@ function Get-GcpGkeInventory {
                         $reqGi = Convert-QuantityToGiB $reqCap
                         $actGi = Convert-QuantityToGiB $actCap
                         if ($actGi -gt 0) { $pvcCapSum += [double]([math]::Round($actGi,4)); $pvcCount++ }
-                        $pvcDetails.Add([PSCustomObject]@{Project=$ProjectId;ClusterName=$ClusterName;Namespace=$pvc.metadata.namespace;PVCName=$pvc.metadata.name;Status=$pvc.status.phase;RequestedGiB=[math]::Round($reqGi,4);CapacityGiB=[math]::Round($actGi,4);StorageClass=$pvc.spec.storageClassName;AccessModes=(($pvc.spec.accessModes)-join ';');VolumeMode=$pvc.spec.volumeMode;PVName=$pvc.spec.volumeName;CreationTimestamp=([datetime]$pvc.metadata.creationTimestamp);AgeDays=[math]::Round((New-TimeSpan -Start ([datetime]$pvc.metadata.creationTimestamp) -End (Get-Date)).TotalDays,2)}) | Out-Null
+                        # Same TryParse treatment as the PV loop. This path had a catch, so it could not abort the
+                        # run - but a single unparseable timestamp still discarded the whole cluster's PVC detail.
+                        $pvcCreated = $null
+                        $pvcParsed  = [datetime]::MinValue
+                        if ($pvc.metadata.creationTimestamp -and [datetime]::TryParse([string]$pvc.metadata.creationTimestamp, [ref]$pvcParsed)) { $pvcCreated = $pvcParsed }
+                        $pvcDetails.Add([PSCustomObject]@{Project=$ProjectId;ClusterName=$ClusterName;Namespace=$pvc.metadata.namespace;PVCName=$pvc.metadata.name;Status=$pvc.status.phase;RequestedGiB=[math]::Round($reqGi,4);CapacityGiB=[math]::Round($actGi,4);StorageClass=$pvc.spec.storageClassName;AccessModes=(($pvc.spec.accessModes)-join ';');VolumeMode=$pvc.spec.volumeMode;PVName=$pvc.spec.volumeName;CreationTimestamp=$pvcCreated;AgeDays=$(if ($pvcCreated) { [math]::Round((New-TimeSpan -Start $pvcCreated -End (Get-Date)).TotalDays,2) } else { $null })}) | Out-Null
                     }
                     # If no PV objects were found, fall back to aggregated PVC capacities/count
                     if ($pvCount -eq 0 -and $pvcCount -gt 0) { $pvCap = [math]::Round($pvcCapSum,2); $pvCount = $pvcCount; $source = 'pvc' }
@@ -2477,6 +2521,11 @@ function Get-GcpGkeInventory {
                     }
                 } catch { Write-Log -Level WARN -Message ("[GKE] ({0}) {1} PVC parse failed: {2}" -f $ProjectId,$ClusterName,$_.Exception.Message) }
             }
+        } catch {
+            # This try had ONLY a finally. Anything that threw inside it - the PV timestamp cast above being the
+            # proven case - propagated out of the runspace to the top-level handler and abandoned the entire run
+            # before a single CSV was written. One cluster's PV detail is not worth the whole deliverable.
+            Write-Log -Level WARN -Message ("[GKE] ({0}) {1} PV/PVC collection failed: {2}" -f $ProjectId, $ClusterName, $_.Exception.Message)
         } finally { try { if (Test-Path $tmpKube) { Remove-Item $tmpKube -Force -ErrorAction SilentlyContinue } } catch {} }
 
         # Heuristic if still zero
@@ -2708,6 +2757,15 @@ function Get-GcpFilestoreInventory {
 # coverage as Unknown rather than as a confirmed gap.
 $script:SnapshotLookupFailed = @{}
 
+# ...and the POSITIVE marker, which is the one the resilience pass actually reads. $SnapshotLookupFailed answers
+# "did an attempt fail?", which is not the same question as "do we know anything?" - it stayed empty in two cases
+# that both produced a fabricated measured gap:
+#   1. -Types without SNAPSHOT: Get-GcpSnapshotInventory never runs at all, so nothing is ever marked failed and
+#      EVERY disk and VM in the run reported XRegionBackup = FALSE - a scored gap for a signal never looked at.
+#   2. an exception rather than a non-Ok result: the catch below logged and continued without marking the project.
+# Keying off "collected" instead means a project has to be positively proven readable to be scored.
+$script:SnapshotCollected = @{}
+
 function Get-GcpSnapshotInventory {
     param([string[]]$ProjectIds)
     $results = @()
@@ -2722,6 +2780,9 @@ function Get-GcpSnapshotInventory {
                 $script:SnapshotLookupFailed[$proj] = $true
                 continue
             }
+            # The listing succeeded. Mark it BEFORE the empty-result check: a project with genuinely zero
+            # snapshots is a measured zero, and its disks must score a real gap rather than Unknown.
+            $script:SnapshotCollected[$proj] = $true
             $raw = $res.Data
             if (-not $raw) { continue }
             foreach ($snap in $raw) {
@@ -2740,7 +2801,12 @@ function Get-GcpSnapshotInventory {
                     Labels          = if ($snap.labels) { ($snap.labels.PSObject.Properties | ForEach-Object { "$($_.Name)=$($_.Value)" }) -join ';' } else { '' }
                 }
             }
-        } catch { Write-Log "Snapshot inventory failed for project ${proj}: $_" -Level WARN }
+        } catch {
+            # Mark the failure here too. Without this an exception left the project absent from BOTH maps, so it
+            # read as "collected, nothing found" and every disk in it scored a gap we never verified.
+            $script:SnapshotLookupFailed[$proj] = $true
+            Write-Log "Snapshot inventory failed for project ${proj}: $_" -Level WARN
+        }
     }
     return $results
 }
@@ -2785,7 +2851,8 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
         foreach ($d in @($invResults.$coll)) {
             if (-not $d) { continue }
             $e = $snapByDisk["$($d.Project)|$($d.DiskName)".ToLower()]
-            $xr = if ($script:SnapshotLookupFailed[$d.Project]) { $null } else { [bool]($e -and $e.XRegion) }
+            # Positive marker, not the failure map - see the note at $script:SnapshotCollected.
+            $xr = if (-not $script:SnapshotCollected[$d.Project]) { $null } else { [bool]($e -and $e.XRegion) }
             Add-Member -InputObject $d -NotePropertyName XRegionBackup -NotePropertyValue $xr -Force
         }
     }
@@ -2799,7 +2866,7 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
     }
     foreach ($v in @($invResults.VMs)) {
         if (-not $v) { continue }
-        $xr = if ($script:SnapshotLookupFailed[$v.Project]) { $null } else { [bool]$vmXRegion["$($v.Project)|$($v.VMName)".ToLower()] }
+        $xr = if (-not $script:SnapshotCollected[$v.Project]) { $null } else { [bool]$vmXRegion["$($v.Project)|$($v.VMName)".ToLower()] }
         Add-Member -InputObject $v -NotePropertyName XRegionBackup -NotePropertyValue $xr -Force
     }
 
@@ -2866,7 +2933,12 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
 
     # Evaluate each resource type; append Ctl_*/ResilienceScore/ResilienceGaps columns onto the inventory rows.
     $collections = @(
-        @{ Type='Database';  Set=$gcpControls.Database;  Rows=@($invResults.Databases) }
+        # Get-GcpDatabaseInventory smuggles collection FAILURES through the data channel as synthetic rows with
+        # Type='Error' (reliably one per project when the bq CLI is missing). Unfiltered they became phantom
+        # Database resources in the signals CSV with SizeGB=0 and every control Unknown, inflating the exported
+        # resource count. The CSV exports already filter them the same way; this is the export that did not.
+        @{ Type='Database';  Set=$gcpControls.Database
+           Rows=@($invResults.Databases | Where-Object { $_ -and $_.Type -ne 'Error' -and -not ($_.Error -and "$($_.Error)".Trim()) }) }
         @{ Type='VM';        Set=$gcpControls.VM;        Rows=@($invResults.VMs) }
         @{ Type='Disk';      Set=$gcpControls.Disk;      Rows=(@($invResults.AttachedDisks) + @($invResults.UnattachedDisks)) }
         @{ Type='Storage';   Set=$gcpControls.Storage;   Rows=@($invResults.StorageBuckets) }
@@ -2875,7 +2947,10 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
     )
     # Name and size are the only genuinely per-type fields; resource group/region/id are probed by New-CVSignalRow.
     $gcpSignalFields = @{
-        Database  = @{ Name = 'InstanceName';  SizeGB = 'StorageGB' }
+        # 'Name', not 'InstanceName': every DB builder ($items - CloudSQL, AlloyDB, Spanner, BigQuery) sets
+        # Name. InstanceName belongs to Filestore rows, so this mapping left ResourceName blank on every
+        # database row in gcp_resilience_signals_*.csv - the backend could not identify the resource at all.
+        Database  = @{ Name = 'Name';  SizeGB = 'StorageGB' }
         VM        = @{ Name = 'VMName';        SizeGB = 'VMDiskSizeGB' }
         Disk      = @{ Name = 'DiskName';      SizeGB = 'SizeGB' }
         Storage   = @{ Name = 'StorageBucket'; SizeGB = 'UsedCapacityGB' }
@@ -3552,13 +3627,19 @@ if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
     $jsonSummary = @{}
     $allWorkloads = @{}
 
-    if ($AllVMs -and $AllVMs.Count -gt 0) {
-        $allWorkloads["gcp_vms"]         = @($AllVMs)
-        $jsonSummary["VM"]               = @{ count = $AllVMs.Count; total_storage_gb = [double](($AllVMs | Measure-Object -Property SizeGB -Sum -ErrorAction SilentlyContinue).Sum); notes = "" }
+    # $AllVMs / $AllBuckets were never assigned anywhere in this script, so gcp_sizing_*.json silently shipped
+    # with no VMs and no buckets - the two largest workloads - and nobody saw an error because a $null guard
+    # reads as "none discovered". The property names were wrong too: VM rows carry VMDiskSizeGB and bucket rows
+    # carry UsedCapacityGB, so even with the variables bound both totals would have been 0.
+    $jsonVMs     = @($invResults.VMs)
+    $jsonBuckets = @($invResults.StorageBuckets)
+    if ($jsonVMs.Count -gt 0) {
+        $allWorkloads["gcp_vms"]         = $jsonVMs
+        $jsonSummary["VM"]               = @{ count = $jsonVMs.Count; total_storage_gb = [double](($jsonVMs | Measure-Object -Property VMDiskSizeGB -Sum -ErrorAction SilentlyContinue).Sum); notes = "" }
     }
-    if ($AllBuckets -and $AllBuckets.Count -gt 0) {
-        $allWorkloads["gcp_storage"]     = @($AllBuckets)
-        $jsonSummary["Storage"]          = @{ count = $AllBuckets.Count; total_storage_gb = [double](($AllBuckets | Measure-Object -Property SizeGB -Sum -ErrorAction SilentlyContinue).Sum); notes = "" }
+    if ($jsonBuckets.Count -gt 0) {
+        $allWorkloads["gcp_storage"]     = $jsonBuckets
+        $jsonSummary["Storage"]          = @{ count = $jsonBuckets.Count; total_storage_gb = [double](($jsonBuckets | Measure-Object -Property UsedCapacityGB -Sum -ErrorAction SilentlyContinue).Sum); notes = "" }
     }
     if ($filestoreData -and $filestoreData.Count -gt 0) {
         $allWorkloads["gcp_filestore"]   = @($filestoreData)
@@ -3572,7 +3653,7 @@ if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
     $jsonDoc = @{
         metadata = @{
             cloud          = "gcp"
-            projects       = @($activeProjects)
+            projects       = @($targetProjects)   # $activeProjects was never assigned - this shipped as []
             generated_at   = (Get-Date -Format "o")
             script_version = "2.0"
         }
