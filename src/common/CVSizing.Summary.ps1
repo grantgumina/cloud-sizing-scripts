@@ -79,6 +79,17 @@ function Format-CVSizeGBDecimal {
        TiB = [math]::Round(($Gb * 1000000000) / 1099511627776, 4) }
 }
 
+# GiB-denominated input. Several GCP figures are binary gigabytes despite a "GB" name: Filestore
+# provisionedGib, GKE PV CapacityGiB, AlloyDB monitored usage, and BigQuery physical bytes divided by 1GB.
+# All three outputs derive from ONE byte count, so TB and TiB reconcile instead of disagreeing by 7.4%.
+function Format-CVSizeGiB {
+    param([double]$Gib)
+    $bytes = $Gib * 1073741824
+    @{ GB  = [math]::Round($bytes / 1000000000, 2)
+       TB  = [math]::Round($bytes / 1000000000000, 4)
+       TiB = [math]::Round($Gib / 1024, 4) }
+}
+
 # Byte totals (storage, file shares, NetApp).
 function Format-CVSizeBytes { param([double]$Bytes) @{ GB = (ConvertTo-CVGB $Bytes); TB = (ConvertTo-CVTB $Bytes); TiB = (ConvertTo-CVTiB $Bytes) } }
 # Cosmos measures bytes too, but zero stays a hard 0 and the regional pass wants 4dp gigabytes.

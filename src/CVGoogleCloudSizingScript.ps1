@@ -172,6 +172,8 @@ $cvRequired  = @(
     'CVSizing.Console.ps1'          # console / diagnostics / run paths
     'CVSizing.Resilience.ps1'       # provider-neutral scoring engine
     'CVSizing.Resilience.GCP.ps1'   # GCP control definitions
+    'CVSizing.Summary.ps1'          # shared four-pass inventory rollup engine (cloud-agnostic)
+    'CVSizing.Summary.GCP.ps1'      # GCP descriptor table for it
     'CVSizing.Kubectl.ps1'          # cross-platform kubectl provisioning
     'CVSizing.CloudRewind.ps1'      # provider-neutral Cloud Rewind engine
     'CVSizing.CloudRewind.GCP.ps1'  # GCP billable taxonomy (derived)
@@ -3373,16 +3375,15 @@ if ($Selected.GKE -and $invResults.GKEClusters -and $invResults.GKEClusters.Coun
 
 
 # -------------------------
-# Build Summary (Custom ordering with spacer rows)
-# Order:
-# 1. Overall (VM + Buckets)
-# 2. 4 blank rows
-# 3. Project-level (VM + Buckets)
-# 4. 4 blank rows
-# 5. For each project: Region-level VM rows, 2 blank rows, Zone-level VM rows
-function New-BlankSummaryRow { return [PSCustomObject]@{Level='';ResourceType='';Project='';Region='';Zone='';Count='';TotalSizeGB='';TotalSizeTB='';TotalSizeTiB=''} }
-
-$summaryRows = @()
+# ---------------------------------------------------------------------------------------------------------
+# Inventory rollup + the per-service CSVs that feed it.
+#
+# The rollup itself used to be ~250 lines of inline code here, emitting a 9-column schema across five tiers
+# with the same arithmetic hand-written once per tier. It now lives in common/CVSizing.Summary.GCP.ps1 as a
+# descriptor table driving the shared engine in common/CVSizing.Summary.ps1, which Azure and AWS also use.
+# Read that file's header for what changed in the OUTPUT and why - Level/Zone, the VM disk dedupe, the fused
+# Database row and the AllResources row all went away deliberately.
+# ---------------------------------------------------------------------------------------------------------
 
 $vmData = $invResults.VMs
 $attached = $invResults.AttachedDisks
@@ -3415,208 +3416,49 @@ if ($Selected.SNAPSHOT -and $snapshotData -and $snapshotData.Count -gt 0) {
     Write-Host "Snapshots CSV written: $(Split-Path $snapCsv -Leaf)" -ForegroundColor Cyan
 }
 
-# Fallback: if user requested only DB (or DB included) and nothing discovered, capture zero rows so summary isn't just blank spacers
-if ($Selected.DB -and (-not $databaseData -or $databaseData.Count -eq 0)) {
-    # Overall zero row
-    $summaryRows += [PSCustomObject]@{Level='Overall';ResourceType='Database';Project='All';Region='All';Zone='All';Count=0;TotalSizeGB=0;TotalSizeTB=0;TotalSizeTiB=0}
-    # Per project zero rows (maintains consistency with other resource summaries)
-    foreach ($proj in $targetProjects) {
-        $summaryRows += [PSCustomObject]@{Level='Project';ResourceType='Database';Project=$proj;Region='All';Zone='All';Count=0;TotalSizeGB=0;TotalSizeTB=0;TotalSizeTiB=0}
+# ---- the rollup ------------------------------------------------------------------------------------------
+# Databases are passed as FOUR separate collections rather than one, so each service gets its own row with its
+# own unit and its own stated basis. $cloudSql / $spanner / $alloyClusters / $bigQuery are computed in the DB
+# export block above; they are $null when that block did not run, hence the @() wrappers.
+$gcpInventory = @{
+    VMs               = @($vmData)
+    UnattachedDisks   = @($invResults.UnattachedDisks)
+    StorageBuckets    = @($bucketData)
+    FileShares        = @($fileshareData)
+    CloudSqlInstances = @($cloudSql)
+    SpannerInstances  = @($spanner)
+    AlloyDbClusters   = @($alloyClusters)
+    BigQueryDatasets  = @($bigQuery)
+    GKEClusters       = @($gkeData)
+    DiskSnapshots     = @($snapshotData)
+}
+$summaryRows = @(Get-CVGcpInventorySummary -Inventory $gcpInventory -Selected $Selected `
+                    -Projects @($targetProjects | ForEach-Object { [PSCustomObject]@{ Name = $_ } }))
+
+# Guarded, unlike before. The old export was unconditional, so -Types Snapshot, -Types Filestore or
+# -SkipDataProtection (which clears $Selected entirely) each shipped a gcp_inventory_summary CSV containing a
+# header and twelve all-blank spacer rows, and then announced "Inventory summary exported".
+if (-not $summaryRows.Count) {
+    Write-CVLog 'No inventory rows for the selected types; skipping the inventory summary CSV.' -Level Warning -Source 'Summary'
+} else {
+    $summaryCsv = Join-Path $outDir ("gcp_inventory_summary_" + $dateStr + ".csv")
+    $summaryRows | Export-Csv -Path $summaryCsv -NoTypeInformation
+    Write-Host "Inventory summary exported: $(Split-Path $summaryCsv -Leaf)" -ForegroundColor Green
+}
+
+# Per-zone VM detail, as its own pure CSV. This used to be a Zone tier inside the summary above, grouping
+# ATTACHED DISK rows - but regional persistent disks carry Zone = '', so their capacity fell out of every zone
+# row and the zone rows summed to less than the region row above them. Measuring VM rows fixes that and makes
+# this file reconcile with the summary's VM row, which measures the same property.
+if ($Selected.VM) {
+    $zoneRows = @(Get-CVGcpVmZoneRollup -VMs $vmData)
+    if ($zoneRows.Count) {
+        $zoneCsv = Join-Path $outDir ("gcp_vm_zone_rollup_" + $dateStr + ".csv")
+        $zoneRows | Export-Csv -Path $zoneCsv -NoTypeInformation
+        Write-Host "VM zone rollup exported: $(Split-Path $zoneCsv -Leaf)" -ForegroundColor Green
     }
 }
 
-# Overall rows
-if ($Selected.VM -and $vmData) {
-    $overallDiskSizeGB = ($attached | Select-Object -Property DiskName,SizeGB -Unique | Measure-Object SizeGB -Sum).Sum
-}
-if ($Selected.STORAGE -and $bucketData) {
-    $overallBucketBytes = ($bucketData | Measure-Object UsedCapacityBytes -Sum).Sum
-}
-
-# Combined overall row (only if both resource types selected and present)
-if (($Selected.VM -and $vmData) -and ($Selected.STORAGE -and $bucketData)) {
-    if (-not $overallDiskSizeGB) { $overallDiskSizeGB = 0 }
-    if (-not $overallBucketBytes) { $overallBucketBytes = 0 }
-    $overallBucketGB = [math]::Round($overallBucketBytes/1e9,3)
-    $combinedGB = [math]::Round(($overallDiskSizeGB + $overallBucketGB),3)
-    $summaryRows += [PSCustomObject]@{Level='Overall';ResourceType='AllResources';Project='All';Region='All';Zone='All';Count='N/A';TotalSizeGB=$combinedGB;TotalSizeTB=[math]::Round($combinedGB/1e3,4);TotalSizeTiB=[math]::Round($combinedGB/1024,4)}
-}
-
-# Individual overall rows
-if ($Selected.VM -and $vmData) {
-    if (-not $overallDiskSizeGB) { $overallDiskSizeGB = 0 }
-    $summaryRows += [PSCustomObject]@{Level='Overall';ResourceType='VM';Project='All';Region='All';Zone='All';Count=$vmData.Count;TotalSizeGB=[int64]$overallDiskSizeGB;TotalSizeTB=[math]::Round($overallDiskSizeGB/1e3,4);TotalSizeTiB=[math]::Round($overallDiskSizeGB/1024,4)}
-}
-if ($Selected.STORAGE -and $bucketData) {
-    if (-not $overallBucketBytes) { $overallBucketBytes = 0 }
-    $summaryRows += [PSCustomObject]@{Level='Overall';ResourceType='StorageBucket';Project='All';Region='All';Zone='All';Count=$bucketData.Count;TotalSizeGB=[math]::Round($overallBucketBytes/1e9,3);TotalSizeTB=[math]::Round($overallBucketBytes/1e12,4);TotalSizeTiB=[math]::Round(($overallBucketBytes/1GB)/1024,4)}
-}
-if ($Selected.FILESHARE -and $fileshareData) {
-    $overallFsGiB = ($fileshareData | Measure-Object provisionedGib -Sum).Sum
-    if (-not $overallFsGiB) { $overallFsGiB = 0 }
-    $overallFsGB  = [math]::Round(($overallFsGiB * 1024 * 1024 * 1024)/1e9,3)
-    $overallFsTiB = [math]::Round($overallFsGiB/1024,4)
-    $overallFsTB  = [math]::Round($overallFsGB/1000,4)
-    $summaryRows += [PSCustomObject]@{Level='Overall';ResourceType='Fileshare';Project='All';Region='All';Zone='All';Count=(@($fileshareData)).Count;TotalSizeGB=$overallFsGB;TotalSizeTB=$overallFsTB;TotalSizeTiB=$overallFsTiB}
-}
-if ($Selected.DB -and $databaseData) {
-    $overallDbGB = ($databaseData | Measure-Object StorageGB -Sum).Sum
-    if (-not $overallDbGB) { $overallDbGB = 0 }
-    $summaryRows += [PSCustomObject]@{Level='Overall';ResourceType='Database';Project='All';Region='All';Zone='All';Count=$databaseData.Count;TotalSizeGB=[math]::Round($overallDbGB,3);TotalSizeTB=[math]::Round($overallDbGB/1e3,4);TotalSizeTiB=[math]::Round($overallDbGB/1024,4)}
-}
-if ($Selected.GKE -and $gkeData) {
-    $overallGkePvCap = ($gkeData | Measure-Object PersistentVolumeCapacityGB -Sum).Sum
-    if (-not $overallGkePvCap) { $overallGkePvCap = 0 }
-    $summaryRows += [PSCustomObject]@{Level='Overall';ResourceType='GKECluster';Project='All';Region='All';Zone='All';Count=$gkeData.Count;TotalSizeGB=[math]::Round($overallGkePvCap,2);TotalSizeTB=[math]::Round($overallGkePvCap/1e3,4);TotalSizeTiB=[math]::Round($overallGkePvCap/1024,4)}
-}
-
-# 4 spacer rows
-1..4 | ForEach-Object { $summaryRows += (New-BlankSummaryRow) }
-
-# Project-level rows
-if ($Selected.VM -and $vmData) {
-    foreach ($proj in $targetProjects) {
-        $projVMs = $vmData | Where-Object Project -eq $proj
-        if (-not $projVMs) { continue }
-        $projDisks = $attached | Where-Object Project -eq $proj | Select-Object DiskName,SizeGB -Unique
-        $projGB = ($projDisks | Measure-Object SizeGB -Sum).Sum
-        $summaryRows += [PSCustomObject]@{Level='Project';ResourceType='VM';Project=$proj;Region='All';Zone='All';Count=$projVMs.Count;TotalSizeGB=[int64]$projGB;TotalSizeTB=[math]::Round($projGB/1e3,4);TotalSizeTiB=[math]::Round($projGB/1024,4)}
-    }
-}
-if ($Selected.STORAGE -and $bucketData) {
-    foreach ($proj in $targetProjects) {
-        $projBuckets = $bucketData | Where-Object Project -eq $proj
-        if (-not $projBuckets) { continue }
-        $projBytes = ($projBuckets | Measure-Object UsedCapacityBytes -Sum).Sum
-        $summaryRows += [PSCustomObject]@{Level='Project';ResourceType='StorageBucket';Project=$proj;Region='All';Zone='All';Count=$projBuckets.Count;TotalSizeGB=[math]::Round($projBytes/1e9,3);TotalSizeTB=[math]::Round($projBytes/1e12,4);TotalSizeTiB=[math]::Round(($projBytes/1GB)/1024,4)}
-    }
-}
-if ($Selected.FILESHARE -and $fileshareData) {
-    foreach ($proj in $targetProjects) {
-        $projFS = $fileshareData | Where-Object Project -eq $proj
-        if (-not $projFS) { continue }
-        $projFsGiB = ($projFS | Measure-Object provisionedGib -Sum).Sum
-        if (-not $projFsGiB) { $projFsGiB = 0 }
-        $projFsGB = [math]::Round(($projFsGiB * 1024 * 1024 * 1024)/1e9,3)
-        $projFsTiB = [math]::Round($projFsGiB/1024,4)
-        $projFsTB  = [math]::Round($projFsGB/1000,4)
-        $summaryRows += [PSCustomObject]@{Level='Project';ResourceType='Fileshare';Project=$proj;Region='All';Zone='All';Count=(@($projFS)).Count;TotalSizeGB=$projFsGB;TotalSizeTB=$projFsTB;TotalSizeTiB=$projFsTiB}
-    }
-}
-if ($Selected.DB -and $databaseData) {
-    foreach ($proj in $targetProjects) {
-        $projDB = $databaseData | Where-Object Project -eq $proj
-        if (-not $projDB) { continue }
-        $projDbGB = ($projDB | Measure-Object StorageGB -Sum).Sum
-        if (-not $projDbGB) { $projDbGB = 0 }
-        $summaryRows += [PSCustomObject]@{Level='Project';ResourceType='Database';Project=$proj;Region='All';Zone='All';Count=$projDB.Count;TotalSizeGB=[math]::Round($projDbGB,3);TotalSizeTB=[math]::Round($projDbGB/1e3,4);TotalSizeTiB=[math]::Round($projDbGB/1024,4)}
-    }
-}
-if ($Selected.GKE -and $gkeData) {
-    foreach ($proj in $targetProjects) {
-        $projGke = $gkeData | Where-Object Project -eq $proj
-        if (-not $projGke) { continue }
-    $projGkePvCap = ($projGke | Measure-Object PersistentVolumeCapacityGB -Sum).Sum
-    if (-not $projGkePvCap) { $projGkePvCap = 0 }
-    $summaryRows += [PSCustomObject]@{Level='Project';ResourceType='GKECluster';Project=$proj;Region='All';Zone='All';Count=$projGke.Count;TotalSizeGB=[math]::Round($projGkePvCap,2);TotalSizeTB=[math]::Round($projGkePvCap/1e3,4);TotalSizeTiB=[math]::Round($projGkePvCap/1024,4)}
-    }
-}
-
-# 4 spacer rows
-1..4 | ForEach-Object { $summaryRows += (New-BlankSummaryRow) }
-# -------------------------
-# NEW: Cumulative Region-level rows across ALL projects (placed after project-level)
-# For VMs: sum distinct disks per region to avoid double counting
-# For Buckets: group by Location (mapped to Region column)
-# -------------------------
-if ($Selected.VM -and $vmData) {
-    $regionGroupsAll = $vmData | Group-Object Region | Sort-Object Name
-    foreach ($rg in $regionGroupsAll) {
-        $region = $rg.Name
-        # Distinct disks by name in this region
-        $regionDisksAll = $attached | Where-Object { $_.Region -eq $region } | Select-Object DiskName,SizeGB -Unique
-        $regionGBAll = ($regionDisksAll | Measure-Object SizeGB -Sum).Sum
-        if (-not $regionGBAll) { $regionGBAll = 0 }
-        $summaryRows += [PSCustomObject]@{Level='Region';ResourceType='VM';Project='All';Region=$region;Zone='All';Count=$rg.Count;TotalSizeGB=[int64]$regionGBAll;TotalSizeTB=[math]::Round($regionGBAll/1e3,4);TotalSizeTiB=[math]::Round($regionGBAll/1024,4)}
-    }
-}
-if ($Selected.STORAGE -and $bucketData) {
-    $locGroupsAll = $bucketData | Group-Object Location | Sort-Object Name
-    foreach ($lg in $locGroupsAll) {
-        $locBytes = ($lg.Group | Measure-Object UsedCapacityBytes -Sum).Sum
-        if (-not $locBytes) { $locBytes = 0 }
-        $summaryRows += [PSCustomObject]@{Level='Region';ResourceType='StorageBucket';Project='All';Region=$lg.Name;Zone='All';Count=$lg.Count;TotalSizeGB=[math]::Round($locBytes/1e9,3);TotalSizeTB=[math]::Round($locBytes/1e12,4);TotalSizeTiB=[math]::Round(($locBytes/1GB)/1024,4)}
-    }
-}
-if ($Selected.FILESHARE -and $fileshareData) {
-    $fsRegionGroups = $fileshareData | Group-Object Region | Sort-Object Name
-    foreach ($rg in $fsRegionGroups) {
-        $rGiB = ($rg.Group | Measure-Object provisionedGib -Sum).Sum
-        if (-not $rGiB) { $rGiB = 0 }
-        $rGB  = [math]::Round(($rGiB * 1024 * 1024 * 1024)/1e9,3)
-        $rTiB = [math]::Round($rGiB/1024,4)
-        $rTB  = [math]::Round($rGB/1000,4)
-        $summaryRows += [PSCustomObject]@{Level='Region';ResourceType='Fileshare';Project='All';Region=$rg.Name;Zone='All';Count=$rg.Count;TotalSizeGB=$rGB;TotalSizeTB=$rTB;TotalSizeTiB=$rTiB}
-    }
-}
-if ($Selected.DB -and $databaseData) {
-    $dbRegionGroups = $databaseData | Group-Object Region | Sort-Object Name
-    foreach ($rg in $dbRegionGroups) {
-        $rGb = ($rg.Group | Measure-Object StorageGB -Sum).Sum
-        if (-not $rGb) { $rGb = 0 }
-        $summaryRows += [PSCustomObject]@{Level='Region';ResourceType='Database';Project='All';Region=$rg.Name;Zone='All';Count=$rg.Count;TotalSizeGB=[math]::Round($rGb,3);TotalSizeTB=[math]::Round($rGb/1e3,4);TotalSizeTiB=[math]::Round($rGb/1024,4)}
-    }
-}
-if ($Selected.GKE -and $gkeData) {
-    $gkeRegionGroups = $gkeData | Group-Object Region | Sort-Object Name
-    foreach ($rg in $gkeRegionGroups) {
-    $rgGkePvCap = ($rg.Group | Measure-Object PersistentVolumeCapacityGB -Sum).Sum
-    if (-not $rgGkePvCap) { $rgGkePvCap = 0 }
-    $summaryRows += [PSCustomObject]@{Level='Region';ResourceType='GKECluster';Project='All';Region=$rg.Name;Zone='All';Count=$rg.Count;TotalSizeGB=[math]::Round($rgGkePvCap,2);TotalSizeTB=[math]::Round($rgGkePvCap/1e3,4);TotalSizeTiB=[math]::Round($rgGkePvCap/1024,4)}
-    }
-}
-
-# 4 spacer rows
-1..4 | ForEach-Object { $summaryRows += (New-BlankSummaryRow) }
-
-# Per project region + zone breakdown (VMs only)
-if ($Selected.VM -and $vmData) {
-    foreach ($proj in $targetProjects) {
-        $projVMs = $vmData | Where-Object Project -eq $proj
-        if (-not $projVMs) { continue }
-    
-    # Header row indicating upcoming region/zone breakdown for this project
-    $summaryRows += [PSCustomObject]@{Level="Per region/zone in project [$proj]";ResourceType='';Project='';Region='';Zone='';Count='';TotalSizeGB='';TotalSizeTB='';TotalSizeTiB=''}
-    
-        # Regions
-        $regionGroups = $projVMs | Group-Object Region | Sort-Object Name
-        foreach ($rg in $regionGroups) {
-            $region = $rg.Name
-            $regionDisks = $attached | Where-Object { $_.Project -eq $proj -and $_.Region -eq $region } | Select-Object DiskName,SizeGB -Unique
-            $regionGB = ($regionDisks | Measure-Object SizeGB -Sum).Sum
-            $summaryRows += [PSCustomObject]@{Level='Region';ResourceType='VM';Project=$proj;Region=$region;Zone='All';Count=$rg.Count;TotalSizeGB=[int64]$regionGB;TotalSizeTB=[math]::Round($regionGB/1e3,4);TotalSizeTiB=[math]::Round($regionGB/1024,4)}
-        }
-
-        # 2 spacer rows between region and zone section
-        1..2 | ForEach-Object { $summaryRows += (New-BlankSummaryRow) }
-
-        # Zones (group ensures correct counts; avoids missing zone counts)
-        $zoneGroups = $projVMs | Group-Object Zone | Sort-Object Name
-        foreach ($zg in $zoneGroups) {
-            $zone = $zg.Name
-            $zoneDisks = $attached | Where-Object { $_.Project -eq $proj -and $_.Zone -eq $zone } | Select-Object DiskName,SizeGB -Unique
-            $zoneGB = ($zoneDisks | Measure-Object SizeGB -Sum).Sum
-            $summaryRows += [PSCustomObject]@{Level='Zone';ResourceType='VM';Project=$proj;Region=(($projVMs | Where-Object Zone -eq $zone | Select-Object -First 1).Region);Zone=$zone;Count=$zg.Count;TotalSizeGB=[int64]$zoneGB;TotalSizeTB=[math]::Round($zoneGB/1e3,4);TotalSizeTiB=[math]::Round($zoneGB/1024,4)}
-        }
-
-        # Spacer between projects (optional single blank row)
-        $summaryRows += (New-BlankSummaryRow)
-    }
-}
-
-$summaryCsv = Join-Path $outDir ("gcp_inventory_summary_" + $dateStr + ".csv")
-$summaryRows | Export-Csv -Path $summaryCsv -NoTypeInformation
-Write-Host "Inventory summary exported: $(Split-Path $summaryCsv -Leaf)" -ForegroundColor Green
 
 # ============================================================
 # JSON EXPORT (when OutputFormat is json or both)
