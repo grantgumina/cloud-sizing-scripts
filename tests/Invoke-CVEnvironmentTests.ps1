@@ -128,6 +128,30 @@ $addMemberOffenders = @(Get-ChildItem -Path $srcRoot -Recurse -Filter *.ps1 | Fo
 Assert-CV 'every Add-Member -NotePropertyName passes -Force' $addMemberOffenders.Count 0
 if ($addMemberOffenders.Count) { $addMemberOffenders | ForEach-Object { Write-Host "        $_" -ForegroundColor DarkYellow } }
 
+Write-Host "`n[7a1] Archiving must COPY, not MOVE - the output directory keeps its files"
+<#
+    The AWS script used to delete every archived file, leaving the uncompressed output directory empty. Two
+    problems with that:
+      1. Azure and GCP keep theirs (Azure zips the directory with CreateFromDirectory), so AWS behaved
+         inconsistently and anyone wanting to read a CSV had to unzip first. This was the reported symptom.
+      2. It was a data-loss path. The add loop logs a per-file archive failure as a Warning and continues; the
+         delete then ran because the ZIP *existed*, without checking that this file made it in. One
+         CreateEntryFromFile failure destroyed that output permanently.
+#>
+$awsBodyArch = Get-Content -Raw (Join-Path $srcRoot 'CVAWSCloudSizingScript.ps1')
+# No unconditional Remove-Item over the archived-file list.
+$delLoop = [regex]::Matches($awsBodyArch, '(?ms)foreach \(\$file in \$filesToArchive\)\s*\{[^}]*Remove-Item')
+Assert-CV 'AWS: archived files are not deleted' $delLoop.Count 0
+Assert-CV 'AWS: the "Removed individual file" message is gone' ([bool]($awsBodyArch -match 'Removed individual file')) $false
+# And the archive is cross-checked, so an omission is visible rather than silent.
+Assert-CV 'AWS: archive contents are verified' ([bool]($awsBodyArch -match 'Archive is INCOMPLETE')) $true
+Assert-CV 'AWS: unregistered output files are reported' ([bool]($awsBodyArch -match 'are NOT in the archive')) $true
+# Azure/GCP must not acquire the delete-after-zip behaviour either.
+foreach ($f in @('CVAzureCloudSizingScript.ps1', 'CVGoogleCloudSizingScript.ps1')) {
+    $b = Get-Content -Raw (Join-Path $srcRoot $f)
+    Assert-CV "$f does not delete its output files after zipping" ([bool]($b -match 'Removed individual file')) $false
+}
+
 Write-Host "`n[7a2] The Azure script goes through the shared console and metric layers"
 <#
     Raw Write-Progress bypasses the console layer entirely: no tier awareness (so -NonInteractive still emitted

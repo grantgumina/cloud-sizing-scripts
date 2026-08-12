@@ -4275,16 +4275,45 @@ function New-OutputArchive {
                 $archiveSize = (Get-Item $archiveFile).Length
                 Write-ScriptOutput "Archive created successfully: $archiveFile (Size: $archiveSize bytes)" -Level Success
 
-                foreach ($file in $filesToArchive) {
-                    try {
-                        if (Test-Path $file) {
-                            Remove-Item $file -Force
-                            Write-ScriptOutput "Removed individual file: ${file}" -Level Info
+                # The individual files are DELIBERATELY LEFT IN PLACE.
+                #
+                # This used to delete every archived file, which left the uncompressed output directory empty -
+                # so anyone who wanted to open a CSV had to unzip first, and Azure/GCP behave the opposite way
+                # (Azure zips the directory with CreateFromDirectory and keeps it). That inconsistency was the
+                # reported symptom.
+                #
+                # It was also a data-loss path. The add loop above logs a per-file failure as a Warning and
+                # continues; the delete then ran on the strength of "the zip file exists" alone, without checking
+                # that this particular file made it in. A single CreateEntryFromFile failure therefore destroyed
+                # that output permanently. Keeping the files makes the archive a copy rather than a move.
+                #
+                # Cross-check what actually landed in the archive, so an omission is visible instead of silent -
+                # exactly the class of bug that kept aws_resilience_signals_*.csv out of the ZIP for so long.
+                try {
+                    $zipCheck  = [System.IO.Compression.ZipFile]::OpenRead($archiveFile)
+                    $entries   = @($zipCheck.Entries | ForEach-Object { $_.Name })
+                    $zipCheck.Dispose()
+                    $missing   = @($filesToArchive | ForEach-Object { Split-Path $_ -Leaf } | Where-Object { $_ -notin $entries })
+                    if ($missing.Count) {
+                        Write-ScriptOutput ("Archive is INCOMPLETE - {0} file(s) did not make it in: {1}. The originals are still in the output directory." -f `
+                                            $missing.Count, ($missing -join ', ')) -Level Warning
+                    }
+                    # And the reverse: a file sitting in the output directory that nobody registered for the
+                    # archive. The ZIP is what gets handed over, so an unregistered file is invisible to whoever
+                    # receives it.
+                    # Use the configured output directory rather than deriving it from the zip's filename - the
+                    # two happen to share a stem today, but that is a coincidence to not depend on.
+                    $runDir = if ($script:Config.OutputPath) { $script:Config.OutputPath } else { $script:RunPaths.OutputDir }
+                    if ($runDir -and (Test-Path $runDir)) {
+                        $onDisk    = @(Get-ChildItem -Path $runDir -File | ForEach-Object { $_.Name })
+                        $unzipped  = @($onDisk | Where-Object { $_ -notin $entries })
+                        if ($unzipped.Count) {
+                            Write-ScriptOutput ("{0} output file(s) are NOT in the archive: {1}. Register them via `$script:AllOutputFiles so they reach the recipient." -f `
+                                                $unzipped.Count, ($unzipped -join ', ')) -Level Warning
                         }
                     }
-                    catch {
-                        Write-ScriptOutput "Could not remove individual file ${file}: $_" -Level Warning
-                    }
+                } catch {
+                    Write-ScriptOutput "Could not verify archive contents: $($_.Exception.Message)" -Level Warning
                 }
             }
             else {
