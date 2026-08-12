@@ -215,101 +215,117 @@ Write-Host "`n[4] Shared signal fields are populated PER RESOURCE TYPE, not mere
     an already-built collection) are accepted globally, since text alone cannot tell which collection such a
     pass targets - so this is a floor, not a ceiling.
 #>
-$azureScript = Join-Path $repoRoot 'src' 'CVAzureCloudSizingScript.ps1'
-$azAst = [System.Management.Automation.Language.Parser]::ParseFile($azureScript, [ref]$null, [ref]$null)
-
-# ResourceType -> the row-builder variable(s) whose hashtable becomes a row of that collection. Mirrors the
-# $collections block in the script; FlexDB is two collections concatenated, hence two builders.
-$builders = @{
-    VM        = @('vmObj')
-    Disk      = @('diskObj')
-    Storage   = @('azSAObj')
-    SQL       = @('sqlObj')
-    FlexDB    = @('mysqlObj', 'postgresObj')
-    Cosmos    = @('cosmosObj')
-    FileShare = @('fileShareObj')
-    # NOT 'aksObj' - no such variable exists. The AKS row is built as $AKSCluster, so the mapping silently
-    # resolved to an empty field set and the AKS half of this section asserted nothing at all. Spelling must
-    # match the source exactly: the extractor compares assignment extent text with case-sensitive -eq.
-    AKS       = @('AKSCluster')
-}
-
+<#
+    Parameterised by cloud. It began Azure-only, which is how AWS/rds-vault and AWS/ddb-vault survived: both
+    read AWSBackupProtected, which IS assigned in the AWS script - but only inside Process-EC2Instance. RDS
+    referenced an unassigned local of the same name and DynamoDB never set it at all, so both controls were
+    permanently Unknown while section [1]'s per-cloud text search saw the field and passed.
+#>
+$script:CVBuilderAst = @{}
+$script:CVBuilderFieldCache = @{}
 function Get-CVBuilderFields {
-    <# .SYNOPSIS  Property names assigned on $<Builder>: hashtable literal keys, .Add("k",v), and $b["k"]=v. #>
-    param([string]$Builder)
+    <#
+      .SYNOPSIS  Property names assigned on $<Builder> in $Cloud's script: hashtable literal keys, .Add("k",v)
+                 and $b["k"] = v.
+    #>
+    param([string]$Builder, [Parameter(Mandatory)][ValidateSet('Azure','AWS','GCP')][string]$Cloud)
+    # Memoised: each call does three full AST traversals, and FindAll with a scriptblock predicate is slow over a
+    # 4,000-line script. Without this the section is called ~30 times and takes minutes instead of a second.
+    $cacheKey = "$Cloud|$Builder"
+    if ($script:CVBuilderFieldCache.ContainsKey($cacheKey)) { return $script:CVBuilderFieldCache[$cacheKey] }
+    if (-not $script:CVBuilderAst.ContainsKey($Cloud)) {
+        $script:CVBuilderAst[$Cloud] = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $repoRoot 'src' $script:CVCloudScript[$Cloud]), [ref]$null, [ref]$null)
+    }
+    $ast = $script:CVBuilderAst[$Cloud]
     $fields = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
 
-    # $builder = [ordered]@{ Key = ...; "Key" = ... }
-    $azAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
+    # $builder = [ordered]@{ Key = ...; "Key" = ... }  /  [PSCustomObject]@{ ... }
+    $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
         Where-Object { $_.Left.Extent.Text -eq "`$$Builder" } | ForEach-Object {
             $_.Right.FindAll({ param($n) $n -is [System.Management.Automation.Language.HashtableAst] }, $true) |
                 ForEach-Object { foreach ($pair in $_.KeyValuePairs) { [void]$fields.Add(($pair.Item1.Extent.Text -replace '^[''"]|[''"]$', '')) } }
         }
-
-    # $builder.Add("Key", value)  /  $builder["Key"] = value
-    $azAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true) |
+    # $builder.Add("Key", value)
+    $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] }, $true) |
         Where-Object { $_.Expression.Extent.Text -eq "`$$Builder" -and $_.Member.Extent.Text -eq 'Add' -and $_.Arguments.Count } |
         ForEach-Object { [void]$fields.Add(($_.Arguments[0].Extent.Text -replace '^[''"]|[''"]$', '')) }
-    $azAst.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
+    # $builder["Key"] = value
+    $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
         Where-Object { $_.Left -is [System.Management.Automation.Language.IndexExpressionAst] -and $_.Left.Target.Extent.Text -eq "`$$Builder" } |
         ForEach-Object { [void]$fields.Add(($_.Left.Index.Extent.Text -replace '^[''"]|[''"]$', '')) }
 
+    $script:CVBuilderFieldCache[$cacheKey] = $fields
     return $fields
 }
 
-# Enrichment fields: Add-Member -NotePropertyName X, applied post-hoc to whole collections. Scoped to Azure -
-# a global sweep here was the second half of the same leak, and on its own was enough to make Azure/aks-backup
-# look wired off GCP's HasBackupPlan even after the detector above was fixed.
-$enriched = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-[regex]::Matches($script:CVCloudText['Azure'], '-NotePropertyName\s+[''"]?([A-Za-z_][A-Za-z0-9_]*)') |
-    ForEach-Object { [void]$enriched.Add($_.Groups[1].Value) }
-Assert-CV 'enriched set is Azure-scoped (excludes GCP-only XRegionBackup)' ([bool]$enriched.Contains('XRegionBackup')) $false
-
-Assert-CV 'builder-field extraction works (vmObj has VMName)' ([bool](Get-CVBuilderFields 'vmObj').Contains('VMName')) $true
-Assert-CV 'builder-field extraction is scoped (vmObj lacks DiskName)' ([bool](Get-CVBuilderFields 'vmObj').Contains('DiskName')) $false
-
-# Guard the mapping itself. A $builders entry naming a variable that does not exist yields an empty field set,
-# which makes that resource type's whole check pass for free - it asserted nothing while looking like it did.
-# That is exactly what AKS = @('aksObj') did. Every declared builder must resolve to real fields.
-$emptyBuilders = @()
-foreach ($type in ($builders.Keys | Sort-Object)) {
-    foreach ($b in $builders[$type]) {
-        if (-not (Get-CVBuilderFields $b).Count) { $emptyBuilders += "$type -> `$$b" }
+# ResourceType -> the row-builder variable(s) that construct that type's rows. Spelling must match the source
+# exactly: the extractor compares assignment extent text with case-sensitive -eq. A name that does not exist
+# yields an empty set and silently makes that type's check vacuous - which is what AKS = 'aksObj' did.
+$script:CVTypeBuilders = @{
+    Azure = @{
+        VM = @('vmObj'); Disk = @('diskObj'); Storage = @('azSAObj'); SQL = @('sqlObj')
+        FlexDB = @('mysqlObj', 'postgresObj'); Cosmos = @('cosmosObj'); FileShare = @('fileShareObj')
+        AKS = @('AKSCluster')
+    }
+    AWS = @{
+        EC2 = @('ec2Obj'); EBS = @('volumeObj'); RDS = @('rdsObj'); S3 = @('s3Obj')
+        EFS = @('efsObj'); DynamoDB = @('ddbObj'); Redshift = @('rsObj')
     }
 }
-Assert-CV 'every declared row builder resolves to real fields' $emptyBuilders.Count 0
-if ($emptyBuilders.Count) {
-    Write-Host "        these name no variable that exists in the Azure script:" -ForegroundColor DarkYellow
-    $emptyBuilders | ForEach-Object { Write-Host "          $_" -ForegroundColor DarkYellow }
-}
-# And every resource type with controls must have a builder mapping, or the loop below skips it entirely.
-$unmappedTypes = @((Get-CVAzureResilienceControls).Keys | Where-Object { -not $builders.ContainsKey($_) })
-Assert-CV 'every Azure resource type has a builder mapping' $unmappedTypes.Count 0
-if ($unmappedTypes.Count) { Write-Host "        unmapped: $($unmappedTypes -join ', ')" -ForegroundColor DarkYellow }
 
-. (Join-Path $repoRoot 'src' 'common' 'CVSizing.Resilience.Azure.ps1')
-$azSets = Get-CVAzureResilienceControls
 $perTypeUnwired = @()
-foreach ($type in ($azSets.Keys | Sort-Object)) {
-    if (-not $builders.ContainsKey($type)) { continue }
-    $available = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($b in $builders[$type]) { foreach ($f in (Get-CVBuilderFields $b)) { [void]$available.Add($f) } }
-    foreach ($f in $enriched) { [void]$available.Add($f) }
+foreach ($cloud in @('Azure', 'AWS')) {
+    $builders = $script:CVTypeBuilders[$cloud]
+    $sets = & $(if ($cloud -eq 'Azure') { 'Get-CVAzureResilienceControls' } else { 'Get-CVAwsResilienceControls' })
 
-    foreach ($ctl in $azSets[$type]) {
-        $fields = @([regex]::Matches($ctl.Test.ToString(), '\$r\.([A-Za-z_][A-Za-z0-9_]*)') |
-                      ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
-        if (-not $fields.Count) { continue }
-        if (-not @($fields | Where-Object { $available.Contains($_) }).Count) {
-            # Keep the allow-list key separate from the display text; deriving one from the other by string
-            # surgery is how this check first reported its own five allow-listed entries as failures.
-            $perTypeUnwired += [pscustomobject]@{
-                Key     = "Azure/$($ctl.Id)"
-                Display = "Azure/$type/$($ctl.Id) [reads: $($fields -join ', ')]"
+    # Enrichment fields (Add-Member -NotePropertyName X) applied post-hoc to whole collections. Scoped to this
+    # cloud - a global sweep here was the second half of the cross-cloud leak.
+    $enriched = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    [regex]::Matches($script:CVCloudText[$cloud], '-NotePropertyName\s+[''"]?([A-Za-z_][A-Za-z0-9_]*)') |
+        ForEach-Object { [void]$enriched.Add($_.Groups[1].Value) }
+
+    # Guard the mapping itself, per cloud.
+    $emptyBuilders = @()
+    foreach ($type in ($builders.Keys | Sort-Object)) {
+        foreach ($b in $builders[$type]) {
+            if (-not (Get-CVBuilderFields -Builder $b -Cloud $cloud).Count) { $emptyBuilders += "$type -> `$$b" }
+        }
+    }
+    Assert-CV "${cloud}: every declared row builder resolves to real fields" $emptyBuilders.Count 0
+    if ($emptyBuilders.Count) { $emptyBuilders | ForEach-Object { Write-Host "          names nothing in the $cloud script: $_" -ForegroundColor DarkYellow } }
+
+    $unmappedTypes = @($sets.Keys | Where-Object { -not $builders.ContainsKey($_) })
+    Assert-CV "${cloud}: every resource type has a builder mapping" $unmappedTypes.Count 0
+    if ($unmappedTypes.Count) { Write-Host "        unmapped: $($unmappedTypes -join ', ')" -ForegroundColor DarkYellow }
+
+    foreach ($type in ($sets.Keys | Sort-Object)) {
+        if (-not $builders.ContainsKey($type)) { continue }
+        $available = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($b in $builders[$type]) { foreach ($f in (Get-CVBuilderFields -Builder $b -Cloud $cloud)) { [void]$available.Add($f) } }
+        foreach ($f in $enriched) { [void]$available.Add($f) }
+
+        foreach ($ctl in $sets[$type]) {
+            $fields = @([regex]::Matches($ctl.Test.ToString(), '\$r\.([A-Za-z_][A-Za-z0-9_]*)') |
+                          ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+            if (-not $fields.Count) { continue }
+            if (-not @($fields | Where-Object { $available.Contains($_) }).Count) {
+                # Allow-list key kept separate from the display text; deriving one from the other by string
+                # surgery is how this check once reported its own allow-listed entries as failures.
+                $perTypeUnwired += [pscustomobject]@{
+                    Key     = "$cloud/$($ctl.Id)"
+                    Display = "$cloud/$type/$($ctl.Id) [reads: $($fields -join ', ')]"
+                }
             }
         }
     }
 }
+
+Assert-CV 'extraction works (Azure vmObj has VMName)'      ([bool](Get-CVBuilderFields -Builder 'vmObj'  -Cloud Azure).Contains('VMName'))   $true
+Assert-CV 'extraction is scoped (vmObj lacks DiskName)'    ([bool](Get-CVBuilderFields -Builder 'vmObj'  -Cloud Azure).Contains('DiskName')) $false
+Assert-CV 'extraction works (AWS rdsObj has MultiAZ)'      ([bool](Get-CVBuilderFields -Builder 'rdsObj' -Cloud AWS).Contains('MultiAZ'))    $true
+Assert-CV 'extraction is cloud-scoped (rdsObj not in Azure)' (Get-CVBuilderFields -Builder 'rdsObj' -Cloud Azure).Count                     0
+
 $perTypeUnexpected = @($perTypeUnwired | Where-Object { -not $script:KnownUnwired.ContainsKey($_.Key) })
 Assert-CV 'no control is blank for its own resource type' $perTypeUnexpected.Count 0
 if ($perTypeUnexpected.Count) {
@@ -317,10 +333,85 @@ if ($perTypeUnexpected.Count) {
     $perTypeUnexpected | ForEach-Object { Write-Host "          $($_.Display)" -ForegroundColor DarkYellow }
 }
 
+Write-Host "`n[5] A signal field must not be fed from a variable nothing ever assigns"
+<#
+    Section [4] proves the FIELD is on the row builder. It cannot prove the field has a value: a builder can
+    assign `AWSBackupProtected = $awsBackupProtected` where $awsBackupProtected is never set in that function, so
+    the row carries the field as $null forever and the control is permanently Unknown.
+
+    That is exactly what AWS/rds-vault did. Only Process-EC2Instance ever called the AWS Backup lookup; RDS
+    referenced a local of the same name that was never assigned. Section [4] passes it because the field is
+    genuinely present on $rdsObj.
+
+    Same defect class as the three undefined variables that silently dropped SQL and Cosmos from the Azure JSON
+    export. Set-StrictMode would catch it at runtime; this catches it in the suite.
+#>
+function Get-CVUnassignedBuilderVars {
+    <#
+      .SYNOPSIS  Variables READ as a builder hashtable's values but never assigned in the enclosing function.
+      .OUTPUTS   "<function>/<builder>.<Field> <- $<var>" for each offender.
+    #>
+    param([Parameter(Mandatory)][ValidateSet('Azure','AWS','GCP')][string]$Cloud, [string[]]$Builder)
+    if (-not $script:CVBuilderAst.ContainsKey($Cloud)) {
+        $script:CVBuilderAst[$Cloud] = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $repoRoot 'src' $script:CVCloudScript[$Cloud]), [ref]$null, [ref]$null)
+    }
+    $ast = $script:CVBuilderAst[$Cloud]
+    $out = @()
+
+    foreach ($fn in $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }, $true)) {
+        # Everything assigned anywhere in this function, plus its parameters.
+        $assigned = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        $fn.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
+            ForEach-Object {
+                $l = $_.Left
+                if ($l -is [System.Management.Automation.Language.VariableExpressionAst]) { [void]$assigned.Add($l.VariablePath.UserPath) }
+                elseif ($l -is [System.Management.Automation.Language.IndexExpressionAst] -and
+                        $l.Target -is [System.Management.Automation.Language.VariableExpressionAst]) { [void]$assigned.Add($l.Target.VariablePath.UserPath) }
+                elseif ($l -is [System.Management.Automation.Language.MemberExpressionAst] -and
+                        $l.Expression -is [System.Management.Automation.Language.VariableExpressionAst]) { [void]$assigned.Add($l.Expression.VariablePath.UserPath) }
+            }
+        if ($fn.Body.ParamBlock) { $fn.Body.ParamBlock.Parameters | ForEach-Object { [void]$assigned.Add($_.Name.VariablePath.UserPath) } }
+        # foreach ($x in ...) binds $x too.
+        $fn.FindAll({ param($n) $n -is [System.Management.Automation.Language.ForEachStatementAst] }, $true) |
+            ForEach-Object { [void]$assigned.Add($_.Variable.VariablePath.UserPath) }
+
+        foreach ($b in $Builder) {
+            $fn.FindAll({ param($n) $n -is [System.Management.Automation.Language.AssignmentStatementAst] }, $true) |
+                Where-Object { $_.Left.Extent.Text -eq "`$$b" } | ForEach-Object {
+                    $ht = $_.Right.Find({ param($n) $n -is [System.Management.Automation.Language.HashtableAst] }, $true)
+                    if (-not $ht) { return }
+                    foreach ($pair in $ht.KeyValuePairs) {
+                        # Only flag a value that is JUST a bare variable - anything more is too complex to judge.
+                        $v = $pair.Item2
+                        $expr = $v.Extent.Text.Trim()
+                        if ($expr -notmatch '^\$[A-Za-z_][A-Za-z0-9_]*$') { continue }
+                        $name = $expr.Substring(1)
+                        if ($assigned.Contains($name)) { continue }
+                        if ($name -in @('null','true','false','_')) { continue }
+                        $key = $pair.Item1.Extent.Text -replace '^[''"]|[''"]$', ''
+                        $out += "$($fn.Name)/`$$b.$key <- `$$name"
+                    }
+                }
+        }
+    }
+    return $out
+}
+
+$unassigned = @()
+foreach ($cloud in @('Azure', 'AWS')) {
+    $unassigned += @(Get-CVUnassignedBuilderVars -Cloud $cloud -Builder @($script:CVTypeBuilders[$cloud].Values | ForEach-Object { $_ }))
+}
+Assert-CV 'no builder field is fed from an unassigned variable' $unassigned.Count 0
+if ($unassigned.Count) {
+    Write-Host "        These row fields can only ever be `$null - the variable is never assigned in that function:" -ForegroundColor DarkYellow
+    $unassigned | ForEach-Object { Write-Host "          $_" -ForegroundColor DarkYellow }
+}
+
 # The four CMK controls this section was written for. Each must now find CmkEncrypted on its own builder.
 foreach ($pair in @(@{T='Disk';B='diskObj'}, @{T='SQL';B='sqlObj'}, @{T='Cosmos';B='cosmosObj'},
                     @{T='FlexDB';B='mysqlObj'}, @{T='FlexDB';B='postgresObj'}, @{T='Storage';B='azSAObj'})) {
-    Assert-CV "$($pair.T): CmkEncrypted set on `$$($pair.B)" ([bool](Get-CVBuilderFields $pair.B).Contains('CmkEncrypted')) $true
+    Assert-CV "$($pair.T): CmkEncrypted set on `$$($pair.B)" ([bool](Get-CVBuilderFields -Builder $pair.B -Cloud Azure).Contains('CmkEncrypted')) $true
 }
 
 Write-Host ("`n======  {0} passed, {1} failed  ======`n" -f $script:Pass, $script:Fail) `

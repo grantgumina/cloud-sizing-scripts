@@ -78,7 +78,7 @@ Azure is the exception: the script talks to Azure through the `Az` PowerShell mo
 - The script requires `gsutil` (bucket sizing) and `bq` (BigQuery sizing) in addition to `gcloud`. They ship with the SDK; if the preflight reports either missing, add them with [`gcloud components install gsutil bq`](https://cloud.google.com/sdk/docs/components)
 - Confirm: `gcloud auth list` and `gcloud projects list`
 
-**Permissions:** read-only access is enough everywhere — AWS: the IAM policy in [docs/AWS.md](docs/AWS.md); Azure: **Reader** on each target subscription; GCP: **Viewer** on each target project.
+**Permissions:** read-only access is enough everywhere — AWS: the IAM policy in [docs/AWS.md](docs/AWS.md); Azure: **Reader** on each target subscription (AKS additionally needs Cluster User Role and cluster-scoped node/PV read — see [docs/Azure.md](docs/Azure.md#permissions)); GCP: **Viewer** on each target project.
 
 ### Step 3 — Install the PowerShell modules
 

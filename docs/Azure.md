@@ -8,8 +8,7 @@ This PowerShell script inventories Azure resources across subscriptions to assis
    https://docs.microsoft.com/en-us/azure/cloud-shell/overview
 
 2. Verify Azure permissions:
-   Ensure your Azure AD account has "Reader" role on target subscriptions
-   Additional "Reader and Data Access" role may be needed for storage metrics
+   `Reader` on each target subscription. See [Permissions](#permissions) below — AKS needs more.
 
 3. Access Azure Cloud Shell:
    - Login to Azure Portal with verified account
@@ -41,7 +40,7 @@ This PowerShell script inventories Azure resources across subscriptions to assis
    ```
 
 4. Verify permissions:
-   Ensure your Azure AD account has "Reader" role on target subscriptions
+   `Reader` on each target subscription. See [Permissions](#permissions) below — AKS needs more.
 
 5. Change to the script directory (where this repo was cloned/unzipped):
    ```powershell
@@ -104,12 +103,57 @@ This PowerShell script inventories Azure resources across subscriptions to assis
 * You can use subscription IDs instead of names to avoid spacing issues
 * The script will show available subscriptions if specified ones are not found
 
-#### AKS Requirements
-For AKS functionality, kubectl is required and will be automatically installed if not found. The script needs:
-- Azure Kubernetes Service Cluster User role on target AKS clusters
-- Azure Kubernetes Service RBAC Reader role on target AKS clusters
-- Reader role on the subscription/resource group containing AKS clusters
-- Network connectivity to AKS cluster API servers
+#### Permissions
+
+**`Reader` on each target subscription** (or on a management group above them) covers everything except AKS.
+
+Every Azure call the script makes is a `Get-Az*` cmdlet or an ARM `GET`; nothing writes. Since the built-in Reader
+role is `*/read`, it satisfies all of them: VMs and disks, storage accounts and file shares, Azure Monitor metrics,
+SQL / MySQL / PostgreSQL, NetApp, Cosmos, AVS, Recovery Services and Data Protection vaults, resource locks, and
+Resource Graph (which only returns resources you can already read).
+
+`Reader and Data Access` is **not** required. The script never touches a storage data plane — it reads no account
+keys and issues no SAS. File share usage comes from the ARM cmdlet `Get-AzRmStorageShare -GetShareUsage`, and
+capacity figures come from Azure Monitor (`Microsoft.Insights/metrics/read`), both covered by Reader.
+
+Grant Reader on **every** subscription you want inventoried: with no `-Subscriptions` filter the script scans all it
+can see. In a multi-tenant estate the identity needs access in each tenant, because the Cloud Rewind pass switches
+context per tenant.
+
+Missing permissions degrade rather than abort. A 403 leaves the affected signal blank / Unknown — never a false
+"gap" — and the log names the exact action to grant, e.g. `Microsoft.RecoveryServices/vaults/read`,
+`Microsoft.Authorization/locks/read`, `Microsoft.DataProtection/backupVaults/read`.
+
+##### AKS requires more than Reader
+
+`-Types AKS` collects persistent-volume data by pulling cluster credentials and running kubectl, which needs two
+things Reader does not grant:
+
+1. **Azure Kubernetes Service Cluster User Role** on each cluster. `Import-AzAksCredential` calls
+   `Microsoft.ContainerService/managedClusters/listClusterUserCredential/action` — an action, not a read.
+2. **Kubernetes read access to cluster-scoped storage objects.** The script runs `kubectl get nodes`,
+   `kubectl get pv`, and `kubectl get pvc -A`.
+
+On an Azure-RBAC-enabled cluster the built-in **Azure Kubernetes Service RBAC Reader is not sufficient** for step 2.
+It is a namespace-scoped role: it grants `persistentvolumeclaims/read` but has no dataAction for `persistentvolumes`
+or `nodes` (see [Azure/AKS#3336](https://github.com/Azure/AKS/issues/3336), and the open request for a cluster-wide
+reader role, [Azure/AKS#4387](https://github.com/Azure/AKS/issues/4387)). The script gates on `kubectl get nodes`
+before collecting anything, so RBAC Reader alone yields **no** AKS storage data at all. Use either:
+
+* **Azure Kubernetes Service RBAC Cluster Admin** on the clusters — simplest, but broad; or
+* a custom role assigned at cluster scope with just these dataActions:
+  ```
+  Microsoft.ContainerService/managedClusters/nodes/read
+  Microsoft.ContainerService/managedClusters/persistentvolumes/read
+  Microsoft.ContainerService/managedClusters/persistentvolumeclaims/read
+  ```
+
+On clusters *without* Azure RBAC, Cluster User yields a kubeconfig mapped to a Kubernetes identity, and the same read
+access must be granted with a Kubernetes `ClusterRole` / `ClusterRoleBinding` instead.
+
+AKS also needs kubectl (installed automatically if absent) and network reachability to each cluster's API server;
+private clusters are unreachable from Cloud Shell, so run from inside the VNet or with equivalent connectivity. If
+these permissions are unavailable, exclude AKS via `-Types` — the rest of the inventory is unaffected.
 
 #### Results & Output
 The script creates a timestamped output directory with the following files:

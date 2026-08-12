@@ -689,9 +689,16 @@ function Write-AWSResilienceReport {
         # One file: every resource with a gap or an incomplete assessment, ranked. The static control catalog and
         # the per-category rollup are no longer written - neither named the resources to go look at.
         if ($script:ResilienceSignalRows.Count) {
+            $signalsPath = Join-Path $OutputPath ("aws_resilience_signals_" + $DateString + ".csv")
             Sort-CVSignalRows -Rows $script:ResilienceSignalRows |
-                Export-CVCsv -Path (Join-Path $OutputPath ("aws_resilience_signals_" + $DateString + ".csv")) `
+                Export-CVCsv -Path $signalsPath `
                              -PreferredOrder (Get-CVSignalColumns -ControlSets (Get-CVAwsResilienceControls)) -KeepDeclaredColumns
+            # REGISTER IT FOR THE ARCHIVE. The ZIP is built from $script:AllOutputFiles, not from the output
+            # directory, so a file that writes itself without registering is silently left out - and the ZIP is
+            # the artifact handed to the Commvault representative. Verified against a live run: the signals CSV
+            # was on disk and absent from the archive, so on AWS this whole export was invisible in the
+            # deliverable. Every other writer does this; this one did not.
+            $script:AllOutputFiles.Add($signalsPath) | Out-Null
             Write-CVLog ("Resilience signals: {0} resource(s) exported across {1} resource type(s)." -f `
                          $script:ResilienceSignalRows.Count, @($script:ResilienceSignalRows | Select-Object -ExpandProperty ResourceType -Unique).Count) `
                         -Level Info -Source 'Resilience'
@@ -721,10 +728,54 @@ function Resolve-CVAwsCommand {
     return $null
 }
 
-function Get-AWSBackupProtectedArn {
+function Test-CVAwsNotConfiguredError {
     <#
-      .SYNOPSIS  Region-scoped list of ARNs covered by AWS Backup.
-      .OUTPUTS   String[] of ARNs (possibly empty) when the lookup succeeded; $null when it could not be performed.
+      .SYNOPSIS  Does this S3 exception mean "the feature is not configured" rather than "the call failed"?
+      .DESCRIPTION
+        S3 signals absence by THROWING, not by returning an empty object. Verified live against a real bucket:
+        get-object-lock-configuration returns ObjectLockConfigurationNotFoundError when Object Lock was never
+        enabled. The same pattern applies to replication, lifecycle and default encryption.
+
+        That makes a blanket `catch { $null }` wrong in the opposite direction from a blanket `catch { $false }`:
+        one invents a gap, the other hides a real one behind Unknown. Only these specific error codes are a
+        measured absence; anything else - AccessDenied, throttling, a network fault - is genuinely unknown.
+      .OUTPUTS  $true when the error means "not configured".
+    #>
+    param($ErrorRecord)
+
+    # The AWS error CODE is the reliable signal, but it can sit on the exception, on an InnerException, or be
+    # absent entirely depending on how the cmdlet wrapped the fault - so gather every place it might be and
+    # match once. Verified live: two buckets with no public-access block raise
+    # NoSuchPublicAccessBlockConfiguration, and an ErrorCode-only check missed it, leaving the four columns blank
+    # when the honest answer is FALSE - i.e. hiding a genuinely unprotected bucket behind "not collected".
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $ex = $ErrorRecord.Exception
+    $depth = 0
+    while ($ex -and $depth -lt 4) {
+        foreach ($prop in 'ErrorCode', 'Message') {
+            try { $v = $ex.$prop; if ($v) { $parts.Add("$v") } } catch { }
+        }
+        $ex = $ex.InnerException; $depth++
+    }
+    try { if ($ErrorRecord.FullyQualifiedErrorId) { $parts.Add("$($ErrorRecord.FullyQualifiedErrorId)") } } catch { }
+    $hay = ($parts -join ' | ')
+
+    # Error-code tokens, plus the prose forms AWS uses when no code survives the wrapping.
+    return [bool]($hay -match '(?i)(ReplicationConfigurationNotFound|NoSuchLifecycleConfiguration|NoSuchLifecycleConfig|ServerSideEncryptionConfigurationNotFound|ObjectLockConfigurationNotFound|NoSuchPublicAccessBlockConfiguration|NoSuchReplicationConfiguration|NoSuchConfiguration|not\s*found|does not exist)')
+}
+
+function Get-AWSBackupProtectedResource {
+    <#
+      .SYNOPSIS  Region-scoped list of resources covered by AWS Backup, as full objects.
+      .DESCRIPTION
+        Caches the ProtectedResource objects rather than just their ARNs, because two of their other fields
+        matter: .ResourceType ('EC2' | 'RDS' | 'DynamoDB' | 'EFS' | 'S3' ...) lets a caller match by type instead
+        of guessing from the ARN text, and .LastBackupTime gives a real recovery-point age for every service -
+        not just EC2, which was inferring it from EBS snapshots alone.
+        Verified live: ResourceType='RDS', ResourceArn='arn:aws:rds:us-east-1:...:db:database-1',
+        LastBackupTime=2021-07-31.
+      .OUTPUTS   ProtectedResource[] (possibly empty) when the lookup SUCCEEDED; $null when it could not be
+                 performed. That distinction is the whole point - see Resolve-AWSBackupProtection.
     #>
     param($Credential, [string]$Region)
 
@@ -744,15 +795,135 @@ function Get-AWSBackupProtectedArn {
         return $null
     }
     try {
-        $items = & $cmdName -Credential $Credential -Region $Region -ErrorAction Stop
-        $arns  = @($items | ForEach-Object { $_.ResourceArn } | Where-Object { $_ })
-        $script:AWSBackupProtectedCache[$Region] = $arns
-        Write-ScriptOutput "AWS Backup: $($arns.Count) protected resource(s) in $Region (via $cmdName)." -Level Info
-        return ,$arns
+        $items = @(& $cmdName -Credential $Credential -Region $Region -ErrorAction Stop | Where-Object { $_ -and $_.ResourceArn })
+        $script:AWSBackupProtectedCache[$Region] = $items
+        Write-ScriptOutput "AWS Backup: $($items.Count) protected resource(s) in $Region (via $cmdName)." -Level Info
+        return ,$items
     } catch {
         Write-ScriptOutput "AWS Backup protected-resource lookup failed in ${Region}: $($_.Exception.Message)" -Level Warning
         $script:AWSBackupProtectedCache[$Region] = $null
         return $null
+    }
+}
+
+$script:AWSVaultLockCache = @{}
+
+function Get-AWSBackupVaultLock {
+    <#
+      .SYNOPSIS  Region-scoped AWS Backup Vault Lock posture - the immutability signal AWS had none of.
+      .DESCRIPTION
+        Vault Lock is the AWS analogue of an Azure Recovery Services vault's locked immutability policy: once
+        locked in compliance mode, recovery points cannot be deleted or their retention shortened, even by an
+        administrator. Nothing in this script collected it, so AWS reported no immutability signal for backups at
+        all while Azure reported one for every VM.
+
+        Verified live: Get-BAKBackupVaultList then Get-BAKBackupVault returns .Locked (a real boolean), .LockDate,
+        .MinRetentionDays, .MaxRetentionDays and .NumberOfRecoveryPoints. On the test account the 'Default' vault
+        reported Locked=false with 1 recovery point.
+
+        Aggregated per region because a resource's recovery points can span vaults: AnyLocked answers "is any
+        vault protecting this region immutable", which is the honest summary without pretending to know which
+        vault holds a given resource's points.
+      .OUTPUTS  pscustomobject { Status; VaultCount; LockedCount; AnyLocked; MinRetentionDays; VaultNames }
+                Status is Ok | Failed; every value is $null when Failed.
+    #>
+    param($Credential, [string]$Region)
+
+    if ($script:AWSVaultLockCache.ContainsKey($Region)) { return $script:AWSVaultLockCache[$Region] }
+
+    $unknown = [pscustomobject]@{ Status = 'Failed'; VaultCount = $null; LockedCount = $null
+                                 AnyLocked = $null; MinRetentionDays = $null; VaultNames = '' }
+    $listCmd = Resolve-CVAwsCommand -Candidates @('Get-BAKBackupVaultList','Get-BKPBackupVaultList')
+    $descCmd = Resolve-CVAwsCommand -Candidates @('Get-BAKBackupVault','Get-BKPBackupVault')
+    if (-not $listCmd -or -not $descCmd) {
+        $script:AWSVaultLockCache[$Region] = $unknown
+        return $unknown
+    }
+
+    try {
+        $vaults = @(& $listCmd -Credential $Credential -Region $Region -ErrorAction Stop)
+    } catch {
+        Write-ScriptOutput "AWS Backup vault listing failed in ${Region}: $($_.Exception.Message)" -Level Warning
+        $script:AWSVaultLockCache[$Region] = $unknown
+        return $unknown
+    }
+
+    # 200 with zero vaults is conclusive: no vault, so nothing is locked.
+    if (-not $vaults.Count) {
+        $res = [pscustomobject]@{ Status = 'Ok'; VaultCount = 0; LockedCount = 0
+                                  AnyLocked = $false; MinRetentionDays = $null; VaultNames = '' }
+        $script:AWSVaultLockCache[$Region] = $res
+        return $res
+    }
+
+    $locked = 0; $minRet = $null; $names = @(); $anyFailed = $false
+    foreach ($v in $vaults) {
+        $names += "$($v.BackupVaultName)"
+        try {
+            $d = & $descCmd -BackupVaultName $v.BackupVaultName -Credential $Credential -Region $Region -ErrorAction Stop
+            if ($d.Locked) {
+                $locked++
+                if ($null -ne $d.MinRetentionDays -and ($null -eq $minRet -or [int]$d.MinRetentionDays -lt $minRet)) { $minRet = [int]$d.MinRetentionDays }
+            }
+        } catch { $anyFailed = $true }
+    }
+    # One unreadable vault means we cannot claim "nothing is locked" for the region.
+    if ($anyFailed -and $locked -eq 0) {
+        $script:AWSVaultLockCache[$Region] = $unknown
+        return $unknown
+    }
+
+    $res = [pscustomobject]@{
+        Status = 'Ok'; VaultCount = $vaults.Count; LockedCount = $locked
+        AnyLocked = [bool]($locked -gt 0); MinRetentionDays = $minRet; VaultNames = ($names -join ';')
+    }
+    $script:AWSVaultLockCache[$Region] = $res
+    return $res
+}
+
+function Resolve-AWSBackupProtection {
+    <#
+      .SYNOPSIS  Tri-state AWS Backup coverage for one resource, plus its last backup time.
+      .DESCRIPTION
+        Matches on ResourceType AND an exact ARN, replacing a substring test
+        (`$_ -like "*$InstanceId*"`) that could match the wrong resource: identifiers chosen by the user - RDS
+        instances, DynamoDB tables - collide readily, so 'db1' matched 'db10'. An ARN suffix match on
+        "/$Identifier" or ":$Identifier" is exact at the segment boundary, the same reasoning as the Azure
+        resource-lock scope predicate.
+      .PARAMETER ResourceArn  Preferred: the resource's own ARN, matched exactly.
+      .PARAMETER Identifier   Fallback for resources whose row carries no ARN (EC2 instances). Matched against
+                              the final ARN segment only.
+      .OUTPUTS  pscustomobject { Protected; LastBackupTime; Status }
+                Protected is $null when the protected-resource list could not be read - NEVER $false, because
+                "we could not look" is not evidence the resource is unprotected. Status is Ok | Failed.
+    #>
+    param($Credential, [string]$Region, [string]$ResourceArn, [string]$Identifier, [string]$ResourceType)
+
+    $all = Get-AWSBackupProtectedResource -Credential $Credential -Region $Region
+    if ($null -eq $all) {
+        return [pscustomobject]@{ Protected = $null; LastBackupTime = $null; Status = 'Failed' }
+    }
+
+    $candidates = @($all)
+    if ($ResourceType) { $candidates = @($candidates | Where-Object { "$($_.ResourceType)" -eq $ResourceType }) }
+
+    $match = $null
+    if ($ResourceArn) {
+        $match = @($candidates | Where-Object { "$($_.ResourceArn)".Equals($ResourceArn, [StringComparison]::OrdinalIgnoreCase) })[0]
+    }
+    if (-not $match -and $Identifier) {
+        # Segment-boundary match: an ARN ends '.../i-0abc' or ':table/name', so require the delimiter.
+        $match = @($candidates | Where-Object {
+            $a = "$($_.ResourceArn)"
+            $a.EndsWith("/$Identifier", [StringComparison]::OrdinalIgnoreCase) -or
+            $a.EndsWith(":$Identifier", [StringComparison]::OrdinalIgnoreCase)
+        })[0]
+    }
+
+    return [pscustomobject]@{
+        Protected      = [bool]$match
+        LastBackupTime = $(if ($match) { $match.LastBackupTime } else { $null })
+        Status         = 'Ok'
     }
 }
 
@@ -822,16 +993,23 @@ function Process-EC2Instance {
     $sizes = Convert-BytesToSizes -Bytes $totalEbsBytes
 
     # ── Backup coverage: check AWS Backup and native EBS snapshots ─────────
-    $awsBackupProtected = $false
+    # $null, NOT $false. This used to initialise to $false, so a region whose protected-resource list could not
+    # be read exported AWSBackupProtected = FALSE - an affirmative "not backed up" about data we never saw. The
+    # ec2-backup control happened to compensate via ProtectionStatus, but the SIGNAL COLUMN itself was wrong, and
+    # the column is what the backend consumes.
+    $awsBackupProtected = $null
+    $awsBackupLastTime  = $null
     $latestSnapshotDate = $null
     $snapshotCount = 0
     $snapshotSizeGiB = 0
 
-    # AWS Backup protected-resource list is per REGION, not per instance - fetch once and reuse.
-    $protectedArns = Get-AWSBackupProtectedArn -Credential $Credential -Region $Region
-    if ($null -ne $protectedArns) {
-        $awsBackupProtected = @($protectedArns | Where-Object { $_ -like "*$($Item.InstanceId)*" }).Count -gt 0
-    }
+    # The protected-resource list is per REGION, not per instance - fetched once and cached. Matched by
+    # ResourceType + exact ARN segment rather than a substring of the instance id.
+    $ec2Backup = Resolve-AWSBackupProtection -Credential $Credential -Region $Region `
+                    -Identifier $Item.InstanceId -ResourceType 'EC2'
+    $awsBackupProtected = $ec2Backup.Protected
+    $awsBackupLastTime  = $ec2Backup.LastBackupTime
+
 
     # EBS snapshots belong to VOLUMES, not instances: 'source-instance-id' is not a valid DescribeSnapshots
     # filter, so the old call was rejected by the API and the bare catch reported every instance as having
@@ -871,10 +1049,10 @@ function Process-EC2Instance {
 
     # ── Protection status inference ────────────────────────────────────────
     # 'Unprotected' is a claim, so only make it when both signals were actually collected. When the AWS Backup
-    # list could not be read ($protectedArns is $null) and no snapshots were found, the honest answer is Unknown.
+    # list could not be read and no snapshots were found, the honest answer is Unknown.
     $protectionStatus = if ($awsBackupProtected)                        { 'Protected' }
                         elseif ($snapshotCount -gt 0)                   { 'Snapshot-Only' }
-                        elseif ($null -eq $protectedArns)               { 'Unknown' }
+                        elseif ($ec2Backup.Status -ne 'Ok')             { 'Unknown' }
                         else                                            { 'Unprotected' }
 
     $ec2Obj = [PSCustomObject]@{
@@ -899,11 +1077,22 @@ function Process-EC2Instance {
         # EC2 does not return an ARN, so build the canonical one rather than leave the row unjoinable.
         ResourceId            = "arn:aws:ec2:${Region}:$($AccountInfo.Account):instance/$($Item.InstanceId)"
         AWSBackupProtected    = $awsBackupProtected
+        # AWS Backup Vault Lock - region-scoped immutability. Locked vaults cannot have recovery points
+        # deleted or retention shortened, even by an admin: the AWS analogue of Azure vault immutability.
+        BackupVaultAnyLocked    = $vaultLock.AnyLocked
+        BackupVaultLockedCount  = $vaultLock.LockedCount
+        BackupVaultMinRetentionDays = $vaultLock.MinRetentionDays
         EBSSnapshotCount      = $snapshotCount
         # Reported in TB only (decimal) - the sizing spreadsheet takes TB, and mixed units invite copy/paste errors.
         EBSSnapshotSizeTB     = [math]::Round(($snapshotSizeGiB * 1GB) / 1000000000000, 4)
         LatestSnapshotDate    = $latestSnapshotDate
-        DaysSinceLastBackup   = if ($latestSnapshotDate) { [math]::Round((New-TimeSpan -Start $latestSnapshotDate -End (Get-Date)).TotalDays, 0) } else { $null }
+        # Most recent recovery point from EITHER source. It used to consider EBS snapshots only, so an instance
+        # backed up solely by AWS Backup reported no recovery point at all and ec2-recent read Unknown.
+        DaysSinceLastBackup   = $(
+            $newest = @($latestSnapshotDate, $awsBackupLastTime) | Where-Object { $_ } | Sort-Object -Descending | Select-Object -First 1
+            if ($newest) { [math]::Round((New-TimeSpan -Start $newest -End (Get-Date)).TotalDays, 0) } else { $null }
+        )
+        AwsBackupLastBackupUtc = $(if ($awsBackupLastTime) { ([datetime]$awsBackupLastTime).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { '' })
         ProtectionStatus      = $protectionStatus
     }
 
@@ -1016,35 +1205,92 @@ function Process-S3Bucket {
         } catch { $versioningStatus = 'Unknown' }
 
         # ── Public access block ───────────────────────────────────────────
+        # All FOUR booleans are published raw. Collapsing them into one PublicAccessBlocked was a judgement about
+        # what "blocked" means, and it hid WHICH protection was missing. Verified live: a real bucket returns all
+        # four nested under .PublicAccessBlockConfiguration.
+        $pabAcls = $null; $pabPolicy = $null; $pabIgnore = $null; $pabRestrict = $null
         $publicAccessBlocked = $null
         try {
-            $pab = Get-S3PublicAccessBlock -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
-            $publicAccessBlocked = ($pab.BlockPublicAcls -and $pab.BlockPublicPolicy -and $pab.IgnorePublicAcls -and $pab.RestrictPublicBuckets)
-        } catch { $publicAccessBlocked = $null }
+            $pabResp = Get-S3PublicAccessBlock -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
+            $pab = if ($pabResp -and $pabResp.PSObject.Properties['PublicAccessBlockConfiguration']) { $pabResp.PublicAccessBlockConfiguration } else { $pabResp }
+            if ($pab) {
+                $pabAcls     = $(if ($null -ne $pab.BlockPublicAcls)       { [bool]$pab.BlockPublicAcls })
+                $pabPolicy   = $(if ($null -ne $pab.BlockPublicPolicy)     { [bool]$pab.BlockPublicPolicy })
+                $pabIgnore   = $(if ($null -ne $pab.IgnorePublicAcls)      { [bool]$pab.IgnorePublicAcls })
+                $pabRestrict = $(if ($null -ne $pab.RestrictPublicBuckets) { [bool]$pab.RestrictPublicBuckets })
+                $publicAccessBlocked = ($pabAcls -and $pabPolicy -and $pabIgnore -and $pabRestrict)
+            }
+        } catch {
+            # No block configuration at all is a MEASURED "nothing is blocked", not an unknown.
+            if (Test-CVAwsNotConfiguredError $_) {
+                $pabAcls = $false; $pabPolicy = $false; $pabIgnore = $false; $pabRestrict = $false
+                $publicAccessBlocked = $false
+            }
+        }
 
         # ── Replication ───────────────────────────────────────────────────
-        $replicationEnabled = $false
+        # $null, not $false: this used to report "no cross-region replication" whenever the call failed for ANY
+        # reason, including AccessDenied. S3 throws ReplicationConfigurationNotFoundError when there genuinely is
+        # none, so only that error is a measured absence.
+        $replicationEnabled = $null
         try {
             $replConfig = Get-S3BucketReplication -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
-            $replicationEnabled = ($replConfig -and $replConfig.Rules -and $replConfig.Rules.Count -gt 0)
-        } catch { $replicationEnabled = $false }
+            $replicationEnabled = [bool]($replConfig -and $replConfig.Rules -and @($replConfig.Rules).Count -gt 0)
+        } catch { if (Test-CVAwsNotConfiguredError $_) { $replicationEnabled = $false } }
 
         # ── Lifecycle rules ───────────────────────────────────────────────
-        $lifecycleRuleCount = 0
+        $lifecycleRuleCount = $null
         try {
             $lcRules = Get-S3LifecycleConfiguration -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
-            $lifecycleRuleCount = if ($lcRules -and $lcRules.Rules) { $lcRules.Rules.Count } else { 0 }
-        } catch { $lifecycleRuleCount = 0 }
+            $lifecycleRuleCount = if ($lcRules -and $lcRules.Rules) { @($lcRules.Rules).Count } else { 0 }
+        } catch { if (Test-CVAwsNotConfiguredError $_) { $lifecycleRuleCount = 0 } }
 
         # ── Encryption ────────────────────────────────────────────────────
-        $serverSideEncryption = 'None'
+        # 'Unknown', NOT 'None', when the read fails. s3-encrypted treats 'None' as a Gap, so the old catch
+        # reported a bucket as unencrypted because the API call did not succeed - the worst of the three S3
+        # fabrications, since encryption is a Critical-adjacent finding.
+        $serverSideEncryption = 'Unknown'
         try {
             $encConfig = Get-S3BucketEncryption -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
-            if ($encConfig -and $encConfig.ServerSideEncryptionRules -and $encConfig.ServerSideEncryptionRules.Count -gt 0) {
-                $sse = $encConfig.ServerSideEncryptionRules[0].ServerSideEncryptionByDefault.SSEAlgorithm
-                $serverSideEncryption = if ($sse -and $sse.PSObject.Properties.Name -contains 'Value') { $sse.Value } else { [string]$sse }
-            }
-        } catch { $serverSideEncryption = 'None' }
+            if ($encConfig -and $encConfig.ServerSideEncryptionRules -and @($encConfig.ServerSideEncryptionRules).Count -gt 0) {
+                # ServerSideEncryptionAlgorithm, NOT SSEAlgorithm. The latter is the REST/JSON field name; the
+                # .NET SDK object calls it ServerSideEncryptionAlgorithm, so reading .SSEAlgorithm returned $null
+                # and this column was blank on EVERY bucket in every run - meaning s3-encrypted could only ever
+                # be Unknown. Confirmed on a live account whose buckets are all AES256.
+                $sseDefault = $encConfig.ServerSideEncryptionRules[0].ServerSideEncryptionByDefault
+                $sse = if ($sseDefault) { $sseDefault.ServerSideEncryptionAlgorithm } else { $null }
+                $serverSideEncryption = if ($sse -and $sse.PSObject.Properties.Name -contains 'Value') { $sse.Value }
+                                        elseif ($sse) { [string]$sse }
+                                        else { 'None' }
+            } else { $serverSideEncryption = 'None' }
+        } catch { if (Test-CVAwsNotConfiguredError $_) { $serverSideEncryption = 'None' } }
+
+        # ── Object Lock (WORM) ────────────────────────────────────────────
+        # S3's immutability control, and the AWS analogue of Azure storage's locked immutability policy. Not
+        # collected before, so AWS had no immutability signal for object storage at all. Verified live: absent
+        # configuration throws ObjectLockConfigurationNotFoundError, which is a measured 'None'.
+        $objectLockEnabled = 'Unknown'
+        $objectLockMode    = ''
+        $objectLockDays    = $null
+        try {
+            $olResp = Get-S3ObjectLockConfiguration -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
+            $ol = if ($olResp -and $olResp.PSObject.Properties['ObjectLockConfiguration']) { $olResp.ObjectLockConfiguration } else { $olResp }
+            if ($ol -and "$($ol.ObjectLockEnabled)") {
+                $objectLockEnabled = "$($ol.ObjectLockEnabled)"
+                if ($ol.Rule -and $ol.Rule.DefaultRetention) {
+                    $objectLockMode = "$($ol.Rule.DefaultRetention.Mode)"
+                    $objectLockDays = $(if ($ol.Rule.DefaultRetention.Days) { [int]$ol.Rule.DefaultRetention.Days }
+                                        elseif ($ol.Rule.DefaultRetention.Years) { [int]$ol.Rule.DefaultRetention.Years * 365 })
+                }
+            } else { $objectLockEnabled = 'None' }
+        } catch { if (Test-CVAwsNotConfiguredError $_) { $objectLockEnabled = 'None' } }
+
+        # ── MFA delete ────────────────────────────────────────────────────
+        # Comes from the versioning response already fetched above - no extra call.
+        # A successfully read versioning config that omits EnableMfaDelete means MFA delete is OFF - measured,
+        # not unknown. Blank is reserved for the case where the versioning read itself failed.
+        $mfaDelete = $(if ($null -ne $vConfig -and $null -ne $vConfig.EnableMfaDelete) { [bool]$vConfig.EnableMfaDelete }
+                       elseif ($null -ne $vConfig) { $false })
 
         # ── Protection status inference ───────────────────────────────────
         $s3ProtectionStatus = if ($replicationEnabled -and $versioningStatus -eq 'Enabled') { 'Protected' }
@@ -1060,10 +1306,21 @@ function Process-S3Bucket {
             ObjectCount           = $objectCount
             CreationDate          = if ($Item.CreationDate) { $Item.CreationDate } else { $null }
             VersioningStatus      = $versioningStatus
+            MfaDeleteEnabled      = $mfaDelete
+            # All four public-access booleans, published raw. PublicAccessBlocked is kept as the AND of them for
+            # continuity, but the four are what tell you WHICH protection is missing.
             PublicAccessBlocked   = $publicAccessBlocked
+            BlockPublicAcls       = $pabAcls
+            BlockPublicPolicy     = $pabPolicy
+            IgnorePublicAcls      = $pabIgnore
+            RestrictPublicBuckets = $pabRestrict
             ReplicationEnabled    = $replicationEnabled
             LifecycleRuleCount    = $lifecycleRuleCount
             ServerSideEncryption  = $serverSideEncryption
+            # Object Lock: S3's WORM control. 'Enabled' | 'None' | 'Unknown'.
+            ObjectLockEnabled     = $objectLockEnabled
+            ObjectLockMode        = $objectLockMode
+            ObjectLockRetentionDays = $objectLockDays
             ProtectionStatus      = $s3ProtectionStatus
             SizeGiB               = $sizes.SizeGiB
             SizeTiB               = $sizes.SizeTiB
@@ -1122,7 +1379,19 @@ function Process-EFSFileSystem {
     $efsEncrypted = if ($Item.Encrypted -ne $null) { [bool]$Item.Encrypted } else { $null }
     $throughputMode = if ($Item.ThroughputMode) { $Item.ThroughputMode.Value ?? $Item.ThroughputMode } else { $null }
 
-    $efsProtectionStatus = if ($backupPolicyStatus -eq 'ENABLED') { 'Protected' }
+    # ── AWS Backup coverage + cross-region replication ─────────────────────
+    $efsBackup = Resolve-AWSBackupProtection -Credential $Credential -Region $Region `
+                    -ResourceArn $Item.FileSystemArn -Identifier $Item.FileSystemId -ResourceType 'EFS'
+    # EFS replication to another region is its cross-region redundancy signal. Absence throws, which is a
+    # measured 'None' rather than an unknown.
+    $efsReplication = 'Unknown'
+    try {
+        $rc = Get-EFSReplicationConfiguration -FileSystemId $Item.FileSystemId -Credential $Credential -Region $Region -ErrorAction Stop
+        $efsReplication = $(if (@($rc).Count) { 'Configured' } else { 'None' })
+    } catch { if (Test-CVAwsNotConfiguredError $_) { $efsReplication = 'None' } }
+
+    $efsProtectionStatus = if ($backupPolicyStatus -eq 'ENABLED' -or $efsBackup.Protected) { 'Protected' }
+                           elseif ($backupPolicyStatus -eq 'Unknown' -or $efsBackup.Status -ne 'Ok') { 'Unknown' }
                            else { 'Unprotected' }
 
     $efsObj = [PSCustomObject]@{
@@ -1136,6 +1405,14 @@ function Process-EFSFileSystem {
         State              = if ($Item.LifeCycleState -and $Item.LifeCycleState.PSObject.Properties.Name -contains 'Value') { $Item.LifeCycleState.Value } else { [string]$Item.LifeCycleState }
         Encrypted          = $efsEncrypted
         BackupPolicyStatus = $backupPolicyStatus
+        AWSBackupProtected = $efsBackup.Protected
+        # AWS Backup Vault Lock - region-scoped immutability. Locked vaults cannot have recovery points
+        # deleted or retention shortened, even by an admin: the AWS analogue of Azure vault immutability.
+        BackupVaultAnyLocked    = $vaultLock.AnyLocked
+        BackupVaultLockedCount  = $vaultLock.LockedCount
+        BackupVaultMinRetentionDays = $vaultLock.MinRetentionDays
+        AwsBackupLastBackupUtc = $(if ($efsBackup.LastBackupTime) { ([datetime]$efsBackup.LastBackupTime).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { '' })
+        ReplicationStatus  = $efsReplication
         ProtectionStatus   = $efsProtectionStatus
         SizeGiB            = $sizes.SizeGiB
         SizeTiB            = $sizes.SizeTiB
@@ -1709,23 +1986,36 @@ function Process-RDSInstance {
         } catch {}
 
         # ── Backup & protection fields ────────────────────────────────────
-        $backupRetentionDays = if ($Item.BackupRetentionPeriod -ne $null) { [int]$Item.BackupRetentionPeriod } else { 0 }
-        $automatedBackupsEnabled = $backupRetentionDays -gt 0
-        $multiAZ = if ($Item.MultiAZ -ne $null) { [bool]$Item.MultiAZ } else { $false }
-        $storageEncrypted = if ($Item.StorageEncrypted -ne $null) { [bool]$Item.StorageEncrypted } else { $false }
-        $deletionProtection = if ($Item.DeletionProtection -ne $null) { [bool]$Item.DeletionProtection } else { $false }
+        # $null, not $false/0, when the API did not report the field. DescribeDBInstances virtually always
+        # returns these, so the coalesce is a safety net - but a safety net that invents 'no Multi-AZ',
+        # 'not encrypted' and 'no deletion protection' is worse than a blank cell, because each becomes an
+        # affirmative Gap in the report.
+        $backupRetentionDays = if ($null -ne $Item.BackupRetentionPeriod) { [int]$Item.BackupRetentionPeriod } else { $null }
+        $automatedBackupsEnabled = $(if ($null -eq $backupRetentionDays) { $null } else { $backupRetentionDays -gt 0 })
+        $multiAZ = if ($null -ne $Item.MultiAZ) { [bool]$Item.MultiAZ } else { $null }
+        $storageEncrypted = if ($null -ne $Item.StorageEncrypted) { [bool]$Item.StorageEncrypted } else { $null }
+        $deletionProtection = if ($null -ne $Item.DeletionProtection) { [bool]$Item.DeletionProtection } else { $null }
         $dbStatus = if ($Item.DBInstanceStatus) { $Item.DBInstanceStatus } else { 'unknown' }
 
         # ── AWS Backup coverage ───────────────────────────────────────────
-        $awsBackupProtected = [bool](Get-AWSBackupRecoveryPoint -ResourceArn $Item.DBInstanceArn -Credential $Credential -Region $Region)
+        # Was [bool](Get-AWSBackupRecoveryPoint ...), which collapsed the tri-state at the boundary: that helper
+        # returns $null both for "no recovery point" AND for "the call failed / the cmdlet is missing", and
+        # [bool]$null is $false - so an unreadable AWS Backup API reported the database as not covered.
+        # The region-scoped protected-resource list is also ONE call per region instead of one per instance, and
+        # it carries LastBackupTime.
+        $rdsBackup = Resolve-AWSBackupProtection -Credential $Credential -Region $Region `
+                        -ResourceArn $Item.DBInstanceArn -ResourceType 'RDS'
+        $awsBackupProtected = $rdsBackup.Protected
+        $awsBackupLastTime  = $rdsBackup.LastBackupTime
 
         $protectionStatus = if ($awsBackupProtected) { 'Protected' }
                             elseif ($automatedBackupsEnabled) { 'Automated-Backup' }
+                            elseif ($null -eq $automatedBackupsEnabled -or $rdsBackup.Status -ne 'Ok') { 'Unknown' }
                             else { 'Unprotected' }
 
         # ── PITR: RDS supports point-in-time recovery when automated backups are enabled.
         # LatestRestorableTime shows exactly how far back you can restore.
-        $pitrEnabled = $automatedBackupsEnabled  # RDS PITR is active when BackupRetentionPeriod > 0
+        $pitrEnabled = $automatedBackupsEnabled  # RDS PITR is active when BackupRetentionPeriod > 0 ($null if unread)
         $latestRestorableTime = if ($Item.LatestRestorableTime) { $Item.LatestRestorableTime.ToString('yyyy-MM-ddTHH:mm:ssZ') } else { $null }
 
         $rdsObj = [PSCustomObject]@{
@@ -1745,6 +2035,12 @@ function Process-RDSInstance {
             PITREnabled             = $pitrEnabled
             LatestRestorableTime    = $latestRestorableTime
             AWSBackupProtected      = $awsBackupProtected
+            # AWS Backup Vault Lock - region-scoped immutability. Locked vaults cannot have recovery points
+            # deleted or retention shortened, even by an admin: the AWS analogue of Azure vault immutability.
+            BackupVaultAnyLocked    = $vaultLock.AnyLocked
+            BackupVaultLockedCount  = $vaultLock.LockedCount
+            BackupVaultMinRetentionDays = $vaultLock.MinRetentionDays
+            AwsBackupLastBackupUtc  = $(if ($awsBackupLastTime) { ([datetime]$awsBackupLastTime).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { '' })
             ProtectionStatus        = $protectionStatus
             SizeGiB                 = $sizes.SizeGiB
             SizeTiB                 = $sizes.SizeTiB
@@ -2052,7 +2348,9 @@ function Process-DynamoDBTable {
         $sizes = Convert-BytesToSizes -Bytes $tableSizeBytes
 
         # ── PITR (point-in-time recovery) ────────────────────────────────
-        $pitrEnabled = $false
+        # $null until proven otherwise: a failed Get-DDBContinuousBackup must not read as "PITR disabled".
+        $pitrEnabled = $null
+        $pitrRecoveryDays = $null
         try {
             $cbs = Get-DDBContinuousBackup -TableName $tableName -Credential $Credential -Region $Region -ErrorAction Stop
             $pitrStatus = if ($cbs -and $cbs.ContinuousBackupsDescription) {
@@ -2060,10 +2358,27 @@ function Process-DynamoDBTable {
             } elseif ($cbs) {
                 $cbs.PointInTimeRecoveryDescription.PointInTimeRecoveryStatus
             } else { $null }
-            $pitrEnabled = ($pitrStatus -ne $null) -and ($pitrStatus.ToString() -eq 'ENABLED')
-        } catch { $pitrEnabled = $false }
+            $pitrEnabled = ($null -ne $pitrStatus) -and ($pitrStatus.ToString() -eq 'ENABLED')
+            # RecoveryPeriodInDays sits on the same description - how far back PITR can restore, not just whether
+            # it is on. Newer API versions only; absent on older ones, which stays $null rather than 0.
+            $pitrDesc = if ($cbs -and $cbs.ContinuousBackupsDescription) { $cbs.ContinuousBackupsDescription.PointInTimeRecoveryDescription }
+                        elseif ($cbs) { $cbs.PointInTimeRecoveryDescription } else { $null }
+            if ($pitrDesc -and $pitrDesc.PSObject.Properties['RecoveryPeriodInDays']) { $pitrRecoveryDays = $pitrDesc.RecoveryPeriodInDays }
+        } catch {
+            $pitrEnabled = $null
+            Write-ScriptOutput "DynamoDB continuous-backup lookup failed for ${tableName}: $($_.Exception.Message)" -Level Warning
+        }
 
-        $ddbProtectionStatus = if ($pitrEnabled) { 'Protected' } else { 'Unprotected' }
+        # ── AWS Backup coverage ───────────────────────────────────────────
+        # ddb-vault reads AWSBackupProtected, which DynamoDB never set at ALL - the field was absent from the row,
+        # so the control was permanently Unknown on every table in every account. Found by the per-resource-type
+        # wiring guard; the cross-cloud field search had reported it as wired because EC2 and RDS set it.
+        $ddbBackup = Resolve-AWSBackupProtection -Credential $Credential -Region $Region `
+                        -ResourceArn $tableArn -Identifier $tableName -ResourceType 'DynamoDB'
+
+        $ddbProtectionStatus = if ($pitrEnabled -or $ddbBackup.Protected) { 'Protected' }
+                               elseif ($null -eq $pitrEnabled -or $ddbBackup.Status -ne 'Ok') { 'Unknown' }
+                               else { 'Unprotected' }
 
         $ddbObj = [PSCustomObject]@{
             AwsAccountId     = "$($AccountInfo.Account)"
@@ -2076,6 +2391,23 @@ function Process-DynamoDBTable {
             TableStatus      = $tableStatus
             ItemCount        = $itemCount
             PITREnabled      = $pitrEnabled
+            # ddb-vault reads this. It was never set on a DynamoDB row, so the control could only ever be Unknown.
+            AWSBackupProtected = $ddbBackup.Protected
+            # AWS Backup Vault Lock - region-scoped immutability. Locked vaults cannot have recovery points
+            # deleted or retention shortened, even by an admin: the AWS analogue of Azure vault immutability.
+            BackupVaultAnyLocked    = $vaultLock.AnyLocked
+            BackupVaultLockedCount  = $vaultLock.LockedCount
+            BackupVaultMinRetentionDays = $vaultLock.MinRetentionDays
+            AwsBackupLastBackupUtc = $(if ($ddbBackup.LastBackupTime) { ([datetime]$ddbBackup.LastBackupTime).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { '' })
+            # PITR window length, not just on/off - from PointInTimeRecoveryDescription.RecoveryPeriodInDays.
+            PITRRecoveryPeriodDays = $pitrRecoveryDays
+            # Deletion protection and encryption at rest. Both come free from the DescribeTable response that was
+            # already fetched, and DynamoDB previously had NO encryption signal at all.
+            DeletionProtection = $(if ($null -ne $Item.DeletionProtectionEnabled) { [bool]$Item.DeletionProtectionEnabled } else { $null })
+            SSEType            = $(if ($Item.SSEDescription) { "$($Item.SSEDescription.SSEType)" } else { 'None' })
+            SSEStatus          = $(if ($Item.SSEDescription) { "$($Item.SSEDescription.Status)" } else { 'None' })
+            # Global tables: a replica in another region is DynamoDB's cross-region redundancy.
+            ReplicaRegionCount = $(if ($null -ne $Item.Replicas) { @($Item.Replicas).Count } else { $null })
             ProtectionStatus = $ddbProtectionStatus
             TableSizeGiB     = $sizes.SizeGiB
             TableSizeTiB     = $sizes.SizeTiB
@@ -2176,6 +2508,9 @@ function Process-RedshiftCluster {
             Encrypted                       = $rsEncrypted
             PubliclyAccessible              = $rsPubliclyAccessible
             AutomatedSnapshotRetentionDays  = $rsAutomatedSnapshotRetention
+            # Both come free from the DescribeClusters response already fetched.
+            ManualSnapshotRetentionDays     = $(if ($null -ne $Item.ManualSnapshotRetentionPeriod) { [int]$Item.ManualSnapshotRetentionPeriod } else { $null })
+            MultiAZ                         = $(if ($null -ne $Item.MultiAZ) { "$($Item.MultiAZ)" } else { $null })
             ProtectionStatus                = $rsProtectionStatus
             TotalSizeGiB                    = $totalSizes.SizeGiB
             TotalSizeTiB                    = $totalSizes.SizeTiB

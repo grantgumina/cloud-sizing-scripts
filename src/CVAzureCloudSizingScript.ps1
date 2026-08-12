@@ -105,7 +105,14 @@
     - Az.PostgreSql (for PostgreSQL servers)
     - Az.Aks (for AKS clusters)
     
-    Script must be run by a user with appropriate Azure permissions to read VMs, Storage Accounts, File Shares, NetApp Volumes, SQL resources, CosmosDB accounts, MySQL servers, PostgreSQL servers, and AKS clusters
+    AZURE PERMISSIONS:
+    "Reader" on each target subscription (or a management group above them) covers everything except AKS. Every
+    Azure call here is a Get-Az* cmdlet or an ARM GET and nothing writes, so the built-in Reader role (*/read)
+    satisfies all of them. "Reader and Data Access" is NOT needed: no storage account keys are read and no SAS is
+    issued - file share usage comes from the ARM cmdlet Get-AzRmStorageShare -GetShareUsage, and capacity comes
+    from Azure Monitor (Microsoft.Insights/metrics/read). Reader is needed on EVERY subscription to be inventoried,
+    and in every tenant, since the Cloud Rewind pass switches context per tenant. A 403 degrades the affected
+    signal to blank/Unknown rather than aborting the run, and the log names the exact action to grant.
     VM disk sizing includes both OS disks and data disks with error handling for inaccessible disks
     Storage Account, File Share, NetApp Files, CosmosDB, MySQL, and PostgreSQL metrics are retrieved from Azure Monitor for the last 1 hour
     
@@ -119,20 +126,29 @@
     - kubectl installation is validated at script startup when AKS resource type is selected
     - If kubectl cannot be installed, AKS functionality will be limited to basic cluster information only
     
-    AZURE PERMISSIONS REQUIRED FOR AKS:
-    - Azure RBAC should be enabled on target AKS clusters (recommended configuration)
-    - Azure Kubernetes Service Cluster User role on target AKS clusters
-    - Azure Kubernetes Service RBAC Reader role on target AKS clusters  
-    - Reader role on the subscription/resource group containing AKS clusters
-    - Network Contributor role may be required for some AKS network configurations
-    
+    AZURE PERMISSIONS REQUIRED FOR AKS (more than Reader - two separate grants):
+    - Reader on the subscription / resource group containing the clusters (for Get-AzAksCluster).
+    - Azure Kubernetes Service Cluster User Role on each cluster. Import-AzAksCredential calls
+      Microsoft.ContainerService/managedClusters/listClusterUserCredential/action - an ACTION, not a read, so
+      Reader does not cover it.
+    - Kubernetes read access to what this script actually runs: kubectl get nodes, get pv, get pvc -A.
+
     KUBERNETES RBAC REQUIREMENTS:
-    - AKS clusters should have Azure RBAC integration enabled (recommended)
-    - With Azure RBAC enabled, the Azure roles above provide the necessary Kubernetes permissions
-    - Required Kubernetes permissions: read access to persistentvolumes, persistentvolumeclaims, storageclasses, and nodes
-    - Since the script uses Azure credentials (az aks get-credentials), Azure RBAC roles determine access permissions
-    
+    On an Azure-RBAC-enabled cluster the built-in "Azure Kubernetes Service RBAC Reader" is NOT sufficient. It is a
+    namespace-scoped role: it grants persistentvolumeclaims/read but has NO dataAction for persistentvolumes or
+    nodes (Azure/AKS#3336; the cluster-wide reader role is still only a request, Azure/AKS#4387). Since
+    Get-AKSPersistentVolumeInfo gates on 'kubectl get nodes' before collecting anything, RBAC Reader alone
+    returns NO AKS storage data at all. Use either:
+      - "Azure Kubernetes Service RBAC Cluster Admin" on the clusters (simplest, but broad), or
+      - a custom role at cluster scope with exactly these dataActions:
+            Microsoft.ContainerService/managedClusters/nodes/read
+            Microsoft.ContainerService/managedClusters/persistentvolumes/read
+            Microsoft.ContainerService/managedClusters/persistentvolumeclaims/read
+    On clusters WITHOUT Azure RBAC, Cluster User yields a kubeconfig mapped to a Kubernetes identity and the same
+    read access must come from a Kubernetes ClusterRole / ClusterRoleBinding instead.
+
     NOTE: If insufficient permissions, kubectl commands will fail and AKS storage data collection will be incomplete.
+    The rest of the inventory is unaffected - exclude AKS with -Types if these grants are unavailable.
     
     AKS CONNECTIVITY REQUIREMENTS:
     - Script must be able to connect to AKS cluster API servers
@@ -164,9 +180,8 @@
        Visit: https://docs.microsoft.com/en-us/azure/cloud-shell/overview
 
     2. Verify Azure permissions:
-       Ensure your Azure AD account has "Reader" role on target subscriptions
-       Additional "Reader and Data Access" role may be needed for storage metrics
-       For AKS: "Azure Kubernetes Service Cluster User" role required on AKS clusters
+       "Reader" on every target subscription (see AZURE PERMISSIONS above)
+       For AKS only: Cluster User Role plus cluster-scoped node/PV read (see AZURE PERMISSIONS REQUIRED FOR AKS)
 
     3. Access Azure Cloud Shell:
        - Login to Azure Portal with verified account
@@ -198,8 +213,8 @@
        Note: Script will attempt automatic installation if kubectl is not found
 
     4. Verify Azure permissions:
-       Ensure your Azure AD account has "Reader" role on target subscriptions
-       For AKS: "Azure Kubernetes Service Cluster User" role required on AKS clusters
+       "Reader" on every target subscription (see AZURE PERMISSIONS above)
+       For AKS only: Cluster User Role plus cluster-scoped node/PV read (see AZURE PERMISSIONS REQUIRED FOR AKS)
 
     5. Connect to Azure:
        Connect-AzAccount

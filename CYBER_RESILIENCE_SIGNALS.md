@@ -120,30 +120,66 @@ Every AWS signal is collected today.
 
 | Resource type | Signal | Values / meaning |
 |---|---|---|
-| **EC2** | `AWSBackupProtected` | `TRUE`/`FALSE` — the instance ARN appears in the region's AWS Backup protected-resource list |
-| | `ProtectionStatus` | `Protected` / `Snapshot-Only` / `Unprotected` / `Unknown`. `Unknown` means the AWS Backup list could not be read |
+| **EC2** | `AWSBackupProtected` | `TRUE`/`FALSE` — matched by AWS Backup `ResourceType` + exact ARN segment. Blank when the region's protected-resource list could not be read (never `FALSE`) |
+| | `ProtectionStatus` | `Protected` / `Snapshot-Only` / `Unprotected` / `Unknown` |
 | | `EBSSnapshotCount` | Integer count of snapshots of the attached volumes |
-| | `DaysSinceLastBackup` | Integer days since the newest snapshot. Blank when none exist |
+| | `DaysSinceLastBackup` | Integer days since the newest recovery point from **either** an EBS snapshot or AWS Backup. Blank when none exist |
+| | `AwsBackupLastBackupUtc` | ISO-8601 UTC of the AWS Backup recovery point, from `ProtectedResource.LastBackupTime` |
 | | `AllVolumesEncrypted` | `TRUE`/`FALSE` across every attached volume |
+| | `BackupVaultAnyLocked` | `TRUE` when **any** AWS Backup vault in the region has Vault Lock enabled — see the note below |
+| | `BackupVaultLockedCount` / `BackupVaultMinRetentionDays` | Locked vault count, and the shortest minimum retention among them |
 | **EBS** | `Encrypted` | `TRUE`/`FALSE` — includes unattached volumes |
-| **RDS** | `AutomatedBackupsEnabled` | `TRUE`/`FALSE` |
-| | `BackupRetentionDays` | Integer days |
-| | `PITREnabled` | `TRUE`/`FALSE` |
-| | `AWSBackupProtected` | `TRUE`/`FALSE` — covered by AWS Backup in addition to native automated backups |
-| | `MultiAZ` | `TRUE`/`FALSE` |
-| | `StorageEncrypted` | `TRUE`/`FALSE` |
-| | `DeletionProtection` | `TRUE`/`FALSE` |
-| **S3** | `VersioningStatus` | `Enabled` / `Suspended` / blank |
-| | `ReplicationEnabled` | `TRUE`/`FALSE` — cross-region replication configured |
-| | `ServerSideEncryption` | e.g. `AES256`, `aws:kms`, `None` |
-| | `PublicAccessBlocked` | `TRUE` = public access blocked (note the polarity) |
-| | `LifecycleRuleCount` | Integer count of lifecycle rules |
+| **RDS** | `AutomatedBackupsEnabled` | `TRUE`/`FALSE`. Blank when `BackupRetentionPeriod` was not reported |
+| | `BackupRetentionDays` | Integer days. **Blank, not 0**, when unreported — 0 would assert "no backups" |
+| | `PITREnabled` | `TRUE`/`FALSE` — RDS PITR is active whenever automated backups are |
+| | `AWSBackupProtected` | `TRUE`/`FALSE` — covered by AWS Backup in addition to native automated backups. Blank when the list could not be read |
+| | `AwsBackupLastBackupUtc` | ISO-8601 UTC of the last AWS Backup recovery point |
+| | `MultiAZ`, `StorageEncrypted`, `DeletionProtection` | `TRUE`/`FALSE`. **Blank, not `FALSE`**, when the API did not report the field |
+| | `BackupVaultAnyLocked` etc. | As for EC2 |
+| **S3** | `VersioningStatus` | `Enabled` / `Suspended` / `Off` / `Unknown`. The SDK reports never-versioned buckets as `Off` (measured); `Unknown` means the read failed |
+| | `MfaDeleteEnabled` | `TRUE`/`FALSE` — MFA required to delete a version. From the same versioning response |
+| | `PublicAccessBlocked` | `TRUE` only when all four blocks below are on (note the polarity). Kept as a rollup |
+| | `BlockPublicAcls`, `BlockPublicPolicy`, `IgnorePublicAcls`, `RestrictPublicBuckets` | The four raw booleans. These say **which** protection is missing, which the rollup alone cannot |
+| | `ReplicationEnabled` | `TRUE`/`FALSE` — cross-region replication. **Blank** when the read failed |
+| | `ServerSideEncryption` | e.g. `AES256`, `aws:kms`, `None`, `Unknown`. `None` is measured; `Unknown` means the read failed |
+| | `LifecycleRuleCount` | Integer count. **Blank, not 0**, when the read failed |
+| | `ObjectLockEnabled` | `Enabled` / `None` / `Unknown` — **S3's WORM control**, and AWS's object-storage immutability signal |
+| | `ObjectLockMode` / `ObjectLockRetentionDays` | `GOVERNANCE` or `COMPLIANCE`, and the default retention window |
 | **EFS** | `BackupPolicyStatus` | `ENABLED` / `DISABLED` / `Unknown` |
 | | `Encrypted` | `TRUE`/`FALSE` |
-| **DynamoDB** | `PITREnabled` | `TRUE`/`FALSE` |
-| | `AWSBackupProtected` | `TRUE`/`FALSE` |
+| | `AWSBackupProtected` / `AwsBackupLastBackupUtc` | AWS Backup coverage for the file system, matched on its ARN |
+| | `ReplicationStatus` | `Configured` / `None` / `Unknown` — cross-region replication |
+| | `BackupVaultAnyLocked` etc. | As for EC2 |
+| **DynamoDB** | `PITREnabled` | `TRUE`/`FALSE`. **Blank** when the continuous-backups call failed |
+| | `PITRRecoveryPeriodDays` | How far back PITR can restore, not merely whether it is on |
+| | `AWSBackupProtected` / `AwsBackupLastBackupUtc` | AWS Backup coverage. **This was previously never set at all**, so the `ddb-vault` control was permanently Unknown |
+| | `SSEType` / `SSEStatus` | `KMS` when a customer-managed key is used, `None` when only AWS-owned default encryption applies. DynamoDB is **always** encrypted, so `None` means "no CMK", not "unencrypted" |
+| | `DeletionProtection` | `TRUE`/`FALSE` |
+| | `ReplicaRegionCount` | Global-table replicas in other regions — DynamoDB's cross-region redundancy |
+| | `BackupVaultAnyLocked` etc. | As for EC2 |
 | **Redshift** | `Encrypted` | `TRUE`/`FALSE` |
 | | `AutomatedSnapshotRetentionDays` | Integer days |
+| | `ManualSnapshotRetentionDays` | Integer days. **`-1` means "retain indefinitely"** — the strongest setting, not a missing one |
+| | `MultiAZ` | `Enabled` / `Disabled` — a **string**, not a boolean |
+
+#### AWS Backup Vault Lock is region-scoped, not per resource
+
+`BackupVaultAnyLocked` answers *"is any AWS Backup vault in this region locked"*, not *"are this resource's
+recovery points immutable"*. A resource's recovery points can span vaults and the protected-resource list does not
+say which vault holds them, so a per-resource answer would be a guess. Vault Lock in compliance mode prevents
+recovery points being deleted or their retention shortened even by an administrator — the AWS equivalent of an
+Azure Recovery Services vault with immutability **Locked**.
+
+#### Two AWS-specific traps
+
+**S3 signals absence by throwing.** `get-object-lock-configuration`, replication, lifecycle and default encryption
+all raise a `...NotFound` error when the feature was never configured, rather than returning an empty object. Those
+specific error codes are treated as a **measured** `None`; any other failure (`AccessDenied`, throttling) leaves
+the signal blank. Getting this backwards in either direction is wrong: a blanket `FALSE` invents a gap, a blanket
+blank hides a real one.
+
+**Encryption polarity differs by service.** For S3 and EBS, `FALSE` means genuinely unencrypted. For DynamoDB it
+means *no customer-managed key* — the table is still encrypted with an AWS-owned key. Same for AKS etcd on Azure.
 
 ### Google Cloud
 

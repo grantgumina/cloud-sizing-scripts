@@ -43,7 +43,10 @@ Assert-CV 'ec2-backup unknown when lookup failed' (Outcome $C.EC2 'ec2-backup'  
 Assert-CV 'ec2-encrypted unknown when unread'     (Outcome $C.EC2 'ec2-encrypted' $unk) 'Unknown'
 $ev = Invoke-CVResilience -Resource $unk -Controls $C.EC2
 Assert-CV 'snapshot gap still scored (that signal WAS read)' $ev.GapCount 1
-Assert-CV 'three signals excluded as unknown'                $ev.UnknownCount 3
+# 4, not 3: ec2-vaultlock was added and this synthetic row carries no BackupVaultAnyLocked, so it is Unknown
+# too. The point of the assertion is unchanged - unread signals are EXCLUDED, never counted as gaps.
+Assert-CV 'unread signals excluded as unknown'                $ev.UnknownCount 4
+Assert-CV 'and still exactly one real gap'                    $ev.GapCount 1
 
 Write-Host "`n[4] RDS retention boundary + Multi-AZ"
 $r34 = [pscustomobject]@{ AutomatedBackupsEnabled=$true; BackupRetentionDays=34; PITREnabled=$true; MultiAZ=$false; StorageEncrypted=$true; DeletionProtection=$true }
@@ -67,6 +70,59 @@ Write-Host "`n[6] EFS - the literal string 'Unknown' must not score as a gap"
 Assert-CV 'efs-backup met'     (Outcome $C.EFS 'efs-backup' ([pscustomobject]@{ BackupPolicyStatus='ENABLED' }))  'Met'
 Assert-CV 'efs-backup gap'     (Outcome $C.EFS 'efs-backup' ([pscustomobject]@{ BackupPolicyStatus='DISABLED' })) 'Gap'
 Assert-CV 'efs-backup unknown' (Outcome $C.EFS 'efs-backup' ([pscustomobject]@{ BackupPolicyStatus='Unknown' }))  'Unknown'
+
+Write-Host "`n[7] The new signals: string enums must not be read through Get-CVTri"
+<#
+    Same trap as Azure's vault immutability: Get-CVTri is [bool]$Value and EVERY non-empty string is truthy, so
+    Get-CVTri 'Disabled' is $true. Redshift reports MultiAZ as a STRING, S3 Object Lock as 'Enabled'/'None', and
+    EFS replication as 'Configured'/'None'. Production never executes these Test blocks, so nothing else catches
+    an inversion here.
+#>
+Assert-CV 'Get-CVTri on a string is truthy (the trap)' (Get-CVTri 'Disabled') $true
+
+# S3 Object Lock - WORM. 'None' is MEASURED (S3 throws when unconfigured); 'Unknown' means the call failed.
+Assert-CV 's3-objectlock Enabled -> Met'     (Outcome $C.S3 's3-objectlock' ([pscustomobject]@{ ObjectLockEnabled='Enabled' })) 'Met'
+Assert-CV 's3-objectlock None -> Gap'        (Outcome $C.S3 's3-objectlock' ([pscustomobject]@{ ObjectLockEnabled='None' }))    'Gap'
+Assert-CV 's3-objectlock Unknown -> Unknown' (Outcome $C.S3 's3-objectlock' ([pscustomobject]@{ ObjectLockEnabled='Unknown' })) 'Unknown'
+Assert-CV 's3-objectlock blank -> Unknown'   (Outcome $C.S3 's3-objectlock' ([pscustomobject]@{})) 'Unknown'
+
+# The four public-access booleans are published separately, so a partial configuration is visible.
+$partial = [pscustomobject]@{ BlockPublicAcls=$true; BlockPublicPolicy=$false; IgnorePublicAcls=$true; RestrictPublicBuckets=$true }
+Assert-CV 's3-pab-acls met'            (Outcome $C.S3 's3-pab-acls'     $partial) 'Met'
+Assert-CV 's3-pab-policy gap (the one that is off)' (Outcome $C.S3 's3-pab-policy' $partial) 'Gap'
+Assert-CV 's3-pab-restrict met'        (Outcome $C.S3 's3-pab-restrict' $partial) 'Met'
+Assert-CV 's3-pab unread -> Unknown'   (Outcome $C.S3 's3-pab-acls' ([pscustomobject]@{})) 'Unknown'
+Assert-CV 's3-mfadelete off -> Gap'    (Outcome $C.S3 's3-mfadelete' ([pscustomobject]@{ MfaDeleteEnabled=$false })) 'Gap'
+
+# Redshift Multi-AZ is a STRING, which is exactly why it cannot use Get-CVTri.
+Assert-CV 'rs-multiaz Enabled -> Met'   (Outcome $C.Redshift 'rs-multiaz' ([pscustomobject]@{ MultiAZ='Enabled' }))  'Met'
+Assert-CV 'rs-multiaz Disabled -> Gap'  (Outcome $C.Redshift 'rs-multiaz' ([pscustomobject]@{ MultiAZ='Disabled' })) 'Gap'
+Assert-CV 'rs-multiaz blank -> Unknown' (Outcome $C.Redshift 'rs-multiaz' ([pscustomobject]@{ MultiAZ='' }))         'Unknown'
+# -1 is Redshift's "retain indefinitely" sentinel - the STRONGEST setting, so it must not read as a gap.
+Assert-CV 'rs-manualret -1 (indefinite) -> Met' (Outcome $C.Redshift 'rs-manualret' ([pscustomobject]@{ ManualSnapshotRetentionDays=-1 })) 'Met'
+Assert-CV 'rs-manualret 0 -> Gap'               (Outcome $C.Redshift 'rs-manualret' ([pscustomobject]@{ ManualSnapshotRetentionDays=0 }))  'Gap'
+
+# EFS cross-region replication.
+Assert-CV 'efs-xregion Configured -> Met' (Outcome $C.EFS 'efs-xregion' ([pscustomobject]@{ ReplicationStatus='Configured' })) 'Met'
+Assert-CV 'efs-xregion None -> Gap'       (Outcome $C.EFS 'efs-xregion' ([pscustomobject]@{ ReplicationStatus='None' }))       'Gap'
+Assert-CV 'efs-xregion Unknown -> Unknown' (Outcome $C.EFS 'efs-xregion' ([pscustomobject]@{ ReplicationStatus='Unknown' }))   'Unknown'
+
+# DynamoDB: encryption is ALWAYS on, so FALSE means "no customer-managed key", not "unencrypted".
+Assert-CV 'ddb-encrypted KMS -> Met'   (Outcome $C.DynamoDB 'ddb-encrypted' ([pscustomobject]@{ SSEType='KMS' }))  'Met'
+Assert-CV 'ddb-encrypted None -> Gap'  (Outcome $C.DynamoDB 'ddb-encrypted' ([pscustomobject]@{ SSEType='None' })) 'Gap'
+Assert-CV 'ddb-xregion replica -> Met' (Outcome $C.DynamoDB 'ddb-xregion' ([pscustomobject]@{ ReplicaRegionCount=2 })) 'Met'
+Assert-CV 'ddb-xregion none -> Gap'    (Outcome $C.DynamoDB 'ddb-xregion' ([pscustomobject]@{ ReplicaRegionCount=0 })) 'Gap'
+# The signal that was entirely absent from the DynamoDB row before this change.
+Assert-CV 'ddb-vault protected -> Met' (Outcome $C.DynamoDB 'ddb-vault' ([pscustomobject]@{ AWSBackupProtected=$true }))  'Met'
+Assert-CV 'ddb-vault unread -> Unknown' (Outcome $C.DynamoDB 'ddb-vault' ([pscustomobject]@{})) 'Unknown'
+
+# Vault Lock - AWS's backup immutability, absent before. Declared on every type carrying AWS Backup coverage.
+foreach ($pair in @(@{S=$C.EC2;I='ec2-vaultlock'}, @{S=$C.RDS;I='rds-vaultlock'},
+                    @{S=$C.DynamoDB;I='ddb-vaultlock'}, @{S=$C.EFS;I='efs-vaultlock'})) {
+    Assert-CV "$($pair.I) locked -> Met"    (Outcome $pair.S $pair.I ([pscustomobject]@{ BackupVaultAnyLocked=$true }))  'Met'
+    Assert-CV "$($pair.I) unlocked -> Gap"  (Outcome $pair.S $pair.I ([pscustomobject]@{ BackupVaultAnyLocked=$false })) 'Gap'
+    Assert-CV "$($pair.I) unread -> Unknown" (Outcome $pair.S $pair.I ([pscustomobject]@{}))                            'Unknown'
+}
 
 # [7] used to assert that an empty AWS environment produced a null overall score. It went with the scoring
 # engine - an overall score is the backend's to compute, so there is no contract here to pin.
