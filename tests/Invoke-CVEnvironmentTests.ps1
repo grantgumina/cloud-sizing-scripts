@@ -244,6 +244,24 @@ Assert-CV 'Azure: no raw Get-AzMetric (use Get-CVAzMetricValue/-Set)' $rawMetric
 Assert-CV 'Azure: uses Update-CVProgress'   ([bool]($azBodyLayer -match '\bUpdate-CVProgress\b'))   $true
 Assert-CV 'Azure: uses Complete-CVProgress' ([bool]($azBodyLayer -match '\bComplete-CVProgress\b')) $true
 
+# The GCP twin. GCP had 33 raw Write-Progress calls and ZERO console-layer progress calls, all executing on the
+# owner thread after Initialize-CVConsole - so -NonInteractive and -Quiet still painted bars, because the tier
+# check lives in the Start-/Update-/Complete-CVProgress wrappers and not in Write-Progress itself. Several bars
+# were also never completed, leaving them pinned to the terminal for the rest of the run.
+$gcpBodyLayer   = Get-Content -Raw (Join-Path $srcRoot 'CVGoogleCloudSizingScript.ps1')
+$gcpRawProgress = @([regex]::Matches($gcpBodyLayer, '(?m)^[^#\r\n]*\bWrite-Progress\b'))
+Assert-CV 'GCP: no raw Write-Progress (use Start-/Update-/Complete-CVProgress)' $gcpRawProgress.Count 0
+if ($gcpRawProgress.Count) {
+    Write-Host "        $($gcpRawProgress.Count) raw call(s) remain - they bypass the tier check, so -Quiet still paints" -ForegroundColor DarkYellow
+}
+Assert-CV 'GCP: uses Start-CVProgress'    ([bool]($gcpBodyLayer -match '\bStart-CVProgress\b'))    $true
+Assert-CV 'GCP: uses Update-CVProgress'   ([bool]($gcpBodyLayer -match '\bUpdate-CVProgress\b'))   $true
+Assert-CV 'GCP: uses Complete-CVProgress' ([bool]($gcpBodyLayer -match '\bComplete-CVProgress\b')) $true
+# Archiving: GCP was already the only script staging its transcript into the ZIP, but its failure path lied.
+Assert-CV 'GCP: zips the output directory'       ([bool]($gcpBodyLayer -match 'CreateFromDirectory'))    $true
+Assert-CV 'GCP: no per-file curated add loop'    ([bool]($gcpBodyLayer -match 'CreateEntryFromFile'))    $false
+Assert-CV 'GCP: the ZIP success message is gated on success' ([bool]($gcpBodyLayer -match '\$zipOk'))    $true
+
 Write-Host "`n[7b] Every shared CV command a script calls is in that script's own `$cvRequired"
 <#
     The defect this catches: the Azure script called Install-CVKubectl while CVSizing.Kubectl.ps1 was absent from

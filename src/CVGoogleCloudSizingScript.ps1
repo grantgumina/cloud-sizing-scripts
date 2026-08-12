@@ -1025,7 +1025,7 @@ function Get-GcpVMInventory {
         }
         $allVMs=@(); $allAttached=@(); $allAllDisks=@(); $allUnattached=@(); $completed=0; $total=$ProjectIds.Count
         $durations = New-Object System.Collections.Generic.List[double]; $overallStart=[DateTime]::UtcNow
-        Write-Progress -Id 101 -Activity 'VM Projects' -Status 'Queued...' -PercentComplete 0
+        Start-CVProgress -Id 'vm-projects' -Activity 'VM Projects'
         while ($runspaces.Count -gt 0) {
             $still=@()
             foreach ($rs in $runspaces) {
@@ -1069,10 +1069,10 @@ function Get-GcpVMInventory {
             $remaining = $total - $completed; $etaMin = if ($avgMin -gt 0 -and $remaining -gt 0) { [math]::Round($avgMin * $remaining,2) } else { 0 }
             $rate = if ($elapsedMin -gt 0) { [math]::Round($allVMs.Count / ($elapsedMin*60),2) } else { 0 }
             $status = "Projects {0}/{1} ({2}%) | Discovered VMs={3} | Rate={4}/s | ElapsedMin={5} | ETA_Min={6}" -f $completed,$total,$pct,$allVMs.Count,$rate,$elapsedMin,$etaMin
-            Write-Progress -Id 101 -Activity 'VM Projects' -Status $status -PercentComplete $pct
+            Update-CVProgress -Id 'vm-projects' -Activity 'VM Projects' -Status $status -PercentComplete $pct
             if ($runspaces.Count -gt 0) { Start-Sleep -Milliseconds 200 }
         }
-        Write-Progress -Id 101 -Activity 'VM Projects' -Completed
+        Complete-CVProgress -Id 'vm-projects'
         $pool.Close(); $pool.Dispose()
         $script:VmProjectStatuses = $vmStatuses
         return @{ VMs=$allVMs; AttachedDisks=$allAttached; AllDisks=$allAllDisks; UnattachedDisks=$allUnattached; Statuses=$vmStatuses }
@@ -1083,7 +1083,7 @@ function Get-GcpVMInventory {
         $active=@()
         $allVMs=@(); $allAttached=@(); $allAllDisks=@(); $allUnattached=@(); $completed=0; $total=$ProjectIds.Count
         $durations = New-Object System.Collections.Generic.List[double]; $overallStart=[DateTime]::UtcNow
-        Write-Progress -Id 101 -Activity 'VM Projects' -Status 'Starting (LightMode)...' -PercentComplete 0
+        Start-CVProgress -Id 'vm-projects' -Activity 'VM Projects'
         while ($active.Count -gt 0 -or $queue.Count -gt 0) {
             while ($active.Count -lt $effectiveMax -and $queue.Count -gt 0) {
                 $proj = $queue.Dequeue()
@@ -1123,10 +1123,10 @@ function Get-GcpVMInventory {
             $remainingCount = $total - $completed; $etaMin = if ($avgMin -gt 0 -and $remainingCount -gt 0) { [math]::Round($avgMin * $remainingCount,2) } else { 0 }
             $rate = if ($elapsedMin -gt 0) { [math]::Round($allVMs.Count / ($elapsedMin*60),2) } else { 0 }
             $status = "(Light) Projects {0}/{1} ({2}%) | Discovered VMs={3} | Rate={4}/s | ElapsedMin={5} | ETA_Min={6}" -f $completed,$total,$pct,$allVMs.Count,$rate,$elapsedMin,$etaMin
-            Write-Progress -Id 101 -Activity 'VM Projects' -Status $status -PercentComplete $pct
+            Update-CVProgress -Id 'vm-projects' -Activity 'VM Projects' -Status $status -PercentComplete $pct
             if ($active.Count -gt 0 -or $queue.Count -gt 0) { Start-Sleep -Milliseconds 150 }
         }
-        Write-Progress -Id 101 -Activity 'VM Projects' -Completed
+        Complete-CVProgress -Id 'vm-projects'
         $script:VmProjectStatuses = $vmStatuses
         return @{ VMs=$allVMs; AttachedDisks=$allAttached; AllDisks=$allAllDisks; UnattachedDisks=$allUnattached; Statuses=$vmStatuses }
     }
@@ -1277,7 +1277,7 @@ function Get-GcpStorageInventory {
         $rsList += [PSCustomObject]@{ PS=$ps; Handle=$ps.BeginInvoke(); Project=$p }
     }
     $projResults=@(); $completed=0; $total=$rsList.Count; $listStart=[DateTime]::UtcNow
-    Write-Progress -Id 400 -Activity 'Bucket Listing' -Status 'Starting...' -PercentComplete 0
+    Start-CVProgress -Id 'bucket-listing' -Activity 'Bucket Listing'
     while ($rsList.Count -gt 0) {
         $next=@()
         foreach ($r in $rsList) {
@@ -1290,10 +1290,10 @@ function Get-GcpStorageInventory {
         $rsList=$next
         $pct = if ($total -gt 0) { [math]::Round(($completed/$total)*100,1) } else { 100 }
         $elapsed = [math]::Round(([DateTime]::UtcNow - $listStart).TotalSeconds,1)
-        Write-Progress -Id 400 -Activity 'Bucket Listing' -Status ("Projects {0}/{1} ({2}%) ElapsedSec={3}" -f $completed,$total,$pct,$elapsed) -PercentComplete $pct
+        Update-CVProgress -Id 'bucket-listing' -Activity 'Bucket Listing' -Status ("Projects {0}/{1} ({2}%) ElapsedSec={3}" -f $completed,$total,$pct,$elapsed) -PercentComplete $pct
         if ($rsList.Count -gt 0) { Start-Sleep -Milliseconds 150 }
     }
-    Write-Progress -Id 400 -Activity 'Bucket Listing' -Completed
+    Complete-CVProgress -Id 'bucket-listing'
     $pool1.Close(); $pool1.Dispose()
 
     # Build project status list
@@ -1341,7 +1341,7 @@ function Get-GcpStorageInventory {
         $bucketRunspaces += [PSCustomObject]@{ PS=$ps; Handle=$ps.BeginInvoke(); Project=$bd.Project; Bucket=$bd.Name }
     }
     $sized=@(); $done=0; $totalBuckets=$bucketRunspaces.Count; $sizeStart=[DateTime]::UtcNow
-    Write-Progress -Id 401 -Activity 'Bucket Sizing' -Status 'Queued...' -PercentComplete 0
+    Start-CVProgress -Id 'bucket-sizing' -Activity 'Bucket Sizing'
     while ($bucketRunspaces.Count -gt 0) {
         $next=@()
         foreach ($br in $bucketRunspaces) {
@@ -1361,10 +1361,10 @@ function Get-GcpStorageInventory {
         $elapsedMin = [math]::Round($elapsed/60,2)
         $totalBytes = ($sized | Measure-Object UsedCapacityBytes -Sum).Sum
         $totalGB = if ($totalBytes) { [math]::Round($totalBytes/1e9,3) } else { 0 }
-        Write-Progress -Id 401 -Activity 'Bucket Sizing' -Status ("Buckets {0}/{1} ({2}%) SizedGB={3} ElapsedSec={4} ElapsedMin={5}" -f $done,$totalBuckets,$pct,$totalGB,$elapsed,$elapsedMin) -PercentComplete $pct
+        Update-CVProgress -Id 'bucket-sizing' -Activity 'Bucket Sizing' -Status ("Buckets {0}/{1} ({2}%) SizedGB={3} ElapsedSec={4} ElapsedMin={5}" -f $done,$totalBuckets,$pct,$totalGB,$elapsed,$elapsedMin) -PercentComplete $pct
         if ($bucketRunspaces.Count -gt 0) { Start-Sleep -Milliseconds 200 }
     }
-    Write-Progress -Id 401 -Activity 'Bucket Sizing' -Completed
+    Complete-CVProgress -Id 'bucket-sizing'
     $pool2.Close(); $pool2.Dispose()
 
     # Replay the workers' log lines on the parent thread, where the console layer actually exists.
@@ -1507,7 +1507,7 @@ function Get-GcpFileShareInventory {
         $pool=[RunspaceFactory]::CreateRunspacePool(1,$effectiveMax,$iss,$Host); $pool.Open()
         $runspaces=@(); foreach ($p in $ProjectIds){ $ps=[PowerShell]::Create().AddScript($fsProjectScript).AddArgument($p).AddArgument($MinimalOutput); $ps.RunspacePool=$pool; $runspaces+= [PSCustomObject]@{ PS=$ps; Handle=$ps.BeginInvoke(); Project=$p; Submitted=[DateTime]::UtcNow } }
         $all=@(); $completed=0; $total=$ProjectIds.Count; $overall=[DateTime]::UtcNow
-        Write-Progress -Id 501 -Activity 'FileShare Projects' -Status 'Queued...' -PercentComplete 0
+        Start-CVProgress -Id 'fileshare-projects' -Activity 'FileShare Projects'
         while ($runspaces.Count -gt 0) {
             $next=@()
             foreach ($rs in $runspaces) {
@@ -1545,17 +1545,17 @@ function Get-GcpFileShareInventory {
             }
             $runspaces=$next
             $pct = if ($total -gt 0){ [math]::Round(($completed/$total)*100,1)} else {100}
-            Write-Progress -Id 501 -Activity 'FileShare Projects' -Status ("Projects {0}/{1} ({2}%)" -f $completed,$total,$pct) -PercentComplete $pct
+            Update-CVProgress -Id 'fileshare-projects' -Activity 'FileShare Projects' -Status ("Projects {0}/{1} ({2}%)" -f $completed,$total,$pct) -PercentComplete $pct
             if ($runspaces.Count -gt 0) { Start-Sleep -Milliseconds 200 }
         }
-        Write-Progress -Id 501 -Activity 'FileShare Projects' -Completed
+        Complete-CVProgress -Id 'fileshare-projects'
         $pool.Close(); $pool.Dispose()
     $script:FileShareLogLines = $allLogs
         return $all
     } else {
         $queue=New-Object System.Collections.Queue; foreach ($p in $ProjectIds){ $queue.Enqueue($p) }
         $active=@(); $all=@(); $completed=0; $total=$ProjectIds.Count
-        Write-Progress -Id 501 -Activity 'FileShare Projects' -Status 'Starting (LightMode)...' -PercentComplete 0
+        Start-CVProgress -Id 'fileshare-projects' -Activity 'FileShare Projects'
         while ($active.Count -gt 0 -or $queue.Count -gt 0) {
             while ($active.Count -lt $effectiveMax -and $queue.Count -gt 0) {
                 $proj=$queue.Dequeue(); $ps=[PowerShell]::Create().AddScript($fsProjectScript).AddArgument($proj).AddArgument($MinimalOutput); $handle=$ps.BeginInvoke(); $active += [PSCustomObject]@{ PS=$ps; Handle=$handle; Project=$proj; Started=[DateTime]::UtcNow }
@@ -1594,10 +1594,10 @@ function Get-GcpFileShareInventory {
             }
             $active=$remain
             $pct = if ($total -gt 0){ [math]::Round(($completed/$total)*100,1)} else {100}
-            Write-Progress -Id 501 -Activity 'FileShare Projects' -Status ("(Light) Projects {0}/{1} ({2}%)" -f $completed,$total,$pct) -PercentComplete $pct
+            Update-CVProgress -Id 'fileshare-projects' -Activity 'FileShare Projects' -Status ("(Light) Projects {0}/{1} ({2}%)" -f $completed,$total,$pct) -PercentComplete $pct
             if ($active.Count -gt 0 -or $queue.Count -gt 0) { Start-Sleep -Milliseconds 160 }
         }
-        Write-Progress -Id 501 -Activity 'FileShare Projects' -Completed
+        Complete-CVProgress -Id 'fileshare-projects'
     $script:FileShareLogLines = $allLogs
         return $all
     }
@@ -1692,7 +1692,7 @@ function Get-GcpCloudSqlInstances {
                 Extra='';Error=''}
             if ($sqlObjs -and $sqlObjs.Count -gt 0 -and $cloudSqlInstCount -le 200) {
                 $pctInst=[int](($cloudSqlInstCount/[double]$sqlObjs.Count)*100); if ($pctInst -gt 100){$pctInst=100}
-                Write-Progress -Id 611 -Activity ("CloudSQL $ProjectId") -Status ("Instances ($cloudSqlInstCount/$($sqlObjs.Count)) - $pctInst%") -PercentComplete $pctInst -ErrorAction SilentlyContinue
+                Update-CVProgress -Id 'db-cloudsql' -Activity ("CloudSQL $ProjectId") -Status ("Instances ($cloudSqlInstCount/$($sqlObjs.Count)) - $pctInst%") -PercentComplete $pctInst -ParentId 'db-projects'
             }
         }
         Write-Log "[DB] ($ProjectId) End CloudSQL Count=$cloudSqlInstCount" -Level DEBUG
@@ -1732,7 +1732,7 @@ function Get-GcpAlloyDbResources {
             $___primProcessed++
             if ($___primTotal -gt 0 -and $___primProcessed -le 500) {
                 $pctPrim=[int](($___primProcessed/[double]$___primTotal)*100); if ($pctPrim -gt 100) { $pctPrim=100 }
-                Write-Progress -Id 613 -Activity ("AlloyDB Clusters $ProjectId") -Status ("PrimaryClusters ($___primProcessed/$___primTotal) - $pctPrim%") -PercentComplete $pctPrim -ErrorAction SilentlyContinue
+                Update-CVProgress -Id 'db-alloydb' -Activity ("AlloyDB Clusters $ProjectId") -Status ("PrimaryClusters ($___primProcessed/$___primTotal) - $pctPrim%") -PercentComplete $pctPrim -ParentId 'db-projects'
             }
             $clusterStorageBytes = 0; $clusterStorageGB=0; $clusterStorageMB=0; $extraInfo=''
             if ($clusterType -eq 'PRIMARY') {
@@ -1967,7 +1967,7 @@ function Get-GcpBigQueryDatasets {
         $largestLogicalBytesForLargestPhysical = 0
         $largestTableName = ''
         $pctDs = if ($datasetTotal -gt 0) { [int](($dsIndex/[double]$datasetTotal)*100) } else { 100 }
-        Write-Progress -Id 614 -ParentId 610 -Activity ("BigQuery Datasets $ProjectId") -Status ("Dataset {0}/{1} ({2}%) - {3}" -f $dsIndex,$datasetTotal,$pctDs,$datasetId) -PercentComplete $pctDs -ErrorAction SilentlyContinue
+        Update-CVProgress -Id 'bq-datasets' -Activity ("BigQuery Datasets $ProjectId") -Status ("Dataset {0}/{1} ({2}%) - {3}" -f $dsIndex,$datasetTotal,$pctDs,$datasetId) -PercentComplete $pctDs -ParentId 'db-projects'
         Write-Log ("[DB][BigQuery] ({0}) DatasetStart {1} ({2}/{3})" -f $ProjectId,$datasetId,$dsIndex,$datasetTotal) -Level DEBUG
 
         # List tables in dataset (handle both array output and object with 'tables' + pagination)
@@ -2126,7 +2126,7 @@ function Get-GcpBigQueryDatasets {
                             $completed++
                             if ($tableIds.Count -gt 0 -and ($completed -eq 1 -or $completed -eq $tableIds.Count -or ($completed % 25 -eq 0))) {
                                 $pct = [int](($completed/[double]$tableIds.Count)*100)
-                                Write-Progress -Id 615 -ParentId 614 -Activity ("Tables $datasetId") -Status ("{0}/{1} ({2}%)" -f $completed,$tableIds.Count,$pct) -PercentComplete $pct -ErrorAction SilentlyContinue
+                                Update-CVProgress -Id 'bq-tables' -Activity ("Tables $datasetId") -Status ("{0}/{1} ({2}%)" -f $completed,$tableIds.Count,$pct) -PercentComplete $pct -ParentId 'bq-datasets'
                             }
                         } else { $next += $a }
                     }
@@ -2147,7 +2147,7 @@ function Get-GcpBigQueryDatasets {
                 if ($tableIds.Count -gt 0) {
                     $pctTbl = [int](($tblIndex/[double]$tableIds.Count)*100)
                     if ($tblIndex -eq 1 -or $tblIndex -eq $tableIds.Count -or ($tblIndex % 25 -eq 0)) {
-                        Write-Progress -Id 615 -ParentId 614 -Activity ("Tables $datasetId") -Status ("{0}/{1} ({2}%)" -f $tblIndex,$tableIds.Count,$pctTbl) -PercentComplete $pctTbl -ErrorAction SilentlyContinue
+                        Update-CVProgress -Id 'bq-tables' -Activity ("Tables $datasetId") -Status ("{0}/{1} ({2}%)" -f $tblIndex,$tableIds.Count,$pctTbl) -PercentComplete $pctTbl -ParentId 'bq-datasets'
                     }
                 }
                 $metaJson = & bq show --format=json --project_id=$ProjectId "$datasetId.$tid" 2>$null
@@ -2172,9 +2172,9 @@ function Get-GcpBigQueryDatasets {
             Write-Log ("[DB][BigQuery][Table-Info] ({0}) Dataset={1} Table={2} LogicalBytes={3} PhysicalBytes={4}" -f $ProjectId,$datasetId,$r.TableId,$r.LogicalBytes,$r.PhysicalBytes) -Level DEBUG
         }
         $tblIndex = $tableResults.Count
-        if ($tableTotal -gt 0) { Write-Progress -Id 615 -ParentId 614 -Activity ("Tables $datasetId") -Status ("{0}/{1} (100%)" -f $tblIndex,$tableTotal) -PercentComplete 100 -ErrorAction SilentlyContinue }
+        if ($tableTotal -gt 0) { Update-CVProgress -Id 'bq-tables' -Activity ("Tables $datasetId") -Status ("{0}/{1} (100%)" -f $tblIndex,$tableTotal) -PercentComplete 100 -ParentId 'bq-datasets' }
         # --- End parallel table metadata retrieval ---
-        if ($tableTotal -gt 0) { Write-Progress -Id 615 -Activity ("Tables $datasetId") -Completed -ErrorAction SilentlyContinue }
+        if ($tableTotal -gt 0) { Complete-CVProgress -Id 'bq-tables' }
         Write-Log ("[DB][BigQuery] ({0}) DatasetEnd {1} Tables={2} LogicalBytes={3} PhysicalBytes={4} LargestTable={5}" -f $ProjectId,$datasetId,$tableTotal,$totalLogicalBytes,$totalPhysicalBytes,$largestTableName) -Level DEBUG
 
         $physicalGB = [math]::Round($totalPhysicalBytes / 1GB, 2)
@@ -2198,7 +2198,7 @@ function Get-GcpBigQueryDatasets {
             Error                    = ''
         }
     }
-    if ($datasetTotal -gt 0) { Write-Progress -Id 614 -Activity ("BigQuery Datasets $ProjectId") -Completed -ErrorAction SilentlyContinue }
+    if ($datasetTotal -gt 0) { Complete-CVProgress -Id 'bq-datasets' }
 
     Write-Log "[DB] ($ProjectId) End BigQuery" -Level DEBUG
     return $items
@@ -2224,7 +2224,7 @@ function Invoke-GcpDbProjectInventory {
     $missingSvcs = @(); foreach ($kv in $requiredMap.GetEnumerator()) { if ($enabledSvcNames -and ($enabledSvcNames -notcontains $kv.Value)) { $missingSvcs += $kv.Value } }
     if ($missingSvcs.Count -gt 0) { $projStatus.ApiDisabled='Y'; if (-not $projStatus.Error){ $projStatus.Error = 'MissingServices=' + ($missingSvcs -join ';') } }
     $displayTotal = if ($TotalProjects -gt 0) { $TotalProjects } else { 1 }
-    Write-Progress -Id 610 -Activity 'DB Projects' -Status ("Project $ProjectId ($ProjectIndex/$displayTotal)") -PercentComplete ([int](($ProjectIndex-1)/[double]$displayTotal*100)) -ErrorAction SilentlyContinue
+    Update-CVProgress -Id 'db-projects' -Activity 'DB Projects' -Status ("Project $ProjectId ($ProjectIndex/$displayTotal)") -PercentComplete ([int](($ProjectIndex-1)/[double]$displayTotal*100))
     $allItems=@()
     $projOk=$true
     try {
@@ -2298,7 +2298,7 @@ public class DbProg { private static int counter = 0; public static int Incremen
                 foreach ($i in $inv.Items) { $res.Add($i) }
                 foreach ($le in $localErrs) { $errs.Add($le) }
                 $processed=[DbProg]::Increment(); $pctParent = if ($total -gt 0) { [int](($processed/[double]$total)*100) } else { 100 }
-                Write-Progress -Id 610 -Activity 'DB Projects' -Status ("Project $ProjectId ($ProjectIndex/$displayTotal)") -PercentComplete $pctParent -ErrorAction SilentlyContinue
+                Update-CVProgress -Id 'db-projects' -Activity 'DB Projects' -Status ("Project $ProjectId ($ProjectIndex/$displayTotal)") -PercentComplete $pctParent
             } catch {
                 $errs.Add("General DB inventory failure for ${proj}: $($_.Exception.Message)")
             }
@@ -3295,7 +3295,7 @@ if ($Selected.DB -and $invResults.Databases -and (@($invResults.Databases)).Coun
 # -------------------------
 # Output CSVs
 # -------------------------
-Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Exporting CSV files..." -PercentComplete 0
+Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Exporting CSV files..." -PercentComplete 0
 
 
 
@@ -3598,7 +3598,7 @@ if ($Selected.VM) {
 # JSON EXPORT (when OutputFormat is json or both)
 # ============================================================
 if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
-    Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Writing JSON output..." -PercentComplete 72
+    Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Writing JSON output..." -PercentComplete 72
 
     $jsonSummary = @{}
     $allWorkloads = @{}
@@ -3645,13 +3645,13 @@ if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
 # -------------------------
 # Finalize log, then ZIP
 # -------------------------
-Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Finalizing log..." -PercentComplete 75
+Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Finalizing log..." -PercentComplete 75
 # Aggregated diagnostics summary (warning/error counts + which projects/services were skipped and why).
 Write-CVSummary -Title 'GCP Sizing Run Summary'
 Stop-Transcript | Out-Null   # end transcript (separate from detail log)
 
 
-Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Creating ZIP archive..." -PercentComplete 90
+Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Creating ZIP archive..." -PercentComplete 90
 $zipFile = $runPaths.ZipPath
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
@@ -3666,21 +3666,47 @@ try {
     Write-Warning "Could not stage the run log into the output folder: $($_.Exception.Message)"
 }
 
+# The closing messages below are GATED on this. They used to run unconditionally after a catch that only
+# emitted a Write-Warning, so a full disk or a file locked by a stalled child produced two confident
+# contradictions - "Results in <path>.zip" and "All output files ... are compressed into the ZIP archive" -
+# a few lines under a warning saying the opposite. A customer reads the green text, sends nothing, and the run
+# summary reports no error at all. Nothing is lost either way, because the loose files are kept.
+$zipOk = $false
 try {
-    [IO.Compression.ZipFile]::CreateFromDirectory($outDir, $zipFile)
-    Write-Host "ZIP archive created: $zipFile" -ForegroundColor Green
+    $onDisk = @(Get-ChildItem -LiteralPath $outDir -File -Recurse -ErrorAction Stop)
+    if (-not $onDisk.Count) {
+        Write-CVLog "Output directory is empty; no archive created: $outDir" -Level Error -Source 'Archive'
+    } else {
+        if (Test-Path -LiteralPath $zipFile) { Remove-Item -LiteralPath $zipFile -Force }
+        [IO.Compression.ZipFile]::CreateFromDirectory($outDir, $zipFile)
+        # Verify rather than assume: CreateFromDirectory can throw AFTER creating a partial file.
+        if (Test-Path -LiteralPath $zipFile) {
+            $zipOk = $true
+            Write-Host ("ZIP archive created: {0} ({1} file(s), {2:N0} bytes)" -f $zipFile, $onDisk.Count, (Get-Item -LiteralPath $zipFile).Length) -ForegroundColor Green
+        } else {
+            Write-CVLog "Archive creation reported success but the file is not there: $zipFile" -Level Error -Source 'Archive'
+        }
+    }
 } catch {
-    Write-Warning "Failed to create ZIP archive: $_"
+    # Write-CVLog, not Write-Warning: a warning never reaches Add-CVDiagnostic, so the run summary counted zero
+    # errors for a run that produced no deliverable.
+    Write-CVLog "Failed to create ZIP archive" -Level Error -Source 'Archive' -Exception $_
 }
 
 # The per-run output folder is kept under Output/ (loose CSVs/JSON) alongside the ZIP - nothing is deleted.
 
-Write-Progress -Id 5 -Activity "Generating Output Files" -Completed
-Write-Host "`nInventory complete. Results in $zipFile`n" -ForegroundColor Green
-if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
-    Write-Host "JSON sizing report (gcp_sizing_$dateStr.json) is included in the ZIP for Sales AI Hub upload." -ForegroundColor Cyan
+Complete-CVProgress -Id 'output'
+if ($zipOk) {
+    Write-Host "`nInventory complete. Results in $zipFile`n" -ForegroundColor Green
+    if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
+        Write-Host "JSON sizing report (gcp_sizing_$dateStr.json) is included in the ZIP for Sales AI Hub upload." -ForegroundColor Cyan
+    }
+    Write-Host "All output files (including the log) are compressed into the ZIP archive." -ForegroundColor Cyan
+} else {
+    Write-Host "`nInventory finished, but NO ZIP ARCHIVE was produced." -ForegroundColor Red
+    Write-Host "The individual output files are intact in: $outDir" -ForegroundColor Yellow
+    Write-Host "Send that folder to your Commvault representative, or re-run once the cause above is resolved." -ForegroundColor Yellow
 }
-Write-Host "All output files (including the log) are compressed into the ZIP archive." -ForegroundColor Cyan
 
 }
 catch {
