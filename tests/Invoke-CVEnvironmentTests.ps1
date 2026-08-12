@@ -128,6 +128,44 @@ $addMemberOffenders = @(Get-ChildItem -Path $srcRoot -Recurse -Filter *.ps1 | Fo
 Assert-CV 'every Add-Member -NotePropertyName passes -Force' $addMemberOffenders.Count 0
 if ($addMemberOffenders.Count) { $addMemberOffenders | ForEach-Object { Write-Host "        $_" -ForegroundColor DarkYellow } }
 
+Write-Host "`n[7a0] A data CSV is pure CSV - one header, one row per resource, nothing appended"
+<#
+    The GCP script used to append a summary block into gcp_gke_clusters_*, gcp_gke_persistent_volumes_*,
+    gcp_gke_persistent_volume_claims_* and gcp_disk_snapshots_* after Export-Csv had written them: a blank line,
+    a 'Summary:' banner, then label/value rows like "TotalSnapshots,3,TotalStorageGB,4500,TotalStorageTB,4.5".
+
+    None of those rows is WIDER than its file's header, so no parser errors - every failure is silent. The
+    measured consequence on gcp_disk_snapshots_*: Import-Csv returns the aggregate line as an ordinary data row,
+    so Measure-Object StorageTB -Sum returns exactly TWICE the real total. Azure and AWS never did this.
+
+    Guard the idiom, not the line count, so any resurrection of the pattern fails regardless of which file.
+#>
+$csvPurity = @()
+foreach ($f in @('CVGoogleCloudSizingScript.ps1', 'CVAzureCloudSizingScript.ps1', 'CVAWSCloudSizingScript.ps1')) {
+    $b = Get-Content -Raw (Join-Path $srcRoot $f)
+    # A 'Summary:' or '### X Summary ###' banner written into a file.
+    if ($b -match "Add-Content[^\r\n]*-Value\s+'Summary:'")        { $csvPurity += "${f}: appends a 'Summary:' banner" }
+    if ($b -match 'Add-Content[^\r\n]*###\s*\{?0?\}?\s*Summary') { $csvPurity += "${f}: appends a '### Summary ###' banner" }
+    # An aggregate row: Add-Content whose value starts with a Total*/Project* label rather than data.
+    $agg = [regex]::Matches($b, 'Add-Content[^\r\n]*-Value\s+\("(Total|Project|ProjectRegion|ProjectZone|ProjectLocation)')
+    if ($agg.Count) { $csvPurity += "${f}: appends $($agg.Count) aggregate row(s) into a CSV" }
+    # Blank-line padding into a file is only ever there to visually separate an appended block.
+    if ($b -match "Add-Content[^\r\n]*-Value\s+''")                { $csvPurity += "${f}: appends a blank line into a file" }
+}
+Assert-CV 'no cloud script appends a summary block into a data CSV' $csvPurity.Count 0
+if ($csvPurity.Count) { $csvPurity | ForEach-Object { Write-Host "        $_" -ForegroundColor DarkYellow } }
+
+# The six helpers that implemented the abandoned design. Their only callers were each other.
+$deadAppenders = @('Add-BlankLines', 'Add-DbWorkloadSummary', 'Write-PlainCsv', 'Add-VmInfoSummary',
+                   'Add-DiskSummary', 'Add-BucketSummary')
+$gcpBodyCsv = Get-Content -Raw (Join-Path $srcRoot 'CVGoogleCloudSizingScript.ps1')
+$revived = @($deadAppenders | Where-Object { $gcpBodyCsv -match "function\s+$_\b" })
+Assert-CV 'the dead CSV-append helpers stay deleted' $revived.Count 0
+if ($revived.Count) { Write-Host "        back in the file: $($revived -join ', ')" -ForegroundColor DarkYellow }
+
+# And the internal arrays that rendered as a column of type names.
+Assert-CV 'GCP does not export _PvDetails/_PvcDetails' ([bool]($gcpBodyCsv -match '(?m)^\s*\$gkeData \| Export-Csv')) $false
+
 Write-Host "`n[7a1] Archiving must COPY, not MOVE - the output directory keeps its files"
 <#
     The AWS script used to delete every archived file, leaving the uncompressed output directory empty. Two

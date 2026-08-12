@@ -1090,15 +1090,6 @@ function Get-GcpVMInventory {
 }
 
 
-# Helper - Update bucket progress
-function Update-BucketWorkProgress {
-    param([string]$Phase,[int]$Current,[int]$Total)
-    if ($Total -le 0) { $Total = 1 }
-    $pctRaw = ($Current / $Total) * 100
-    if ($pctRaw -gt 100) { $pctRaw = 100 }
-    $pct = [math]::Round($pctRaw,0)
-    Write-Progress -Id 41 -ParentId 4 -Activity "Bucket Workload" -Status ("{0} ({1}/{2})" -f $Phase,$Current,$Total) -PercentComplete $pct
-}
 
 
 # MultiThreading - Script Blocks for Bucket sizing
@@ -3021,73 +3012,6 @@ if (-not $SkipCloudRewind) {
   }
 }
 
-# ================= DB CSV EXPORTS =================
-# Helper must be defined before usage
-if (-not (Get-Command Add-BlankLines -ErrorAction SilentlyContinue)) {
-    function Add-BlankLines {
-        param(
-            [Parameter(Mandatory=$true)][string]$Path,
-            [int]$Count = 4
-        )
-        if (-not $Count -or $Count -le 0) { return }
-        # Create file if it does not yet exist so Add-Content won't fail
-        if (-not (Test-Path -LiteralPath $Path)) { New-Item -ItemType File -Path $Path -Force | Out-Null }
-        for ($i=0; $i -lt $Count; $i++) { Add-Content -Path $Path -Value '' }
-    }
-}
-if (-not (Get-Command Add-DbWorkloadSummary -ErrorAction SilentlyContinue)) {
-function Add-DbWorkloadSummary {
-    param(
-        [string]$Path,
-        [object[]]$Data,
-        [string]$WorkloadName,
-        [string]$CountLabel = 'Objects',
-        [string]$SizeProperty = 'StorageGB',
-        [string]$AltSizeLabel = ''
-    )
-    if (-not $Data -or $Data.Count -eq 0) { return }
-    Add-BlankLines -Path $Path -Count 4
-    Add-Content -Path $Path -Value ("### {0} Summary ###" -f $WorkloadName)
-    $total = $Data.Count
-    $hasSize = $false
-    $sumSize = 0
-    if ($SizeProperty -and ($Data | Select-Object -First 1).PSObject.Properties[$SizeProperty]) {
-        $hasSize = $true
-        $sumSize = ($Data | Measure-Object -Property $SizeProperty -Sum).Sum
-    }
-    if ($hasSize) {
-        Add-Content -Path $Path -Value ("Total {0}, {1}, TotalSizeGB, {2}" -f $CountLabel,$total,$sumSize)
-    } else {
-        Add-Content -Path $Path -Value ("Total {0}, {1}" -f $CountLabel,$total)
-    }
-    Add-BlankLines -Path $Path -Count 1
-    Add-Content -Path $Path -Value 'Per Project:'
-    $projGroups = $Data | Group-Object Project | Sort-Object Name
-    foreach ($pg in $projGroups) {
-        if ($hasSize) {
-            $pSize = ($pg.Group | Measure-Object -Property $SizeProperty -Sum).Sum
-            Add-Content -Path $Path -Value ("Project, {0}, {1}, {2}, SizeGB, {3}" -f $pg.Name,$CountLabel,$pg.Count,$pSize)
-        } else {
-            Add-Content -Path $Path -Value ("Project, {0}, {1}, {2}" -f $pg.Name,$CountLabel,$pg.Count)
-        }
-    }
-    if (($Data | Select-Object -First 1).PSObject.Properties['Region']) {
-        Add-BlankLines -Path $Path -Count 1
-        Add-Content -Path $Path -Value 'Per Project Region:'
-        foreach ($pg in $projGroups) {
-            $regionGroups = $pg.Group | Group-Object Region | Sort-Object Name
-            foreach ($rg in $regionGroups) {
-                if ($hasSize) {
-                    $rSize = ($rg.Group | Measure-Object -Property $SizeProperty -Sum).Sum
-                    Add-Content -Path $Path -Value ("ProjectRegion, {0}, {1}, {2}, {3}, SizeGB, {4}" -f $pg.Name,$rg.Name,$CountLabel,$rg.Count,$rSize)
-                } else {
-                    Add-Content -Path $Path -Value ("ProjectRegion, {0}, {1}, {2}, {3}" -f $pg.Name,$rg.Name,$CountLabel,$rg.Count)
-                }
-            }
-        }
-    }
-}
-}
 if ($Selected.DB -and $invResults.Databases -and (@($invResults.Databases)).Count) {
     $dbAll      = @($invResults.Databases)
     $dbSuccess  = @($dbAll | Where-Object { -not ($_.Error -and $_.Error.Trim()) -and $_.Type -ne 'Error' })
@@ -3141,8 +3065,8 @@ if ($Selected.DB -and $invResults.Databases -and (@($invResults.Databases)).Coun
                 Add-Content -Path $bqTablesCsv -Value ("{0},{1},{2},{3},{4},{5},{6}" -f $proj,$ds,$tbl,$lbytes,$pbytes,$lgb,$pgb)
             }
         }
-        if ((Get-Content $bqTablesCsv | Measure-Object -Line).Lines -le 1) { # no rows added
-            Add-Content -Path $bqTablesCsv -Value '# No table detail lines found in log (ensure DEBUG logging enabled)'
+        if ((Get-Content $bqTablesCsv | Measure-Object -Line).Lines -le 1) {
+            Write-Host "BigQuery Tables CSV: header only, no table detail rows reconstructed." -ForegroundColor DarkYellow
         } else {
             Write-Host "BigQuery Tables CSV written: $(Split-Path $bqTablesCsv -Leaf)" -ForegroundColor Cyan
         }
@@ -3162,121 +3086,7 @@ if ($Selected.DB -and $invResults.Databases -and (@($invResults.Databases)).Coun
 # -------------------------
 Write-Progress -Id 5 -Activity "Generating Output Files" -Status "Exporting CSV files..." -PercentComplete 0
 
-function Write-PlainCsv {
-    param(
-        [Parameter(Mandatory)]$Data,
-        [Parameter(Mandatory)][string]$Path,
-        [switch]$Append  # <-- new switch
-    )
-    if (-not $Data -or ($Data | Measure-Object).Count -eq 0) { return }
 
-    $first = $Data | Select-Object -First 1
-    $cols = $first.PSObject.Properties | Where-Object { $_.MemberType -eq 'NoteProperty' } | Select-Object -ExpandProperty Name
-
-    if (-not $Append) {
-        # Overwrite only if not appending
-        Set-Content -Path $Path -Value ($cols -join ',')
-    } elseif (-not (Test-Path $Path)) {
-        # If appending but file doesn't exist, write headers first
-        Set-Content -Path $Path -Value ($cols -join ',')
-    }
-
-    foreach ($row in $Data) {
-        $values = foreach ($c in $cols) {
-            $v = $row.$c
-            if ($null -eq $v) { '' } else { ($v.ToString() -replace '"','') -replace "[\r\n]",' ' }
-        }
-        Add-Content -Path $Path -Value ($values -join ',')
-    }
-}
-
-
-# -------------------------
-# Summary append helpers (appends to existing CSV files with blank lines then a section)
-#  Add-BlankLines defined earlier with guard
-
-function Add-VmInfoSummary {
-    if (-not $VmData -or $VmData.Count -eq 0) { return }
-    Add-BlankLines -Path $Path -Count 4
-    Add-Content -Path $Path -Value ("Total VMs, {0}" -f $VmData.Count)
-    $projGroups = $VmData | Group-Object Project | Sort-Object Name
-    foreach ($pg in $projGroups) {
-        Add-Content -Path $Path -Value ("Project, {0}, VMs, {1}" -f $pg.Name,$pg.Count)
-    }
-    # Per Project -> Region
-    Add-Content -Path $Path -Value 'Per Project Region:'
-    foreach ($pg in $projGroups) {
-        $regionGroups = $pg.Group | Group-Object Region | Sort-Object Name
-        foreach ($rg in $regionGroups) {
-            Add-Content -Path $Path -Value ("ProjectRegion, {0}, {1}, VMs, {2}" -f $pg.Name,$rg.Name,$rg.Count)
-        }
-    }
-    # Per Project -> Zone
-    Add-Content -Path $Path -Value 'Per Project Zone:'
-    foreach ($pg in $projGroups) {
-        $zoneGroups = $pg.Group | Group-Object Zone | Sort-Object Name
-        foreach ($zg in $zoneGroups) {
-            Add-Content -Path $Path -Value ("ProjectZone, {0}, {1}, {2}, VMs, {3}" -f $pg.Name,($zg.Group | Select-Object -First 1).Region,$zg.Name,$zg.Count)
-        }
-    }
-}
-
-
-function Add-DiskSummary {
-    param([string]$Path,[object[]]$DiskData,[string]$Title)
-    if (-not $DiskData -or $DiskData.Count -eq 0) { return }
-    Add-BlankLines -Path $Path -Count 4
-    Add-Content -Path $Path -Value ("### {0} Summary ###" -f $Title)
-    $uniqueDisks = $DiskData | Select-Object -Property DiskName,SizeGB,Project,Region,Zone -Unique
-    $totalCount = ($uniqueDisks | Measure-Object).Count
-    $totalGB = ($uniqueDisks | Measure-Object SizeGB -Sum).Sum
-    Add-Content -Path $Path -Value ("Total Disks, {0}, TotalSizeGB, {1}" -f $totalCount,$totalGB)
-    # Per Project
-    Add-Content -Path $Path -Value 'Per Project:'
-    $projGroups = $uniqueDisks | Group-Object Project | Sort-Object Name
-    foreach ($pg in $projGroups) {
-        $pGB = ($pg.Group | Measure-Object SizeGB -Sum).Sum
-        Add-Content -Path $Path -Value ("Project, {0}, Disks, {1}, SizeGB, {2}" -f $pg.Name,$pg.Count,$pGB)
-    }
-    # Per Project Region
-    Add-Content -Path $Path -Value 'Per Project Region:'
-    foreach ($pg in $projGroups) {
-        $regionGroups = $pg.Group | Group-Object Region | Sort-Object Name
-        foreach ($rg in $regionGroups) {
-            $rGB = ($rg.Group | Measure-Object SizeGB -Sum).Sum
-            Add-Content -Path $Path -Value ("ProjectRegion, {0}, {1}, Disks, {2}, SizeGB, {3}" -f $pg.Name,$rg.Name,$rg.Count,$rGB)
-        }
-    }
-}
-
-function Add-BucketSummary {
-    param([string]$Path,[object[]]$Buckets)
-    if (-not $Buckets -or $Buckets.Count -eq 0) { return }
-    Add-BlankLines -Path $Path -Count 4
-    Add-Content -Path $Path -Value '### Storage Buckets Summary ###'
-    $totalCount = $Buckets.Count
-    $totalBytes = ($Buckets | Measure-Object UsedCapacityBytes -Sum).Sum
-    $totalGB = [math]::Round($totalBytes/1e9,3)
-    Add-Content -Path $Path -Value ("Total Buckets, {0}, TotalSizeGB, {1}" -f $totalCount,$totalGB)
-    # Per Project
-    Add-Content -Path $Path -Value 'Per Project:'
-    $projGroups = $Buckets | Group-Object Project | Sort-Object Name
-    foreach ($pg in $projGroups) {
-        $pBytes = ($pg.Group | Measure-Object UsedCapacityBytes -Sum).Sum
-        $pGB = [math]::Round($pBytes/1e9,3)
-        Add-Content -Path $Path -Value ("Project, {0}, Buckets, {1}, SizeGB, {2}" -f $pg.Name,$pg.Count,$pGB)
-    }
-    # Per Project Location
-    Add-Content -Path $Path -Value 'Per Project Location:'
-    foreach ($pg in $projGroups) {
-        $locGroups = $pg.Group | Group-Object Location | Sort-Object Name
-        foreach ($lg in $locGroups) {
-            $lBytes = ($lg.Group | Measure-Object UsedCapacityBytes -Sum).Sum
-            $lGB = [math]::Round($lBytes/1e9,3)
-            Add-Content -Path $Path -Value ("ProjectLocation, {0}, {1}, Buckets, {2}, SizeGB, {3}" -f $pg.Name,$lg.Name,$lg.Count,$lGB)
-        }
-    }
-}
 
 # ---------------------------------------------------------------------------
 # Protection enrichment: roll disk snapshots up onto each disk row, then aggregate
@@ -3464,26 +3274,9 @@ if ($Selected.GKE -and $invResults.GKEClusters -and $invResults.GKEClusters.Coun
     # Order & columns
     # Full metadata - no column subsetting (Azure-style full dump per instance).
     $gkeData = $invResults.GKEClusters
-    $gkeData | Export-Csv -Path $gkeCsv -NoTypeInformation
-    # Summary append
-    Add-Content -Path $gkeCsv -Value ''
-    Add-Content -Path $gkeCsv -Value 'Summary:'
-    $totalClusters = $gkeData.Count
-    $sumNodes = ($gkeData | Measure-Object NodeCount -Sum).Sum
-    $sumvCPU = ($gkeData | Measure-Object EstimatedvCPU -Sum).Sum
-    $sumMem  = ($gkeData | Measure-Object EstimatedMemGB -Sum).Sum
-    $sumPvCap = ($gkeData | Measure-Object PersistentVolumeCapacityGB -Sum).Sum
-    $sumPvCnt = ($gkeData | Measure-Object PersistentVolumeCount -Sum).Sum
-    Add-Content -Path $gkeCsv -Value ("TotalClusters,{0},TotalNodes,{1},TotalvCPU,{2},TotalMemGB,{3},TotalPVCapGB,{4},TotalPVCount,{5}" -f $totalClusters,$sumNodes,$sumvCPU,$sumMem,$sumPvCap,$sumPvCnt)
-    Add-Content -Path $gkeCsv -Value 'Per Project:'
-    foreach ($grp in ($gkeData | Group-Object Project | Sort-Object Name)) {
-        $nNodes = ($grp.Group | Measure-Object NodeCount -Sum).Sum
-        $nVcpu  = ($grp.Group | Measure-Object EstimatedvCPU -Sum).Sum
-        $nMem   = ($grp.Group | Measure-Object EstimatedMemGB -Sum).Sum
-        $nPvCap = ($grp.Group | Measure-Object PersistentVolumeCapacityGB -Sum).Sum
-        $nPvCnt = ($grp.Group | Measure-Object PersistentVolumeCount -Sum).Sum
-    Add-Content -Path $gkeCsv -Value ("Project,{0},Clusters,{1},Nodes,{2},vCPU,{3},MemGB,{4},PVCapGB,{5},PVCount,{6}" -f $grp.Name,$grp.Count,$nNodes,$nVcpu,$nMem,$nPvCap,$nPvCnt)
-    }
+    # -ExcludeProperty: _PvDetails/_PvcDetails are internal arrays used downstream in-memory. Exported, each cell
+    # reads "System.Management.Automation.PSObject[]" - a column of type names. Nothing in the repo reads them.
+    $gkeData | Select-Object -ExcludeProperty _PvDetails, _PvcDetails | Export-Csv -Path $gkeCsv -NoTypeInformation
     Write-Host "GKE clusters CSV written: $(Split-Path $gkeCsv -Leaf)" -ForegroundColor Cyan
 
     # PV CSV
@@ -3491,17 +3284,6 @@ if ($Selected.GKE -and $invResults.GKEClusters -and $invResults.GKEClusters.Coun
         $pvCsv = Join-Path $outDir ("gcp_gke_persistent_volumes_" + $dateStr + ".csv")
         $pvOrdered = $invResults.GKEPVs | Sort-Object Project,ClusterName,ClaimNamespace,PVName
         $pvOrdered | Export-Csv -Path $pvCsv -NoTypeInformation
-        Add-Content -Path $pvCsv -Value ''
-        Add-Content -Path $pvCsv -Value 'Summary:'
-        $totalPv = $pvOrdered.Count
-        $sumPvCap = ($pvOrdered | Measure-Object CapacityGiB -Sum).Sum
-        Add-Content -Path $pvCsv -Value ("TotalPVs,{0},TotalCapacityGiB,{1}" -f $totalPv,$sumPvCap)
-        Add-Content -Path $pvCsv -Value 'Per Cluster:'
-        foreach ($grp in ($pvOrdered | Group-Object Project,ClusterName)) {
-            $cap = ($grp.Group | Measure-Object CapacityGiB -Sum).Sum
-            $first = $grp.Group | Select-Object -First 1
-            Add-Content -Path $pvCsv -Value ("Project,{0},Cluster,{1},PVs,{2},CapacityGiB,{3}" -f $first.Project,$first.ClusterName,$grp.Count,$cap)
-        }
         Write-Host "GKE PV CSV written: $(Split-Path $pvCsv -Leaf)" -ForegroundColor Cyan
     }
     # PVC CSV
@@ -3509,26 +3291,6 @@ if ($Selected.GKE -and $invResults.GKEClusters -and $invResults.GKEClusters.Coun
         $pvcCsv = Join-Path $outDir ("gcp_gke_persistent_volume_claims_" + $dateStr + ".csv")
         $pvcOrdered = $invResults.GKEPVCs | Sort-Object Project,ClusterName,Namespace,PVCName
         $pvcOrdered | Export-Csv -Path $pvcCsv -NoTypeInformation
-        Add-Content -Path $pvcCsv -Value ''
-        Add-Content -Path $pvcCsv -Value 'Summary:'
-        $totalPvc = $pvcOrdered.Count
-        $sumReq = ($pvcOrdered | Measure-Object RequestedGiB -Sum).Sum
-        $sumCap = ($pvcOrdered | Measure-Object CapacityGiB -Sum).Sum
-        Add-Content -Path $pvcCsv -Value ("TotalPVCs,{0},TotalRequestedGiB,{1},TotalCapacityGiB,{2}" -f $totalPvc,$sumReq,$sumCap)
-        Add-Content -Path $pvcCsv -Value 'Per Cluster:'
-        foreach ($grp in ($pvcOrdered | Group-Object Project,ClusterName)) {
-            $req = ($grp.Group | Measure-Object RequestedGiB -Sum).Sum
-            $cap = ($grp.Group | Measure-Object CapacityGiB -Sum).Sum
-            $first = $grp.Group | Select-Object -First 1
-            Add-Content -Path $pvcCsv -Value ("Project,{0},Cluster,{1},PVCs,{2},RequestedGiB,{3},CapacityGiB,{4}" -f $first.Project,$first.ClusterName,$grp.Count,$req,$cap)
-        }
-        Add-Content -Path $pvcCsv -Value 'Per Cluster Namespace:'
-        foreach ($grp in ($pvcOrdered | Group-Object Project,ClusterName,Namespace)) {
-            $req = ($grp.Group | Measure-Object RequestedGiB -Sum).Sum
-            $cap = ($grp.Group | Measure-Object CapacityGiB -Sum).Sum
-            $first = $grp.Group | Select-Object -First 1
-            Add-Content -Path $pvcCsv -Value ("Project,{0},Cluster,{1},Namespace,{2},PVCs,{3},RequestedGiB,{4},CapacityGiB,{5}" -f $first.Project,$first.ClusterName,$first.Namespace,$grp.Count,$req,$cap)
-        }
         Write-Host "GKE PVC CSV written: $(Split-Path $pvcCsv -Leaf)" -ForegroundColor Cyan
     }
 }
@@ -3572,11 +3334,9 @@ if ($Selected.SNAPSHOT -and $snapshotData -and $snapshotData.Count -gt 0) {
     $snapshotData |
         Select-Object Project,SnapshotName,SourceDisk,SourceDiskZone,Region,StorageTB,DiskSizeGB,Status,CreationTime,StorageLocations,Labels |
         Export-Csv -Path $snapCsv -NoTypeInformation
-    # Append summary
-    Add-Content -Path $snapCsv -Value ''
-    Add-Content -Path $snapCsv -Value 'Summary:'
-    $totalSnapGB = ($snapshotData | Measure-Object StorageGB -Sum).Sum
-    Add-Content -Path $snapCsv -Value ("TotalSnapshots,{0},TotalStorageGB,{1},TotalStorageTB,{2}" -f $snapshotData.Count,[math]::Round($totalSnapGB,2),[math]::Round($totalSnapGB/1000,4))
+    # The snapshot total used to be appended here, and it was the only place it was published. It now has a
+    # proper Disk Snapshots row in gcp_inventory_summary_*.csv instead. Appending it made `Measure-Object
+    # StorageTB -Sum` over this file return exactly 2x the truth, because the total line parsed as a data row.
     Write-Host "Snapshots CSV written: $(Split-Path $snapCsv -Leaf)" -ForegroundColor Cyan
 }
 
