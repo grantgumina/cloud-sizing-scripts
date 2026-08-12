@@ -36,12 +36,26 @@
 .OUTPUTS
         Writes to the repository top level (or the current directory when run outside the repo):
             Output/gcp_YYYY-MM-DD_HHMMSS/
+                - gcp_inventory_summary_*.csv                 (the rollup - see below)
+                - gcp_vm_zone_rollup_*.csv                    (per-zone VM capacity)
                 - gcp_vm_instance_info_*.csv                  (VM inventory)
                 - gcp_disks_attached_to_vm_instances_*.csv    (attached disks)
                 - gcp_disks_unattached_to_vm_instances_*.csv  (unattached disks)
                 - gcp_storage_buckets_info_*.csv              (bucket inventory)
-                - gcp_inventory_summary_*.csv                 (summary rollups)
+                - gcp_filestore_instances_*.csv, gcp_gke_clusters_*.csv, gcp_disk_snapshots_*.csv,
+                  gcp_cloudsql_instances_*.csv, gcp_spanner_instances_*.csv, gcp_alloydb_clusters_*.csv,
+                  gcp_bigquery_datasets_*.csv, gcp_bigquery_tables_*.csv, and the GKE PV/PVC pair
+                - gcp_resilience_signals_*.csv                (unless -SkipResilienceReport)
                 - gcp_sizing_*.json                           (only with -OutputFormat json|both)
+
+            gcp_inventory_summary_*.csv carries Project, ResourceType, Region, Count, TotalSizeGB,
+            TotalSizeTB, TotalSizeTiB - the same seven columns Azure and AWS publish - in four tiers:
+            overall, overall by region, per project, then per project by region. It no longer has the
+            Level or Zone columns; zone detail is in gcp_vm_zone_rollup_*.csv.
+
+            EVERY CSV here is pure CSV: one header row, one row per resource, nothing appended. Four of
+            them used to carry a trailing 'Summary:' block, which made a consumer totalling
+            gcp_disk_snapshots_*.csv read exactly twice the real figure.
             Output/gcp_YYYY-MM-DD_HHMMSS.zip                  (ZIP archive of the run's output)
             Logs/gcp_YYYY-MM-DD_HHMMSS.log                    (execution log / transcript)
         The per-run Output folder is kept alongside the ZIP; nothing is deleted.

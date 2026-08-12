@@ -96,5 +96,15 @@ The term "environment" here refers to the scale of the Google Cloud (GC) environ
 ```
 
 #### Results & Output
-The script writes CSV summaries and any JSON output to `Output/gcp_<timestamp>/` (with a `.zip` archive beside it) and the run log to `Logs/gcp_<timestamp>.log`, at the repository top level. In Cloud Shell you can download these via the built‑in file browser. Share the ZIP or individual CSVs with the team as needed.
+The script writes CSVs and any JSON output to `Output/gcp_<timestamp>/` (with a `.zip` archive beside it) and the run log to `Logs/gcp_<timestamp>.log`, at the repository top level. In Cloud Shell you can download these via the built‑in file browser. Share the ZIP or individual CSVs with the team as needed. The loose files are always kept — the ZIP is a copy, not a move — and if the archive cannot be written the script says so explicitly and points at the folder instead of claiming success.
+
+**Every CSV is pure CSV**: one header, one row per resource, nothing appended. Four files used to carry a trailing `Summary:` block whose aggregate row parsed as data — on `gcp_disk_snapshots_*.csv` that made `sum(StorageTB)` return exactly twice the real total.
+
+- `gcp_inventory_summary_<ts>.csv` — the rollup, in four tiers: overall, overall by region, per project, then per project by region. Columns: `Project`, `ResourceType`, `Region`, `Count`, `TotalSizeGB`, `TotalSizeTB`, `TotalSizeTiB` — the same seven Azure and AWS publish. The old `Level` and `Zone` columns are gone: `Level` was fully derivable from `(Project, Region)`, and zone detail moved to its own file. Each database service (Cloud SQL, Spanner, AlloyDB, BigQuery) now gets its own row stating its basis, instead of one fused total that mixed provisioned disk with a derived capacity ceiling.
+- `gcp_vm_zone_rollup_<ts>.csv` — per-zone VM capacity (`Project`, `Region`, `Zone`, `VMCount`, sizes). Computed from VM rows, so regional persistent disks are attributed to the zone of the VM using them; the previous in-summary zone tier stamped regional disks `Zone=''` and silently lost their capacity.
+- `gcp_<service>_*.csv` — one row per resource, full metadata, for VMs, attached and unattached disks, buckets, Filestore, GKE clusters and their PVs/PVCs, disk snapshots, Cloud SQL, Spanner, AlloyDB and BigQuery.
+- `gcp_resilience_signals_<ts>.csv` *(unless `-SkipResilienceReport`)* — raw cyber-resilience signal values; the backend applies the thresholds. A blank cell means **not collected**, never "no", and the `*DataStatus` columns say why. See [CYBER_RESILIENCE_SIGNALS.md](../CYBER_RESILIENCE_SIGNALS.md).
+- `gcp_cloudrewind_*.csv` *(unless `-SkipCloudRewind`)* — billable-resource sizing.
+
+> **Filestore and GKE backup coverage changed meaning.** `HasBackup` and `HasBackupPlan` were computed per *project*, so one backup or plan anywhere marked every share or cluster in that project as protected. They are now matched to the individual resource, so previously-"protected" resources will start reporting gaps on a Critical control. Those resources were never verified as protected.
 
