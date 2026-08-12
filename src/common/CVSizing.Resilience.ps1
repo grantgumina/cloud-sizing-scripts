@@ -180,7 +180,9 @@ $script:CVSignalStatusColumns = @(
     'LockDataStatus',          # Azure: resource-lock read (deletion protection)
     'VaultSettingsDataStatus', # Azure: Recovery Services vault posture read
     'LtrDataStatus',           # Azure: SQL long-term-retention policy read
-    'AksBackupDataStatus'      # Azure: DataProtection backup-instance read
+    'AksBackupDataStatus',     # Azure: DataProtection backup-instance read
+    'VaultLockDataStatus',     # AWS:   Backup Vault Lock read (region-scoped immutability)
+    'S3PostureDataStatus'      # AWS:   per-bucket posture reads - Ok | Partial | Failed
 )
 
 function Get-CVFirstProperty {

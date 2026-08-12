@@ -25,6 +25,8 @@ of an assessed type with the relevant configuration values read from the cloud A
 | `VaultSettingsDataStatus` | **Azure only.** Recovery Services vault posture read — tracked apart from `BackupDataStatus` because listing backup *items* and reading vault *settings* can fail independently |
 | `LtrDataStatus` | **Azure only.** SQL long-term-retention policy read |
 | `AksBackupDataStatus` | **Azure only.** DataProtection backup-instance read (Backup for AKS) |
+| `VaultLockDataStatus` | **AWS only.** AWS Backup Vault Lock read (region-scoped) |
+| `S3PostureDataStatus` | **AWS only.** Per-bucket posture reads: `Ok` (all six succeeded) / `Partial` / `Failed`. Six independent calls back the S3 signals, so one can fail while the rest succeed — this says which rows to distrust |
 | *signal columns* | The raw configuration values, named exactly as collected. See the tables below |
 
 **A blank signal means the value was not collected** — the API was not reachable, permission was denied, the
@@ -44,6 +46,15 @@ Recovery Services vault protecting it, so an unprotected VM has no vault to desc
 | `Failed` / `Skipped` | blank | **Not collected** — we could not look |
 
 Treating the first row as unassessed will overstate how much of the estate went unevaluated.
+
+AWS has the same pattern in a different place. `DaysSinceLastBackup` blank can mean *no recovery point exists*
+(measured) or *the AWS Backup protected-resource list could not be read*. `BackupDataStatus` on the same row
+separates them, and `VaultLockDataStatus` does the same for `BackupVaultAnyLocked`:
+
+| `BackupDataStatus` | `DaysSinceLastBackup` | Means |
+|---|---|---|
+| `Ok` | blank | **Measured** — no recovery point exists for this resource |
+| `Failed` | blank | **Not collected** — the AWS Backup list could not be read |
 
 **The schema is fixed.** Every column below is emitted on every run regardless of what resource type, so the
 header is identical between runs. Because one file contains information for every resource type, most cells are blank

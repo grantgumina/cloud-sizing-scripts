@@ -639,7 +639,12 @@ $script:AwsResilienceMap = @{
 
 function Invoke-AWSResiliencePass {
     <#
-      .SYNOPSIS  Append Ctl_*/ResilienceScore/ResilienceGaps columns to one account's inventory rows.
+      .SYNOPSIS  Emit one signal row per inventory row, for every resource type that has a control set.
+      .DESCRIPTION
+        NOTHING is scored here and no verdict is written. The control sets are consulted only for WHICH inventory
+        fields are signals (via Get-CVSignalFieldMap, which parses the Test blocks); thresholds and weighting
+        belong to the backend. The Ctl_*/ResilienceScore/ResilienceGaps columns this used to append no longer
+        exist - see the CVSizing.Resilience.ps1 header.
     #>
     param([Parameter(Mandatory)][string]$AccountId)
 
@@ -1080,6 +1085,10 @@ function Process-EC2Instance {
         # AWS Backup Vault Lock - region-scoped immutability. Locked vaults cannot have recovery points
         # deleted or retention shortened, even by an admin: the AWS analogue of Azure vault immutability.
         BackupVaultAnyLocked    = $vaultLock.AnyLocked
+        # Why a blank neighbouring cell is blank. DaysSinceLastBackup blank could mean 'no recovery point
+        # exists' OR 'the AWS Backup list could not be read' - these two columns say which.
+        BackupDataStatus        = $ec2Backup.Status
+        VaultLockDataStatus     = $vaultLock.Status
         BackupVaultLockedCount  = $vaultLock.LockedCount
         BackupVaultMinRetentionDays = $vaultLock.MinRetentionDays
         EBSSnapshotCount      = $snapshotCount
@@ -1197,12 +1206,20 @@ function Process-S3Bucket {
 
         $sizes = Convert-BytesToSizes -Bytes $totalBytes
 
+        # ── Per-bucket posture reads ──────────────────────────────────────
+        # Six independent calls, each able to fail on its own. $s3PostureFailed counts the ones that failed for a
+        # reason OTHER than "the feature is not configured", so a row can say Partial rather than leaving the
+        # reader to guess which blank cells were unread. Observed live: 2 of 7 buckets failed the public-access
+        # read while every other read on those buckets succeeded.
+        $s3PostureReads  = 6
+        $s3PostureFailed = 0
+
         # ── Versioning ────────────────────────────────────────────────────
         $versioningStatus = 'Unknown'
         try {
             $vConfig = Get-S3BucketVersioning -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
             $versioningStatus = if ($vConfig -and $vConfig.Status) { $vConfig.Status.Value ?? $vConfig.Status } else { 'Disabled' }
-        } catch { $versioningStatus = 'Unknown' }
+        } catch { $versioningStatus = 'Unknown'; $s3PostureFailed++ }
 
         # ── Public access block ───────────────────────────────────────────
         # All FOUR booleans are published raw. Collapsing them into one PublicAccessBlocked was a judgement about
@@ -1225,7 +1242,7 @@ function Process-S3Bucket {
             if (Test-CVAwsNotConfiguredError $_) {
                 $pabAcls = $false; $pabPolicy = $false; $pabIgnore = $false; $pabRestrict = $false
                 $publicAccessBlocked = $false
-            }
+            } else { $s3PostureFailed++ }
         }
 
         # ── Replication ───────────────────────────────────────────────────
@@ -1236,14 +1253,14 @@ function Process-S3Bucket {
         try {
             $replConfig = Get-S3BucketReplication -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
             $replicationEnabled = [bool]($replConfig -and $replConfig.Rules -and @($replConfig.Rules).Count -gt 0)
-        } catch { if (Test-CVAwsNotConfiguredError $_) { $replicationEnabled = $false } }
+        } catch { if (Test-CVAwsNotConfiguredError $_) { $replicationEnabled = $false } else { $s3PostureFailed++ } }
 
         # ── Lifecycle rules ───────────────────────────────────────────────
         $lifecycleRuleCount = $null
         try {
             $lcRules = Get-S3LifecycleConfiguration -BucketName $bucketName -Credential $Credential -Region $actualRegion -ErrorAction Stop
             $lifecycleRuleCount = if ($lcRules -and $lcRules.Rules) { @($lcRules.Rules).Count } else { 0 }
-        } catch { if (Test-CVAwsNotConfiguredError $_) { $lifecycleRuleCount = 0 } }
+        } catch { if (Test-CVAwsNotConfiguredError $_) { $lifecycleRuleCount = 0 } else { $s3PostureFailed++ } }
 
         # ── Encryption ────────────────────────────────────────────────────
         # 'Unknown', NOT 'None', when the read fails. s3-encrypted treats 'None' as a Gap, so the old catch
@@ -1263,7 +1280,7 @@ function Process-S3Bucket {
                                         elseif ($sse) { [string]$sse }
                                         else { 'None' }
             } else { $serverSideEncryption = 'None' }
-        } catch { if (Test-CVAwsNotConfiguredError $_) { $serverSideEncryption = 'None' } }
+        } catch { if (Test-CVAwsNotConfiguredError $_) { $serverSideEncryption = 'None' } else { $s3PostureFailed++ } }
 
         # ── Object Lock (WORM) ────────────────────────────────────────────
         # S3's immutability control, and the AWS analogue of Azure storage's locked immutability policy. Not
@@ -1283,7 +1300,7 @@ function Process-S3Bucket {
                                         elseif ($ol.Rule.DefaultRetention.Years) { [int]$ol.Rule.DefaultRetention.Years * 365 })
                 }
             } else { $objectLockEnabled = 'None' }
-        } catch { if (Test-CVAwsNotConfiguredError $_) { $objectLockEnabled = 'None' } }
+        } catch { if (Test-CVAwsNotConfiguredError $_) { $objectLockEnabled = 'None' } else { $s3PostureFailed++ } }
 
         # ── MFA delete ────────────────────────────────────────────────────
         # Comes from the versioning response already fetched above - no extra call.
@@ -1321,6 +1338,11 @@ function Process-S3Bucket {
             ObjectLockEnabled     = $objectLockEnabled
             ObjectLockMode        = $objectLockMode
             ObjectLockRetentionDays = $objectLockDays
+            # Ok = all six posture reads succeeded; Partial = some failed for a reason other than "not
+            # configured"; Failed = none succeeded. Tells the reader which blank cells above were unread.
+            S3PostureDataStatus   = $(if ($s3PostureFailed -eq 0) { 'Ok' }
+                                      elseif ($s3PostureFailed -ge $s3PostureReads) { 'Failed' }
+                                      else { 'Partial' })
             ProtectionStatus      = $s3ProtectionStatus
             SizeGiB               = $sizes.SizeGiB
             SizeTiB               = $sizes.SizeTiB
@@ -1409,6 +1431,10 @@ function Process-EFSFileSystem {
         # AWS Backup Vault Lock - region-scoped immutability. Locked vaults cannot have recovery points
         # deleted or retention shortened, even by an admin: the AWS analogue of Azure vault immutability.
         BackupVaultAnyLocked    = $vaultLock.AnyLocked
+        # Why a blank neighbouring cell is blank. DaysSinceLastBackup blank could mean 'no recovery point
+        # exists' OR 'the AWS Backup list could not be read' - these two columns say which.
+        BackupDataStatus        = $efsBackup.Status
+        VaultLockDataStatus     = $vaultLock.Status
         BackupVaultLockedCount  = $vaultLock.LockedCount
         BackupVaultMinRetentionDays = $vaultLock.MinRetentionDays
         AwsBackupLastBackupUtc = $(if ($efsBackup.LastBackupTime) { ([datetime]$efsBackup.LastBackupTime).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { '' })
@@ -2038,6 +2064,10 @@ function Process-RDSInstance {
             # AWS Backup Vault Lock - region-scoped immutability. Locked vaults cannot have recovery points
             # deleted or retention shortened, even by an admin: the AWS analogue of Azure vault immutability.
             BackupVaultAnyLocked    = $vaultLock.AnyLocked
+            # Why a blank neighbouring cell is blank. DaysSinceLastBackup blank could mean 'no recovery point
+            # exists' OR 'the AWS Backup list could not be read' - these two columns say which.
+            BackupDataStatus        = $rdsBackup.Status
+            VaultLockDataStatus     = $vaultLock.Status
             BackupVaultLockedCount  = $vaultLock.LockedCount
             BackupVaultMinRetentionDays = $vaultLock.MinRetentionDays
             AwsBackupLastBackupUtc  = $(if ($awsBackupLastTime) { ([datetime]$awsBackupLastTime).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { '' })
@@ -2396,6 +2426,10 @@ function Process-DynamoDBTable {
             # AWS Backup Vault Lock - region-scoped immutability. Locked vaults cannot have recovery points
             # deleted or retention shortened, even by an admin: the AWS analogue of Azure vault immutability.
             BackupVaultAnyLocked    = $vaultLock.AnyLocked
+            # Why a blank neighbouring cell is blank. DaysSinceLastBackup blank could mean 'no recovery point
+            # exists' OR 'the AWS Backup list could not be read' - these two columns say which.
+            BackupDataStatus        = $ddbBackup.Status
+            VaultLockDataStatus     = $vaultLock.Status
             BackupVaultLockedCount  = $vaultLock.LockedCount
             BackupVaultMinRetentionDays = $vaultLock.MinRetentionDays
             AwsBackupLastBackupUtc = $(if ($ddbBackup.LastBackupTime) { ([datetime]$ddbBackup.LastBackupTime).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { '' })
