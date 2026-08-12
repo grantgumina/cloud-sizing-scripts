@@ -834,8 +834,13 @@ function Get-GcpVMInventory {
                     $zoneVal = ''
                     $isRegional = $false
                     $enc = 'No'
+                    $cmk = $null          # CMEK is only knowable from the disk-list object, not the attachment
                     $typeVal = ''
                     $selfLinkVal = $null
+                    # autoDelete lives on the ATTACHMENT, so it is always readable here even when the disk-list
+                    # lookup missed. Polarity is inverted on purpose: the control asks whether the disk SURVIVES
+                    # VM deletion, the API reports whether it is auto-DELETED.
+                    $survives = if ($null -ne $disk.autoDelete) { -not [bool]$disk.autoDelete } else { $null }
                     if ($d) {
                         $sizeGbVal = [int64]$d.sizeGb
                         if ($d.region) 
@@ -850,6 +855,10 @@ function Get-GcpVMInventory {
                         if ($d.diskEncryptionKey -or $d.encryptionKey) {
                             $enc='Yes' 
                         }
+                        # CMEK specifically: kmsKeyName is what distinguishes a customer-MANAGED key from a
+                        # customer-SUPPLIED one (rawKey/sha256). $enc above is true for both, so pd-cmek cannot
+                        # read it. Already in the `compute disks list` payload.
+                        $cmk = [bool]$d.diskEncryptionKey.kmsKeyName
                         $typeVal = ($d.type -replace '.*/','')
                         
                         if ($d.PSObject.Properties.Name -contains 'selfLink') {
@@ -888,6 +897,8 @@ function Get-GcpVMInventory {
                         DiskSelfLink = $selfLinkVal
                         DiskKey      = $primaryKey
                         Source       = if ($fromMap) { 'DiskList' } else { 'InstanceAttachment' }
+                        CmkEncrypted     = $cmk
+                        SurvivesVmDelete = $survives
                     }
                     $projectAttached += $attachedObj
                     # Ensure disk appears once in AllDisks (prefer enriched version if later disk list supplies it)
@@ -906,6 +917,8 @@ function Get-GcpVMInventory {
                             SizeGB       = $sizeGbVal
                             DiskSelfLink = $selfLinkVal
                             DiskKey      = $diskKeyForAll
+                            CmkEncrypted     = $cmk
+                            SurvivesVmDelete = $survives
                         }
                     }
                 }
@@ -923,6 +936,11 @@ function Get-GcpVMInventory {
                 SelfLink     = $vm.selfLink          # GCP's stable resource id (ARM id / ARN equivalent)
                 DiskCount    = $diskCountLocal
                 VMDiskSizeGB = [int64]$vmDiskGB
+                # vm-delprot read this and nothing set it on a VM row, so the control could never produce a
+                # verdict - while CYBER_RESILIENCE_SIGNALS.md documented it as collected. It was only invisible
+                # because DeletionProtection IS set on Cloud SQL rows, which satisfied the cloud-wide check.
+                # Already in the `compute instances list` payload: no extra call.
+                DeletionProtection = [bool]$vm.deletionProtection
             }
         }
 
@@ -962,6 +980,13 @@ function Get-GcpVMInventory {
                 SizeGB       = [int64]$disk.sizeGb
                 DiskSelfLink = $diskSelf
                 DiskKey      = $diskKeyForAll
+                CmkEncrypted = [bool]$disk.diskEncryptionKey.kmsKeyName
+                # autoDelete is a property of an ATTACHMENT, so an unattached disk has none to read. But the
+                # branch below establishes by measurement that no VM is using this disk ($disk.users is empty),
+                # and a disk with no attachment cannot be auto-deleted with one. That is a real $true, not an
+                # assumption. NEVER the string 'NA' here: the control routes through Get-CVTri, which is
+                # [bool]$Value, and [bool]'NA' is $true - so 'NA' would silently read as Met.
+                SurvivesVmDelete = if (-not $disk.users -or $disk.users.Count -eq 0) { $true } else { $null }
             }
             $projectAllDisks += $diskObj
             if (-not $disk.users -or $disk.users.Count -eq 0) { $projectUnattached += $diskObj }
@@ -2600,6 +2625,14 @@ function Get-GcpGkeInventory {
                 Endpoint      = if ($c.endpoint){$c.endpoint}else{''}
                 ApiDisabled   = $clResult.ApiDisabled
                 PermissionIssue = $clResult.PermIssue
+                # Application-layer secrets encryption (etcd CMEK). Already in the `container clusters list`
+                # payload. ENCRYPTED is the only Met state; DECRYPTED, and a databaseEncryption block that is
+                # absent entirely, are both a MEASURED $false - we read the cluster object and the feature is
+                # not on. Not blank: blank is reserved for "we could not read the cluster at all", which is the
+                # ApiDisabled / PermissionIssue path where this whole row does not get built.
+                SecretsEncryptionCmk    = ("$($c.databaseEncryption.state)" -eq 'ENCRYPTED')
+                # 'None' rather than blank when read-and-absent, matching the aks-diskcmek precedent.
+                SecretsEncryptionKeyName = if ($c.databaseEncryption.keyName) { "$($c.databaseEncryption.keyName)" } else { 'None' }
             }
             # Attach detail arrays (for downstream harvesting to remain compatible)
             $null = $gkeObj | Add-Member -NotePropertyName _PvDetails  -NotePropertyValue ($pvInfo.PvDetails.ToArray())  -Force
@@ -2899,11 +2932,50 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
                         -Level Warning -Source 'Filestore' -Scope @{ Project = $p; Category = $(if ($r.ApiDisabled) { 'ApiDisabled' } else { 'LookupFailed' }) }
         }
     }
+    # Index the backups we already fetched by the INSTANCE they came from. Every backup carries
+    #   sourceInstance = projects/{p}/locations/{loc}/instances/{name}
+    #   name           = projects/{p}/locations/{loc}/backups/{name}    <- the BACKUP's own location
+    # so per-instance attribution and cross-region comparison both come out of the payload at hand.
+    #
+    # This replaces a project-scoped test - [bool](@($fsBackups[$f.Project]).Count -gt 0) - which marked EVERY
+    # share in a project as protected as soon as ONE backup existed anywhere in it, on a control whose Severity
+    # is Critical. That is the mirror image of a fabricated gap and worse in a pre-sales report, because it
+    # silently REMOVES a real finding instead of adding a false one.
+    $fsByInstance = @{}
+    foreach ($p in $fsBackups.Keys) {
+        foreach ($bk in @($fsBackups[$p])) {
+            if (-not $bk -or -not $bk.sourceInstance) { continue }
+            $srcName = ($bk.sourceInstance -split '/')[-1]
+            $srcLoc  = $(if ($bk.sourceInstance -match '/locations/([^/]+)/') { $Matches[1] } else { '' })
+            $bkLoc   = $(if ("$($bk.name)" -match '/locations/([^/]+)/')      { $Matches[1] } else { '' })
+            $k = "$p|$srcName".ToLower()
+            if (-not $fsByInstance.ContainsKey($k)) { $fsByInstance[$k] = @{ Count = 0; Locations = @() } }
+            $fsByInstance[$k].Count++
+            if ($bkLoc) { $fsByInstance[$k].Locations += $bkLoc }
+            # Filestore BASIC tiers are ZONAL, so an instance location can be us-central1-a while its backups
+            # are regional (us-central1). Comparing those raw would report every zonal instance as cross-region.
+            # Strip the zone suffix with the same idiom the snapshot collector uses.
+            $srcRegion = $srcLoc -replace '-[a-z]$', ''
+            $bkRegion  = $bkLoc  -replace '-[a-z]$', ''
+            if ($bkRegion -and $srcRegion -and ($bkRegion -ne $srcRegion)) { $fsByInstance[$k].XRegion = $true }
+        }
+    }
     foreach ($f in @($invResults.FilestoreInstances)) {
         if (-not $f) { continue }
         Add-Member -InputObject $f -NotePropertyName EncryptedAtRest -NotePropertyValue $true -Force   # GCP encrypts Filestore at rest by default
-        $hasBackup = if ($fsLookupOk.ContainsKey($f.Project)) { [bool](@($fsBackups[$f.Project]).Count -gt 0) } else { $null }
-        Add-Member -InputObject $f -NotePropertyName HasBackup -NotePropertyValue $hasBackup -Force
+        if (-not $fsLookupOk.ContainsKey($f.Project)) {
+            # The listing failed for this project: everything backup-derived is genuinely unknown.
+            Add-Member -InputObject $f -NotePropertyName HasBackup     -NotePropertyValue $null -Force
+            Add-Member -InputObject $f -NotePropertyName BackupXRegion -NotePropertyValue $null -Force
+            Add-Member -InputObject $f -NotePropertyName FilestoreBackupLocations -NotePropertyValue $null -Force
+            continue
+        }
+        $e = $fsByInstance["$($f.Project)|$($f.InstanceName)".ToLower()]
+        Add-Member -InputObject $f -NotePropertyName HasBackup     -NotePropertyValue ([bool]($e -and $e.Count -gt 0)) -Force
+        Add-Member -InputObject $f -NotePropertyName BackupXRegion -NotePropertyValue ([bool]($e -and $e.XRegion))     -Force
+        # A measured absence is the token 'None', never blank - blank means "not collected".
+        $fsLocs = $(if ($e -and $e.Locations.Count) { (($e.Locations | Sort-Object -Unique) -join ';') } else { 'None' })
+        Add-Member -InputObject $f -NotePropertyName FilestoreBackupLocations -NotePropertyValue $fsLocs -Force
     }
 
     # Backup for GKE. `gcloud container backup-restore` is beta-only today: on GA it fails with
@@ -2927,10 +2999,45 @@ if (-not $SkipResilienceReport -and -not $SkipDataProtection) {
                         -Level Warning -Source 'GKE' -Scope @{ Project = $p; Category = $(if ($r.ApiDisabled) { 'ApiDisabled' } else { 'LookupFailed' }) }
         }
     }
+    # Index plans by the CLUSTER they protect. Each plan carries
+    #   cluster = projects/{p}/locations/{loc}/clusters/{name}
+    #   name    = projects/{p}/locations/{loc}/backupPlans/{name}   <- the PLAN's own location
+    #
+    # Same defect as Filestore above and the same severity: HasBackupPlan was project-scoped, so one plan
+    # anywhere in a project marked EVERY cluster in it as protected and suppressed gke-backup (Critical) for
+    # every unprotected cluster alongside it.
+    $gkeByCluster = @{}
+    foreach ($p in $gkeBackups.Keys) {
+        foreach ($plan in @($gkeBackups[$p])) {
+            if (-not $plan -or -not $plan.cluster) { continue }
+            # A deactivated plan protects nothing.
+            if ("$($plan.state)" -eq 'DEACTIVATED' -or $plan.deactivated -eq $true) { continue }
+            $clName  = ($plan.cluster -split '/')[-1]
+            $clLoc   = $(if ($plan.cluster -match '/locations/([^/]+)/') { $Matches[1] } else { '' })
+            $planLoc = $(if ("$($plan.name)" -match '/locations/([^/]+)/') { $Matches[1] } else { '' })
+            $k = "$p|$clName".ToLower()
+            if (-not $gkeByCluster.ContainsKey($k)) { $gkeByCluster[$k] = @{ Count = 0; Locations = @() } }
+            $gkeByCluster[$k].Count++
+            if ($planLoc) { $gkeByCluster[$k].Locations += $planLoc }
+            # Plans are regional; a zonal cluster's location is us-central1-a. Normalise both ends.
+            $clRegion   = $clLoc   -replace '-[a-z]$', ''
+            $planRegion = $planLoc -replace '-[a-z]$', ''
+            if ($planRegion -and $clRegion -and ($planRegion -ne $clRegion)) { $gkeByCluster[$k].XRegion = $true }
+        }
+    }
     foreach ($g in @($invResults.GKEClusters)) {
         if (-not $g) { continue }
-        $hasPlan = if ($gkeLookupOk.ContainsKey($g.Project)) { [bool](@($gkeBackups[$g.Project]).Count -gt 0) } else { $null }
-        Add-Member -InputObject $g -NotePropertyName HasBackupPlan -NotePropertyValue $hasPlan -Force
+        if (-not $gkeLookupOk.ContainsKey($g.Project)) {
+            Add-Member -InputObject $g -NotePropertyName HasBackupPlan -NotePropertyValue $null -Force
+            Add-Member -InputObject $g -NotePropertyName BackupXRegion -NotePropertyValue $null -Force
+            Add-Member -InputObject $g -NotePropertyName GkeBackupPlanLocations -NotePropertyValue $null -Force
+            continue
+        }
+        $e = $gkeByCluster["$($g.Project)|$($g.ClusterName)".ToLower()]
+        Add-Member -InputObject $g -NotePropertyName HasBackupPlan -NotePropertyValue ([bool]($e -and $e.Count -gt 0)) -Force
+        Add-Member -InputObject $g -NotePropertyName BackupXRegion -NotePropertyValue ([bool]($e -and $e.XRegion))     -Force
+        $gkeLocs = $(if ($e -and $e.Locations.Count) { (($e.Locations | Sort-Object -Unique) -join ';') } else { 'None' })
+        Add-Member -InputObject $g -NotePropertyName GkeBackupPlanLocations -NotePropertyValue $gkeLocs -Force
     }
 
     # Evaluate each resource type; append Ctl_*/ResilienceScore/ResilienceGaps columns onto the inventory rows.

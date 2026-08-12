@@ -39,24 +39,22 @@ $script:KnownUnwired = @{
     # from the vault posture read, deletion protection from resource locks, AKS KMS from SecurityProfile, AKS
     # backup from DataProtection backup instances, and Azure Files backup by attributing items already collected
     # to the individual share. Only GCP entries remain.
-    'GCP/pd-schedule'     = 'needs gcloud compute disks describe -> resourcePolicies (snapshot schedules)'
-    'GCP/pd-nodelete'     = 'needs the instance attachment autoDelete flag'
-    'GCP/fs-xregion'      = 'needs Filestore backup location vs instance location comparison'
-    'GCP/gke-xregion'     = 'needs Backup for GKE backup-plan region'
-    'GCP/gke-secretenc'   = 'needs GKE databaseEncryption (CMEK) from cluster describe'
-    'GCP/vm-backup'       = 'needs resourcePolicies (snapshot schedule) - distinct from snapshots merely existing'
-    'GCP/vm-immutable'    = 'needs snapshot/vault immutability, which GCP does not expose per-disk today'
-    # Found the moment GCP was wired into section [4]. DeletionProtection IS set in the GCP source - on Cloud SQL
-    # rows ($items) - so section [1] passed this control while VM rows never carried it and the control could
-    # never produce a verdict. CYBER_RESILIENCE_SIGNALS.md claims it is collected; it is not.
-    'GCP/vm-delprot'      = 'DeletionProtection is set on Cloud SQL rows but never on VM rows - collect it from the instances-list deletionProtection field already in the payload'
+    # Only three remain. Five entries that used to sit here - pd-nodelete, fs-xregion, gke-xregion,
+    # gke-secretenc and vm-delprot - were all collectable from fields ALREADY in payloads the script fetched
+    # and discarded, so they are now wired and their entries deleted. The staleness check below section [4]
+    # forces that deletion: leaving a fixed signal on this list fails the build.
+    'GCP/pd-schedule'     = 'needs the disk resourcePolicies (snapshot schedule) list. Could not confirm offline whether `gcloud compute disks list` already returns resourcePolicies; if it does this is free and should be collected. If it needs a per-disk describe, that is N extra calls per project. Verify with: gcloud compute disks list --format=json | grep resourcePolicies'
+    'GCP/vm-backup'       = 'same resourcePolicies read as pd-schedule - a snapshot SCHEDULE, deliberately distinct from snapshots merely existing (which pd-xregion/XRegionBackup already covers)'
+    'GCP/vm-immutable'    = 'GCP exposes no per-disk snapshot immutability. Backup and DR Service backup vaults do expose enforced retention, but that is a different resource model and not attributable to a disk row today'
 }
 <#
-    A BLIND SPOT worth writing down rather than discovering twice: GCP/pd-cmek is also dead on Disk rows, and
-    section [4] CANNOT catch it. CmkEncrypted reaches the $enriched escape hatch below because the GCP script
-    Add-Member's it onto BUCKET rows, and enrichment fields are accepted cloud-globally by design (see the
-    "floor, not a ceiling" note in section [4]). It is deliberately NOT listed above - an entry would be reported
-    stale, since section [1] sees the field as populated. The only remedy for pd-cmek is to collect it.
+    A BLIND SPOT worth recording, now closed but not by test pressure: GCP/pd-cmek was ALSO dead on Disk rows,
+    and section [4] could never have caught it. CmkEncrypted reaches the $enriched escape hatch because the GCP
+    script Add-Member's it onto BUCKET rows, and enrichment fields are accepted cloud-globally by design (see
+    the "floor, not a ceiling" note in section [4]). Nor could it be allow-listed - section [1] sees the field as
+    populated, so an entry would be reported stale. The only remedy was to collect it, which is now done from
+    diskEncryptionKey.kmsKeyName. Note that the row's existing `Encrypted` field could NOT have substituted: it
+    is true for a customer-SUPPLIED key (CSEK) as well as a customer-MANAGED one.
 #>
 
 # Every file that could populate a field on an inventory row. The control definitions themselves are excluded -
