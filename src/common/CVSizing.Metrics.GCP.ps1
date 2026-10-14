@@ -290,3 +290,60 @@ function Resolve-CVBqDatasetSize {
     }
     return [pscustomobject]@{ LogicalBytes = $null; TableCount = $count; LargestTable = ''; LargestTableBytes = $null; Status = 'NoDatapoint'; Note = 'No Cloud Monitoring datapoint (empty dataset, or created within the last few hours)' }
 }
+
+# ---------------------------------------------------------------------------------------------------------------
+# Failure reporting
+# ---------------------------------------------------------------------------------------------------------------
+
+function Get-CVGcpMonitoringFix {
+    <#
+      .SYNOPSIS  Classify a failed Monitoring query and name the one action that fixes it.
+      .DESCRIPTION A disabled API and a missing role both arrive as HTTP 403 PERMISSION_DENIED; only the message
+                   tells them apart ("Cloud Monitoring API has not been used in project N before or it is disabled").
+      .OUTPUTS   pscustomobject { Kind = ApiDisabled|PermissionDenied|Other; Fix }
+    #>
+    param([Parameter(Mandatory)][string]$ProjectId, [string]$ErrorText)
+    if ($ErrorText -match 'has not been used|is disabled|SERVICE_DISABLED|accessNotConfigured') {
+        return [pscustomobject]@{ Kind = 'ApiDisabled'; Fix = "gcloud services enable monitoring.googleapis.com --project $ProjectId" }
+    }
+    if ($ErrorText -match '\b403\b|PERMISSION_DENIED|[Pp]ermission denied') {
+        return [pscustomobject]@{ Kind = 'PermissionDenied'; Fix = "grant roles/monitoring.viewer (or Viewer) on $ProjectId" }
+    }
+    return [pscustomobject]@{ Kind = 'Other'; Fix = "$ErrorText" }
+}
+
+function Format-CVGcpMonitoringFailureReport {
+    <#
+      .SYNOPSIS  End-of-run lines explaining which projects have no bucket/BigQuery sizes, and how to fix each.
+      .DESCRIPTION Without this the only trace of a disabled Monitoring API was a per-project warning and a SizeStatus
+                   column: gcp_inventory_summary silently skips blank sizes, so its totals came out low with no
+                   explanation. A project failing for both Storage and BigQuery is listed once.
+      .PARAMETER Failures  rows { Service; Project; Error }
+      .OUTPUTS   string[] (empty when there are no failures)
+    #>
+    param($Failures, [int]$MaxPerGroup = 25)
+    $rows = @($Failures | Where-Object { $_ -and $_.Project })
+    if (-not $rows.Count) { return @() }
+    $byProject = $rows | Group-Object Project | ForEach-Object {
+        $first = $_.Group | Select-Object -First 1
+        $fix = Get-CVGcpMonitoringFix -ProjectId $_.Name -ErrorText $first.Error
+        [pscustomobject]@{ Project = $_.Name; Services = (($_.Group.Service | Sort-Object -Unique) -join '+'); Kind = $fix.Kind; Fix = $fix.Fix }
+    }
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add(("Bucket/BigQuery sizes are MISSING for {0} project(s): Cloud Monitoring could not be read. Their sizes are blank and the summary totals exclude them." -f @($byProject).Count))
+    $groups = @(
+        @{ Kind = 'ApiDisabled';      Cause = 'Cloud Monitoring API disabled';  Action = 'enable it, then re-run:' }
+        @{ Kind = 'PermissionDenied'; Cause = 'Permission denied';              Action = 'grant Monitoring Viewer (roles/monitoring.viewer) or Viewer, then re-run:' }
+        @{ Kind = 'Other';            Cause = 'Other errors';                   Action = 'see SizeNote in the bucket/BigQuery CSVs and the run log:' }
+    )
+    foreach ($g in $groups) {
+        $hits = @($byProject | Where-Object Kind -eq $g.Kind | Sort-Object Project)
+        if (-not $hits.Count) { continue }
+        $lines.Add(("  {0} ({1} project(s)) - {2}" -f $g.Cause, $hits.Count, $g.Action))
+        foreach ($h in ($hits | Select-Object -First $MaxPerGroup)) {
+            $lines.Add($(if ($g.Kind -eq 'ApiDisabled') { "    $($h.Fix)" } else { "    $($h.Project) [$($h.Services)]: $($h.Fix)" }))
+        }
+        if ($hits.Count -gt $MaxPerGroup) { $lines.Add(("    ... and {0} more (full list in gcp_project_status_storage/bigquery CSVs)" -f ($hits.Count - $MaxPerGroup))) }
+    }
+    return @($lines)
+}

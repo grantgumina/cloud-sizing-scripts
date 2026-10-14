@@ -142,6 +142,28 @@ Assert-CV 'location kept'                 $list.Datasets[1].Location 'europe-wes
 $noDs = Get-CVBqDatasetList -ProjectId 'proj-a' -Fetch { [pscustomobject]@{ kind = 'bigquery#datasetList' } }
 Assert-CV 'project with no datasets'      $noDs.Datasets.Count 0
 
+Write-Host "`n[7] Monitoring failures: classified, de-duplicated, and each given its fix"
+$disabled = 'HTTP 403 PERMISSION_DENIED: Cloud Monitoring API has not been used in project 123 before or it is disabled. Enable it by visiting https://console.developers.google.com/apis/api/monitoring.googleapis.com/overview?project=123'
+$denied   = 'HTTP 403 PERMISSION_DENIED: Permission denied (or the resource may not exist).'
+Assert-CV 'disabled API classified'       (Get-CVGcpMonitoringFix -ProjectId 'p1' -ErrorText $disabled).Kind 'ApiDisabled'
+Assert-CV 'disabled API fix is the enable command' (Get-CVGcpMonitoringFix -ProjectId 'p1' -ErrorText $disabled).Fix 'gcloud services enable monitoring.googleapis.com --project p1'
+Assert-CV 'plain 403 is PermissionDenied' (Get-CVGcpMonitoringFix -ProjectId 'p2' -ErrorText $denied).Kind 'PermissionDenied'
+Assert-CV 'other error is Other'          (Get-CVGcpMonitoringFix -ProjectId 'p3' -ErrorText 'HTTP 500 INTERNAL: boom').Kind 'Other'
+Assert-CV 'no failures -> no lines'       @(Format-CVGcpMonitoringFailureReport -Failures @()).Count 0
+$fails = @(
+    [pscustomobject]@{ Service = 'Storage';  Project = 'p1'; Error = $disabled }
+    [pscustomobject]@{ Service = 'BigQuery'; Project = 'p1'; Error = $disabled }
+    [pscustomobject]@{ Service = 'BigQuery'; Project = 'p2'; Error = $denied }
+)
+$rep = @(Format-CVGcpMonitoringFailureReport -Failures $fails)
+Assert-CV 'headline counts distinct projects' ($rep[0] -match 'MISSING for 2 project') $true
+Assert-CV 'enable command listed once for p1' @($rep | Where-Object { $_ -match 'services enable monitoring.googleapis.com --project p1' }).Count 1
+Assert-CV 'permission group names p2 + service' (@($rep | Where-Object { $_ -match 'p2 \[BigQuery\]' }).Count) 1
+$many = @(1..30 | ForEach-Object { [pscustomobject]@{ Service = 'Storage'; Project = "proj-$_"; Error = $disabled } })
+$capped = @(Format-CVGcpMonitoringFailureReport -Failures $many -MaxPerGroup 25)
+Assert-CV 'long lists are capped'         @($capped | Where-Object { $_ -match 'services enable' }).Count 25
+Assert-CV 'cap says how many more'        ([bool]($capped | Where-Object { $_ -match 'and 5 more' })) $true
+
 Write-Host ("`n======  {0} passed, {1} failed  ======`n" -f $script:Pass, $script:Fail) `
            -ForegroundColor $(if ($script:Fail) { 'Red' } else { 'Green' })
 if ($script:Fail) { exit 1 }

@@ -123,6 +123,11 @@ Each bucket and dataset row carries `SizeSource`, `SizeStatus` and `SizeNote`. A
 - `NotYetMeasured` / `NoDatapoint` — too new to have been measured, or no datapoint; size blank.
 - `Error` — the Monitoring query failed for that project (for example, the Cloud Monitoring API is disabled or permission is denied); size blank, reason in `SizeNote`.
 
+If Cloud Monitoring cannot be read for a project (API disabled, or no permission), its buckets and datasets are still listed with blank sizes, and:
+
+- `gcp_project_status_storage_<ts>.csv` and the new `gcp_project_status_bigquery_<ts>.csv` show `SizeStatus = Error` with the reason in `SizeError`, and a blank (not 0) total for that project. `Status` there still describes listing only.
+- The end of the run prints which projects are affected, grouped by cause, with the fix for each — for a disabled API, `gcloud services enable monitoring.googleapis.com --project <id>`. The `gcp_inventory_summary` totals exclude those projects' sizes.
+
 Permissions: **Viewer** already includes `monitoring.timeSeries.list` and `bigquery.datasets.get`. With custom roles, grant **Monitoring Viewer** (`roles/monitoring.viewer`) and **BigQuery Metadata Viewer** (`roles/bigquery.metadataViewer`). The `gcp_inventory_summary` BigQuery row is now labelled `BigQuery Dataset (logical)`; it previously summed physical bytes.
 - `gcp_resilience_signals_<ts>.csv` *(unless `-SkipResilienceReport`)* — raw cyber-resilience signal values; the backend applies the thresholds. A blank cell means **not collected**, never "no", and the `*DataStatus` columns say why. See [CYBER_RESILIENCE_SIGNALS.md](../CYBER_RESILIENCE_SIGNALS.md).
 - `gcp_cloudrewind_*.csv` *(unless `-SkipCloudRewind`)* — billable-resource sizing.

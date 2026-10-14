@@ -205,6 +205,11 @@ if ($cvMissing.Count) {
 }
 foreach ($cvFile in $cvRequired) { . (Join-Path $cvCommonDir $cvFile) }
 
+# Projects whose Cloud Monitoring read failed (Storage and/or BigQuery), reported with a fix at the end of the run,
+# and per-project BigQuery status for gcp_project_status_bigquery_*.csv. Both paths run on this thread.
+$script:CVGcpMonitoringFailures = [System.Collections.Generic.List[psobject]]::new()
+$script:CVGcpBqProjectStatuses  = [System.Collections.Generic.List[psobject]]::new()
+
 # Normalize -Projects if provided as a single comma-separated string inside quotes
 if ($Projects -and $Projects.Count -eq 1 -and $Projects[0] -match ',') {
     $Projects = $Projects[0].Split(',') | ForEach-Object { $_.Trim() } | Where-Object { $_ }
@@ -1213,6 +1218,9 @@ function Get-GcpStorageInventory {
             PermissionIssue= if ($pr.PermissionIssue){'Y'} else {''}
             Success= if ($pr.PermissionIssue -or $pr.Error) { 'N' } else { 'Y' }
             Error = if ($pr.Error){ $pr.Error } else { '' }
+            # Set by Phase 2. NotQueried = no buckets to size (or listing failed).
+            SizeStatus = 'NotQueried'
+            SizeError  = ''
         }
     }
 
@@ -1238,12 +1246,15 @@ function Get-GcpStorageInventory {
     $byProject = $allBucketDescriptors | Group-Object Project
     Write-Log -Level INFO -Message ("[Buckets-Phase2] Sizing {0} buckets in {1} projects from Cloud Monitoring" -f $allBucketDescriptors.Count,$byProject.Count)
     $sized = [System.Collections.Generic.List[psobject]]::new(); $done=0; $totalProj=$byProject.Count; $sizeStart=[DateTime]::UtcNow
+    $sizeStatusByProject = @{}
     Start-CVProgress -Id 'bucket-sizing' -Activity 'Bucket Sizing'
     foreach ($grp in $byProject) {
         $now = [DateTime]::UtcNow
         $sizeMap = Get-CVGcsBucketSizeMap -ProjectId $grp.Name -AccessToken (Get-CVGcpAccessToken) -NowUtc $now
+        $sizeStatusByProject[$grp.Name] = $sizeMap
         if ($sizeMap.Status -ne 'Ok') {
             Write-CVLog "Cloud Monitoring bucket size query failed; sizes left blank: $($sizeMap.Error)" -Level Warning -Source 'Storage' -Scope @{ Project = $grp.Name }
+            $script:CVGcpMonitoringFailures.Add([pscustomobject]@{ Service = 'Storage'; Project = $grp.Name; Error = $sizeMap.Error })
         }
         foreach ($bd in $grp.Group) {
             $raw = $bd.Raw
@@ -1282,6 +1293,13 @@ function Get-GcpStorageInventory {
         Update-CVProgress -Id 'bucket-sizing' -Activity 'Bucket Sizing' -Status ("Projects {0}/{1} ({2}%) Buckets={3} ElapsedSec={4}" -f $done,$totalProj,$pct,$sized.Count,$elapsed) -PercentComplete $pct
     }
     Complete-CVProgress -Id 'bucket-sizing'
+
+    # Surface the Monitoring outcome in gcp_project_status_storage_*.csv. Status there only reflects LISTING, so a
+    # project whose sizes could not be read used to show Success with TotalSizeGB 0.
+    foreach ($st in $projectStatuses) {
+        $m = $sizeStatusByProject[("$($st.Project)").TrimEnd('*')]
+        if ($m) { $st.SizeStatus = $m.Status; $st.SizeError = $(if ($m.Error) { $m.Error } else { '' }) }
+    }
 
     $script:StorageProjectStatuses = $projectStatuses
     return @($sized)
@@ -1859,16 +1877,21 @@ function Get-GcpBigQueryDatasets {
         $Errors.Value.Add("Failed to list BigQuery datasets for ${ProjectId}: $($list.Error)")
         if (-not $Status.Value.Error) { $Status.Value.Error = 'bigquery-list-failed' }
         if ($list.Error -match '403|PERMISSION_DENIED') { $Status.Value.PermissionIssue = 'Y' }
+        $script:CVGcpBqProjectStatuses.Add([pscustomobject]@{ Project = $ProjectId; Status = 'Failed'; Error = $list.Error; DatasetCount = $null; TotalLogicalSizeGB = $null; SizeStatus = 'NotQueried'; SizeError = '' })
         return @($items)
     }
     Write-Log ("[DB][BigQuery] ({0}) DatasetCount={1}" -f $ProjectId,$list.Datasets.Count) -Level DEBUG
-    if ($list.Datasets.Count -eq 0) { Write-Log "[DB] ($ProjectId) End BigQuery" -Level DEBUG; return @($items) }
+    if ($list.Datasets.Count -eq 0) {
+        $script:CVGcpBqProjectStatuses.Add([pscustomobject]@{ Project = $ProjectId; Status = 'Success'; Error = ''; DatasetCount = 0; TotalLogicalSizeGB = 0; SizeStatus = 'NotQueried'; SizeError = '' })
+        Write-Log "[DB] ($ProjectId) End BigQuery" -Level DEBUG; return @($items)
+    }
 
     $sizeMap = Get-CVBqDatasetSizeMap -ProjectId $ProjectId -AccessToken $token
     if ($sizeMap.Status -ne 'Ok') {
         # Datasets are still reported - with blank sizes and a SizeNote - rather than as Error rows, which the
         # exports and the signals CSV drop. Knowing a dataset exists is worth keeping even when it cannot be sized.
         Write-CVLog "Cloud Monitoring BigQuery size query failed; sizes left blank: $($sizeMap.Error)" -Level Warning -Source 'BigQuery' -Scope @{ Project = $ProjectId }
+        $script:CVGcpMonitoringFailures.Add([pscustomobject]@{ Service = 'BigQuery'; Project = $ProjectId; Error = $sizeMap.Error })
     }
 
     foreach ($ds in $list.Datasets) {
@@ -1895,6 +1918,14 @@ function Get-GcpBigQueryDatasets {
             Error                    = ''
         })
     }
+
+    $sizeOk = ($sizeMap.Status -eq 'Ok')
+    $script:CVGcpBqProjectStatuses.Add([pscustomobject]@{
+        Project = $ProjectId; Status = 'Success'; Error = ''; DatasetCount = $items.Count
+        # Blank, not 0, when Monitoring could not be read - see the storage status CSV for the same rule.
+        TotalLogicalSizeGB = $(if ($sizeOk) { [math]::Round((($items | Measure-Object TotalLogicalSizeGB -Sum).Sum), 2) } else { $null })
+        SizeStatus = $sizeMap.Status; SizeError = $(if ($sizeMap.Error) { $sizeMap.Error } else { '' })
+    })
 
     Write-Log "[DB] ($ProjectId) End BigQuery" -Level DEBUG
     return @($items)
@@ -2956,6 +2987,11 @@ if ($Selected.DB -and $invResults.Databases -and (@($invResults.Databases)).Coun
         'Type,Project,Name,Region,Engine,StorageGB,TotalPhysicalSizeGB,TotalLogicalSizeGB,TableCount,LargestTable,LargestTablePhysicalGB,LargestTableLogicalGB,SizeSource,SizeStatus,SizeNote,Error' | Out-File -FilePath $bqCsv -Encoding utf8
     }
     Write-Host "gcp_bigquery_datasets_$dateStr.csv file has been written to $outDir" -ForegroundColor Cyan
+    if ($script:CVGcpBqProjectStatuses.Count -gt 0) {
+        $bqStatusCsv = Join-Path $outDir ("gcp_project_status_bigquery_" + $dateStr + ".csv")
+        $script:CVGcpBqProjectStatuses | Sort-Object Project | Export-Csv -Path $bqStatusCsv -NoTypeInformation
+        Write-Host "gcp_project_status_bigquery_$dateStr.csv file has been written to $outDir" -ForegroundColor Cyan
+    }
 
     # gcp_bigquery_tables_*.csv is no longer produced: per-table sizes came from one `bq show` per table, which is
     # what made BigQuery sizing take hours. Cloud Monitoring labels only the 100 largest tables per dataset; the
@@ -3106,9 +3142,12 @@ if ($script:StorageProjectStatuses) {
                             else                                                      { 'Unknown' } } },
                       BucketCount,
                       @{ n = 'TotalSizeGB'; e = {
+                            # Blank, not 0, when Cloud Monitoring could not be read: 0 would claim the project is empty.
+                            if ($_.SizeStatus -eq 'Error') { $null } else {
                             $grp = $bucketGroups | Where-Object Name -eq $_.Project
                             $bytes = if ($grp) { ($grp.Group | Measure-Object UsedCapacityBytes -Sum).Sum } else { 0 }
-                            if ($bytes) { [math]::Round($bytes / 1e9, 3) } else { 0 } } } |
+                            if ($bytes) { [math]::Round($bytes / 1e9, 3) } else { 0 } } } },
+                      SizeStatus, SizeError |
         Sort-Object Project |
         Export-Csv -Path $storageStatusCsv -NoTypeInformation
     Write-Host "gcp_project_status_storage_$dateStr.csv file has been written to $outDir" -ForegroundColor Cyan
@@ -3324,6 +3363,14 @@ if ($OutputFormat -eq "json" -or $OutputFormat -eq "both") {
 # Finalize log, then ZIP
 # -------------------------
 Update-CVProgress -Id 'output' -Activity "Generating Output Files" -Status "Finalizing log..." -PercentComplete 75
+# Projects with no bucket/BigQuery sizes, grouped by cause, each with the command or role that fixes it. Printed
+# before the summary so it lands in the transcript. Without it, gcp_inventory_summary silently under-reported.
+$monLines = @(Format-CVGcpMonitoringFailureReport -Failures $script:CVGcpMonitoringFailures)
+if ($monLines.Count) {
+    Write-CVLog $monLines[0] -Level Warning -Source 'Monitoring'
+    $monLines | Select-Object -Skip 1 | ForEach-Object { Write-Host $_ -ForegroundColor Yellow }
+}
+
 # Aggregated diagnostics summary (warning/error counts + which projects/services were skipped and why).
 Write-CVSummary -Title 'GCP Sizing Run Summary'
 Stop-Transcript | Out-Null   # end transcript (separate from detail log)
