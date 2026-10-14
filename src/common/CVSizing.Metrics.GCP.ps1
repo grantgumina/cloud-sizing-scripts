@@ -219,7 +219,9 @@ function Get-CVBqDatasetList {
       .OUTPUTS   pscustomobject { Status; Error; Datasets = List[psobject] { DatasetId; Location } }
     #>
     param([Parameter(Mandatory)][string]$ProjectId, [string]$AccessToken, [scriptblock]$Fetch)
-    $url = 'https://bigquery.googleapis.com/bigquery/v2/projects/{0}/datasets?all=true&maxResults=1000' -f $ProjectId
+    # No all=true: that adds BigQuery's hidden anonymous datasets (`_<hash>`, cached query results), which `bq ls`
+    # never listed and Cloud Monitoring does not track - each surfaced as a blank-size row.
+    $url = 'https://bigquery.googleapis.com/bigquery/v2/projects/{0}/datasets?maxResults=1000' -f $ProjectId
     $paged = Invoke-CVGcpRestPaged -Url $url -AccessToken $AccessToken -Fetch $Fetch
     $out = [pscustomobject]@{ Status = $paged.Status; Error = $paged.Error; Datasets = [System.Collections.Generic.List[psobject]]::new() }
     foreach ($page in $paged.Pages) {

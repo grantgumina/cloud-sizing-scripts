@@ -139,6 +139,9 @@ $list = Get-CVBqDatasetList -ProjectId 'proj-a' -Fetch $listFetch
 Assert-CV 'list ok'                       $list.Status 'Ok'
 Assert-CV 'both pages listed'             (($list.Datasets | ForEach-Object DatasetId) -join ',') 'a,b'
 Assert-CV 'location kept'                 $list.Datasets[1].Location 'europe-west2'
+$script:listUrl = $null
+$null = Get-CVBqDatasetList -ProjectId 'proj-a' -Fetch { param($u) $script:listUrl = $u; [pscustomobject]@{} }
+Assert-CV 'hidden datasets not requested'  ($script:listUrl -match 'all=true') $false
 $noDs = Get-CVBqDatasetList -ProjectId 'proj-a' -Fetch { [pscustomobject]@{ kind = 'bigquery#datasetList' } }
 Assert-CV 'project with no datasets'      $noDs.Datasets.Count 0
 
