@@ -10,7 +10,8 @@
 .DESCRIPTION
     - Inventories GCP Compute Engine VMs and Cloud Storage Buckets across all or specified projects.
     - Speeds up disk lookups by using a single project-wide disk list.
-    - Uses gsutil du -s for bucket sizing (fast).
+    - Sizes buckets and BigQuery datasets from Cloud Monitoring (one query per project, no object or table
+      enumeration). Bucket sizes are up to a day old; BigQuery sizes up to a few hours old, logical bytes only.
     - Produces summary with VM counts only and disk sizes without double-counting regional disks.
     - Regional disks: Zone is blank, sizes roll up at Region level only.
     - Transcript is closed before zipping so the full log is included in the archive.
@@ -44,7 +45,7 @@
                 - gcp_storage_buckets_info_*.csv              (bucket inventory)
                 - gcp_filestore_instances_*.csv, gcp_gke_clusters_*.csv, gcp_disk_snapshots_*.csv,
                   gcp_cloudsql_instances_*.csv, gcp_spanner_instances_*.csv, gcp_alloydb_clusters_*.csv,
-                  gcp_bigquery_datasets_*.csv, gcp_bigquery_tables_*.csv, and the GKE PV/PVC pair
+                  gcp_bigquery_datasets_*.csv, and the GKE PV/PVC pair
                 - gcp_resilience_signals_*.csv                (unless -SkipResilienceReport)
                 - gcp_sizing_*.json                           (only with -OutputFormat json|both)
 
@@ -61,7 +62,7 @@
         The per-run Output folder is kept alongside the ZIP; nothing is deleted.
 
 .NOTES
-    Requires Google Cloud SDK (gcloud CLI and gsutil) installed and authenticated.
+    Requires Google Cloud SDK (gcloud CLI) installed and authenticated.
     Must be run by a user with appropriate GCP permissions.
 
 
@@ -191,6 +192,7 @@ $cvRequired  = @(
     'CVSizing.Kubectl.ps1'          # cross-platform kubectl provisioning
     'CVSizing.CloudRewind.ps1'      # provider-neutral Cloud Rewind engine
     'CVSizing.CloudRewind.GCP.ps1'  # GCP billable taxonomy (derived)
+    'CVSizing.Metrics.GCP.ps1'      # Cloud Monitoring reads for bucket and BigQuery sizing
 )
 $cvMissing = @($cvRequired | Where-Object { -not (Test-Path -LiteralPath (Join-Path $cvCommonDir $_) -PathType Leaf) })
 if ($cvMissing.Count) {
@@ -256,9 +258,10 @@ if (-not (Get-Variable -Name ChildLogQueue -Scope Global -ErrorAction SilentlyCo
 $peek = Get-CVConsoleCapability -NonInteractive:$NonInteractive -Quiet:$Quiet
 $fatalModules = @()
 if (-not $peek.IsHeadless) { $fatalModules += 'PwshSpectreConsole' }
-# Highly opinionated: require the CLIs needed for broad discovery (gcloud + gsutil for buckets + bq for BigQuery).
+# Highly opinionated: require the CLI needed for broad discovery. gsutil and bq are no longer needed: buckets and
+# BigQuery are sized from Cloud Monitoring over REST (common/CVSizing.Metrics.GCP.ps1).
 # kubectl stays optional only because the script auto-provisions it (Ensure-Kubectl) for GKE when absent.
-Assert-CVPreflight -FatalModules $fatalModules -FatalCommands @('gcloud','gsutil','bq') `
+Assert-CVPreflight -FatalModules $fatalModules -FatalCommands @('gcloud') `
                    -OptionalCommands @{ 'GKE inventory (kubectl)' = 'kubectl' } `
                    -ExitOnFatal | Out-Null
 
@@ -608,8 +611,8 @@ function Write-Log {
     )
     $ts = (Get-Date).ToString('s')
     $line = "[$ts] [$Level] $Message"
-    # Preserve the global queue: the BigQuery/Fileshare CSV reconstruction reads these lines later
-    # (e.g. [DB][BigQuery][Table-Info] at ~line 2700). Do NOT remove this enqueue.
+    # Preserve the global queue: CSV reconstruction has read these lines back (BigQuery's per-table CSV did, until
+    # BigQuery moved to Cloud Monitoring). Do NOT remove this enqueue without checking for other readers.
     if (-not (Get-Variable -Name ChildLogQueue -Scope Global -ErrorAction SilentlyContinue)) {
         $Global:ChildLogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
     }
@@ -1146,117 +1149,6 @@ function Get-GcpVMInventory {
     }
 }
 
-
-
-
-# MultiThreading - Script Blocks for Bucket sizing
-$bucketSizingScriptBlock = {
-    param($projectName, $bucket, $minimalFlag, $workerLogQueue)
-        # Runspace-local logger. The parent's Write-Log is NOT in scope here: the pool is built from
-        # [InitialSessionState]::CreateDefault() and .AddScript() re-parses only this block's text, so every
-        # Write-Log call inside this worker threw CommandNotFoundException instead of emitting its warning -
-        # meaning every bucket whose gsutil du failed produced a confusing crash instead of "size unavailable".
-        # Enqueue plain strings and let the parent replay them via Receive-CVWorkerRecords, which already accepts
-        # raw strings for exactly this case.
-        function Write-Log {
-            param([string]$Message, [string]$Level = 'INFO')
-            if ($workerLogQueue) { $workerLogQueue.Enqueue("[$Level] $Message") }
-        }
-        # -------------------------
-        # Bucket sizing helper
-        # Strategy:
-        # 1. Fast path: gsutil du -s (handles large buckets, avoids enumerating every object)
-        # 2. Fallback: gcloud storage objects list + sum sizes (only if du fails or returns nothing)
-        # 3. If both fail -> 0 with warning
-        # -------------------------
-        function Get-BucketSizeBytes {
-            param(
-                [Parameter(Mandatory)][string]$BucketName,
-                [Parameter(Mandatory)][string]$Project
-            )
-            
-            # Attempt gsutil du -s
-            try {
-                $du = gsutil du -s "gs://$BucketName" 2>$null
-                if ($LASTEXITCODE -eq 0 -and $du) {
-                    $firstField = ($du -split '\s+')[0]
-                    if ($firstField -match '^[0-9]+$') {
-                        return [int64]$firstField
-                    }
-                }
-            } catch {
-                Write-Log -Level WARN -Message ("gsutil du failed for {0} in {1}: {2}" -f $BucketName, $Project, ($_.Exception.Message))
-            }
-            # Fallback (can be slow for very large buckets): enumerate objects.
-            $sizeBytes = 0
-            try {
-                $sizes = gcloud --quiet storage objects list "gs://$BucketName" --project $Project --format="value(size)" 2>$null
-                # $LASTEXITCODE, captured BEFORE anything else can clobber it, is the whole point. Without it a
-                # 403 or a throttled listing produced an empty $sizes, the loop added nothing, and 0 was returned
-                # as though measured. An EMPTY bucket also yields no output - but with exit code 0 - so the code
-                # is the only thing that separates "nothing in it" from "we were not allowed to look".
-                $listExit = $LASTEXITCODE
-                if ($listExit -eq 0) {
-                    foreach ($s in $sizes) { if ($s -match '^[0-9]+$') { $sizeBytes += [int64]$s } }
-                    return [int64]$sizeBytes
-                }
-                Write-Log -Level WARN -Message ("Object enumeration for {0} in {1} exited {2}; size is UNKNOWN, not 0." -f $BucketName, $Project, $listExit)
-            } catch {
-                Write-Log -Level WARN -Message ("Fallback object enumeration failed for {0} in {1}: {2}" -f $BucketName, $Project, ($_.Exception.Message))
-            }
-            # Neither path succeeded. $null, never 0: a 0 here is indistinguishable from an empty bucket and
-            # understates the customer's estate. The caller leaves the size cells blank, which is this repo's
-            # single meaning for "not collected". This WARN used to be unreachable, because the fallback's
-            # `return` sat inside the try and ran on every path.
-            Write-Log -Level WARN -Message ("Unable to determine size for bucket {0} in {1}; reporting UNKNOWN." -f $BucketName, $Project)
-            return $null
-        }
-
-        $bucketName = $bucket.name
-        
-        # Get Bucket size in Bytes
-        $sizeBytes = Get-BucketSizeBytes -BucketName $bucketName -Project $projectName
-    if (-not $minimalFlag) { Write-Host ("[Sizing] Bucket: {0} | Project={1} | SizeBytes={2}" -f $bucketName, $projectName, $(if ($null -eq $sizeBytes) { 'UNKNOWN' } else { $sizeBytes })) -ForegroundColor DarkGray }
-        
-        # Precise size conversions (binary vs decimal) with more precision.
-        # $null means the size could not be determined (see Get-BucketSizeBytes). It must NOT be cast to
-        # [int64], which would silently make it 0 and republish the fabricated zero this fix removes. Every
-        # size cell stays $null so the CSV shows blank, and the rollup's Measure-CVSum skips the row.
-        $sizeUnknown = ($null -eq $sizeBytes)
-        $bytes = if ($sizeUnknown) { $null } else { [int64]$sizeBytes }
-        $GiBBytes = 1GB              # 1,073,741,824
-        $MiBBytes = 1MB              # 1,048,576
-        $TiBBytes = $GiBBytes * 1024 # 1,099,511,627,776
-        $GBDecimalDivisor = 1e9
-        $MBDecimalDivisor = 1e6
-        $TBDecimalDivisor = 1e12
-        $sizeMiB     = if ($sizeUnknown) { $null } elseif ($bytes -gt 0) { [math]::Round($bytes / $MiBBytes, 3) } else { 0 }
-        $sizeGiB     = if ($sizeUnknown) { $null } elseif ($bytes -gt 0) { [math]::Round($bytes / $GiBBytes, 4) } else { 0 }
-        $sizeTiB     = if ($sizeUnknown) { $null } elseif ($bytes -gt 0) { [math]::Round($bytes / $TiBBytes, 6) } else { 0 }
-        $sizeMBDec   = if ($sizeUnknown) { $null } elseif ($bytes -gt 0) { [math]::Round($bytes / $MBDecimalDivisor, 3) } else { 0 }
-        $sizeGBDec   = if ($sizeUnknown) { $null } elseif ($bytes -gt 0) { [math]::Round($bytes / $GBDecimalDivisor, 4) } else { 0 }
-        $sizeTBDec   = if ($sizeUnknown) { $null } elseif ($bytes -gt 0) { [math]::Round($bytes / $TBDecimalDivisor, 6) } else { 0 }
-        
-        # Named, not `return [PSCustomObject]@{...}`: Get-CVBuilderFields in the wiring test extracts signal
-        # fields from ASSIGNMENTS to a named builder variable. A bare return yields zero fields, which would
-        # make Storage's per-resource-type check silently vacuous - the same defect AKS = 'aksObj' had.
-        $bucketObj = [PSCustomObject]@{
-            StorageBucket       = $bucket.name
-            Project             = $projectName
-            Location            = $bucket.location
-            StorageClass        = $bucket.storageClass
-            UsedCapacityBytes   = $bytes
-            UsedCapacityMiB     = $sizeMiB
-            UsedCapacityGiB     = $sizeGiB
-            UsedCapacityTiB     = $sizeTiB
-            UsedCapacityMBDec   = $sizeMBDec
-            UsedCapacityGB      = $sizeGBDec
-            UsedCapacityTB      = $sizeTBDec
-        }
-        return $bucketObj
-    }
-
-
 # -------------------------
 # Storage Inventory (fast, gcloud-only)
 # -------------------------
@@ -1339,57 +1231,60 @@ function Get-GcpStorageInventory {
         return @()
     }
 
-    # Phase 2: Concurrent sizing of all buckets globally
-    $maxBucketThreads = [Math]::Min(10,[Math]::Max(1,$allBucketDescriptors.Count))
-    Write-Log -Level INFO -Message ("[Buckets-Phase2] Sizing {0} buckets with maxThreads={1}" -f $allBucketDescriptors.Count,$maxBucketThreads)
-    $iss2 = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-    $pool2 = [RunspaceFactory]::CreateRunspacePool(1,$maxBucketThreads,$iss2,$Host); $pool2.Open()
-    $bucketRunspaces=@(); $index=0
-    # Thread-safe queue the workers log into; drained on the parent thread after the pool completes. Passing the
-    # queue by argument keeps runspace safety by construction - the workers never touch $Host or the console layer.
-    $bucketLogQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
-    foreach ($bd in $allBucketDescriptors) {
-        $index++
-        $ps=[PowerShell]::Create().AddScript($bucketSizingScriptBlock).AddArgument($bd.Project).AddArgument([PSCustomObject]@{ name=$bd.Name; location=$bd.Location; storageClass=$bd.StorageClass }).AddArgument($MinimalOutput).AddArgument($bucketLogQueue)
-        $ps.RunspacePool=$pool2
-        $bucketRunspaces += [PSCustomObject]@{ PS=$ps; Handle=$ps.BeginInvoke(); Project=$bd.Project; Bucket=$bd.Name }
-    }
-    $sized=@(); $done=0; $totalBuckets=$bucketRunspaces.Count; $sizeStart=[DateTime]::UtcNow
+    # Phase 2: size every bucket from Cloud Monitoring - ONE query per project, regardless of object count.
+    # This replaced `gsutil du -s` per bucket, which lists every object 1,000 at a time; a single bucket with
+    # 100M objects held a sizing slot for many hours, and the declared -BucketSizingTimeoutSec was never enforced.
+    # Trade-off: storage/v2/total_bytes is measured once a day, so sizes can be up to a day old.
+    $byProject = $allBucketDescriptors | Group-Object Project
+    Write-Log -Level INFO -Message ("[Buckets-Phase2] Sizing {0} buckets in {1} projects from Cloud Monitoring" -f $allBucketDescriptors.Count,$byProject.Count)
+    $sized = [System.Collections.Generic.List[psobject]]::new(); $done=0; $totalProj=$byProject.Count; $sizeStart=[DateTime]::UtcNow
     Start-CVProgress -Id 'bucket-sizing' -Activity 'Bucket Sizing'
-    while ($bucketRunspaces.Count -gt 0) {
-        $next=@()
-        foreach ($br in $bucketRunspaces) {
-            if ($br.Handle.IsCompleted) {
-                # One bucket per runspace: unwrap so the property reads below hit the object, not the collection.
-                try { $res=Get-CVRunspaceResult $br.PS.EndInvoke($br.Handle) } catch { $res=$null; Write-CVLog "Bucket sizing failed" -Level Error -Source 'Storage' -Scope @{ Project = $br.Project; Bucket = $br.Bucket } -Exception $_ }
-                if ($res) {
-                    $sized += $res
-                    Write-Host ("Bucket={0} Project={1} Location={2} SizeGB={3}" -f $res.StorageBucket,$res.Project,$res.Location,$res.UsedCapacityGB) -ForegroundColor Cyan
-                }
-                $done++
-            } else { $next += $br }
+    foreach ($grp in $byProject) {
+        $now = [DateTime]::UtcNow
+        $sizeMap = Get-CVGcsBucketSizeMap -ProjectId $grp.Name -AccessToken (Get-CVGcpAccessToken) -NowUtc $now
+        if ($sizeMap.Status -ne 'Ok') {
+            Write-CVLog "Cloud Monitoring bucket size query failed; sizes left blank: $($sizeMap.Error)" -Level Warning -Source 'Storage' -Scope @{ Project = $grp.Name }
         }
-        $bucketRunspaces=$next
-        $pct = if ($totalBuckets -gt 0) { [math]::Round(($done/$totalBuckets)*100,1) } else { 100 }
+        foreach ($bd in $grp.Group) {
+            $raw = $bd.Raw
+            # gcloud storage's standardized JSON is snake_case; the API's raw shape is camelCase. Accept either.
+            $created = if ($raw.PSObject.Properties['creation_time']) { $raw.creation_time } elseif ($raw.PSObject.Properties['timeCreated']) { $raw.timeCreated } else { $null }
+            $r = Resolve-CVGcsBucketSize -BucketName $bd.Name -SizeMap $sizeMap -CreatedUtc $created -NowUtc $now
+            # $null means not measured (see Resolve-CVGcsBucketSize). It must not be cast to [int64], which would
+            # make it 0; every size cell stays $null so the CSV shows blank and the rollup's Measure-CVSum skips it.
+            $bytes = $r.Bytes
+            $known = ($null -ne $bytes)
+            # Named, not `return [PSCustomObject]@{...}`: Get-CVBuilderFields in the wiring test extracts signal
+            # fields from ASSIGNMENTS to a named builder variable.
+            $bucketObj = [PSCustomObject]@{
+                StorageBucket       = $bd.Name
+                Project             = $bd.Project
+                Location            = $bd.Location
+                StorageClass        = $(if ($bd.StorageClass) { $bd.StorageClass } elseif ($raw.PSObject.Properties['default_storage_class']) { $raw.default_storage_class } else { $null })
+                UsedCapacityBytes   = $bytes
+                UsedCapacityMiB     = $(if ($known) { [math]::Round($bytes / 1MB, 3) })
+                UsedCapacityGiB     = $(if ($known) { [math]::Round($bytes / 1GB, 4) })
+                UsedCapacityTiB     = $(if ($known) { [math]::Round($bytes / 1TB, 6) })
+                UsedCapacityMBDec   = $(if ($known) { [math]::Round($bytes / 1e6, 3) })
+                UsedCapacityGB      = $(if ($known) { [math]::Round($bytes / 1e9, 4) })
+                UsedCapacityTB      = $(if ($known) { [math]::Round($bytes / 1e12, 6) })
+                NoncurrentVersionBytes = $r.NoncurrentBytes
+                SizeSource          = 'CloudMonitoring:storage/v2/total_bytes'
+                SizeStatus          = $r.Status
+                SizeNote            = $r.Note
+            }
+            $sized.Add($bucketObj)
+            if (-not $MinimalOutput) { Write-Host ("Bucket={0} Project={1} Location={2} SizeGB={3} ({4})" -f $bucketObj.StorageBucket,$bucketObj.Project,$bucketObj.Location,$(if ($known) { $bucketObj.UsedCapacityGB } else { 'UNKNOWN' }),$r.Status) -ForegroundColor Cyan }
+        }
+        $done++
+        $pct = if ($totalProj -gt 0) { [math]::Round(($done/$totalProj)*100,1) } else { 100 }
         $elapsed = [math]::Round(([DateTime]::UtcNow - $sizeStart).TotalSeconds,1)
-        $elapsedMin = [math]::Round($elapsed/60,2)
-        $totalBytes = ($sized | Measure-Object UsedCapacityBytes -Sum).Sum
-        $totalGB = if ($totalBytes) { [math]::Round($totalBytes/1e9,3) } else { 0 }
-        Update-CVProgress -Id 'bucket-sizing' -Activity 'Bucket Sizing' -Status ("Buckets {0}/{1} ({2}%) SizedGB={3} ElapsedSec={4} ElapsedMin={5}" -f $done,$totalBuckets,$pct,$totalGB,$elapsed,$elapsedMin) -PercentComplete $pct
-        if ($bucketRunspaces.Count -gt 0) { Start-Sleep -Milliseconds 200 }
+        Update-CVProgress -Id 'bucket-sizing' -Activity 'Bucket Sizing' -Status ("Projects {0}/{1} ({2}%) Buckets={3} ElapsedSec={4}" -f $done,$totalProj,$pct,$sized.Count,$elapsed) -PercentComplete $pct
     }
     Complete-CVProgress -Id 'bucket-sizing'
-    $pool2.Close(); $pool2.Dispose()
-
-    # Replay the workers' log lines on the parent thread, where the console layer actually exists.
-    $bucketLogLine = $null
-    while ($bucketLogQueue.TryDequeue([ref]$bucketLogLine)) {
-        $lvl = if ($bucketLogLine -match '^\[(WARN|ERROR|DEBUG|INFO)\]') { $Matches[1] } else { 'INFO' }
-        Write-Log -Level $lvl -Message ($bucketLogLine -replace '^\[(WARN|ERROR|DEBUG|INFO)\]\s*', '')
-    }
 
     $script:StorageProjectStatuses = $projectStatuses
-    return $sized
+    return @($sized)
 }
 
 # -------------------------
@@ -1936,6 +1831,19 @@ function Get-GcpSpannerInstances {
 }
 
 function Get-GcpBigQueryDatasets {
+    <#
+        One row per dataset, sized from Cloud Monitoring: a REST dataset list plus two Monitoring queries per
+        project, regardless of table count.
+
+        This replaced `bq ls` per dataset followed by `bq show` per TABLE - a separate Python process each, around
+        a second apiece, with projects processed one at a time. Its INFORMATION_SCHEMA.TABLE_STORAGE "bulk" path was
+        qualified per dataset, which that view does not support (it requires a region qualifier), so it always failed
+        and fell back to per-table calls. Estates with tens of thousands of tables took hours.
+
+        Trade-offs: storage/stored_bytes is LOGICAL bytes, sampled every 30 min and visible up to 3h later.
+        Physical bytes are not available from Monitoring, so TotalPhysicalSizeGB and LargestTablePhysicalGB are
+        blank (not collected). The per-table CSV is gone: Monitoring labels only the 100 largest tables per dataset.
+    #>
     param(
         [string]$ProjectId,
         [ref]$Errors,
@@ -1943,279 +1851,53 @@ function Get-GcpBigQueryDatasets {
     )
 
     Write-Log "[DB] ($ProjectId) Start BigQuery" -Level DEBUG
-    $items = @()
-    $bqCmdPresent = $true
+    $items = [System.Collections.Generic.List[psobject]]::new()
+    $token = Get-CVGcpAccessToken
 
-    if (-not (Get-Command bq -ErrorAction SilentlyContinue)) {
-        $bqCmdPresent = $false
+    $list = Get-CVBqDatasetList -ProjectId $ProjectId -AccessToken $token
+    if ($list.Status -ne 'Ok') {
+        $Errors.Value.Add("Failed to list BigQuery datasets for ${ProjectId}: $($list.Error)")
+        if (-not $Status.Value.Error) { $Status.Value.Error = 'bigquery-list-failed' }
+        if ($list.Error -match '403|PERMISSION_DENIED') { $Status.Value.PermissionIssue = 'Y' }
+        return @($items)
+    }
+    Write-Log ("[DB][BigQuery] ({0}) DatasetCount={1}" -f $ProjectId,$list.Datasets.Count) -Level DEBUG
+    if ($list.Datasets.Count -eq 0) { Write-Log "[DB] ($ProjectId) End BigQuery" -Level DEBUG; return @($items) }
+
+    $sizeMap = Get-CVBqDatasetSizeMap -ProjectId $ProjectId -AccessToken $token
+    if ($sizeMap.Status -ne 'Ok') {
+        # Datasets are still reported - with blank sizes and a SizeNote - rather than as Error rows, which the
+        # exports and the signals CSV drop. Knowing a dataset exists is worth keeping even when it cannot be sized.
+        Write-CVLog "Cloud Monitoring BigQuery size query failed; sizes left blank: $($sizeMap.Error)" -Level Warning -Source 'BigQuery' -Scope @{ Project = $ProjectId }
     }
 
-    if (-not $bqCmdPresent) {
-        $Errors.Value.Add("bq CLI not found for $ProjectId (skipping BigQuery)")
-        if (-not $Status.Value.Error) { $Status.Value.Error = 'bq-cli-missing' }
-        return $items
-    }
-
-    $bqJson = & bq --project_id=$ProjectId ls --format=json 2>$null
-
-    if ($LASTEXITCODE -ne 0 -or -not $bqJson) {
-        $Errors.Value.Add("Failed to list BigQuery datasets for $ProjectId")
-        return $items
-    }
-
-    $bqDatasets = $null
-    try { $bqDatasets = $bqJson | ConvertFrom-Json } catch {}
-
-    $datasetList = @($bqDatasets | Where-Object { $_ })
-    $datasetTotal = $datasetList.Count
-    Write-Log ("[DB][BigQuery] ({0}) DatasetCount={1}" -f $ProjectId,$datasetTotal) -Level DEBUG
-    $dsIndex = 0
-
-    foreach ($ds in $datasetList) {
-        $dsIndex++
-        $datasetId = $ds.datasetReference.datasetId
-        $region = $ds.location
-        $totalLogicalBytes = 0
-        $totalPhysicalBytes = 0
-        $largestPhysicalBytes = 0
-        $largestLogicalBytesForLargestPhysical = 0
-        $largestTableName = ''
-        $pctDs = if ($datasetTotal -gt 0) { [int](($dsIndex/[double]$datasetTotal)*100) } else { 100 }
-        Update-CVProgress -Id 'bq-datasets' -Activity ("BigQuery Datasets $ProjectId") -Status ("Dataset {0}/{1} ({2}%) - {3}" -f $dsIndex,$datasetTotal,$pctDs,$datasetId) -PercentComplete $pctDs -ParentId 'db-projects'
-        Write-Log ("[DB][BigQuery] ({0}) DatasetStart {1} ({2}/{3})" -f $ProjectId,$datasetId,$dsIndex,$datasetTotal) -Level DEBUG
-
-        # List tables in dataset (handle both array output and object with 'tables' + pagination)
-        $tables = New-Object System.Collections.Generic.List[psobject]
-        $pageToken = $null; $listAttempt = 0; $fetchedPages = 0
-        do {
-            $listAttempt++
-            # Build bq ls command safely (avoid quoting issues and Invoke-Expression)
-            $cmdArgs = @("--project_id=$ProjectId","ls","--dataset_id=$datasetId","-n","100000","--format=json")
-            if ($pageToken) { $cmdArgs += "--page_token=$pageToken" }
-            $tableListJson = & bq @cmdArgs 2>$null
-            if ($LASTEXITCODE -ne 0 -or -not $tableListJson) { break }
-            try {
-                $parsed = $tableListJson | ConvertFrom-Json
-                if ($parsed -is [System.Collections.IEnumerable] -and -not ($parsed.PSObject.Properties['tables'])) {
-                    foreach ($t in ($parsed | Where-Object { $_ })) { $tables.Add($t) }
-                    $pageToken = $null
-                } elseif ($parsed.PSObject.Properties['tables']) {
-                    foreach ($t in (@($parsed.tables) | Where-Object { $_ })) { $tables.Add($t) }
-                    if ($parsed.PSObject.Properties['nextPageToken'] -and $parsed.nextPageToken) { $pageToken = $parsed.nextPageToken } else { $pageToken = $null }
-                } else {
-                    $tables.Add($parsed) | Out-Null; $pageToken = $null
-                }
-                $fetchedPages++
-            } catch {
-                $Errors.Value.Add(("Failed to parse table list JSON for {0}:{1} (attempt {2})" -f $ProjectId,$datasetId,$listAttempt))
-                break
-            }
-        } while ($pageToken)
-        if ($tables.Count -eq 0 -and $LASTEXITCODE -ne 0) { $Errors.Value.Add(("Failed to list tables in dataset {0}:{1}" -f $ProjectId,$datasetId)) }
-        $tableTotal = $tables.Count
-        Write-Log ("[DB][BigQuery] ({0}) Dataset={1} TableListPages={2} RawCount={3}" -f $ProjectId,$datasetId,$fetchedPages,$tableTotal) -Level DEBUG
-        $tblIndex = 0
-    if ($tableTotal -gt 0) { Write-Log ("[DB][BigQuery] ({0}) Dataset={1} TableCount={2}" -f $ProjectId,$datasetId,$tableTotal) -Level DEBUG }
-
-    # --- Lightweight table metadata retrieval (default parallel ON, capped low) ---
-    # Strategy:
-    #   1. Try bulk INFORMATION_SCHEMA for large datasets (threshold configurable)
-    #   2. If bulk fails or below threshold, fetch per-table metadata with at most $MaxBigQueryTableThreads active
-    #   3. Adaptive throttle if free RAM < 1.5 GB (drop to 2 threads)
-    # Parallel is ENABLED by default (can be turned off via -DisableBigQueryParallelTables)
-    $tableResults = @()
-    $maxThreads = if (Get-Variable -Name MaxBigQueryTableThreads -Scope Script -ErrorAction SilentlyContinue) { [int]$script:MaxBigQueryTableThreads } else { 5 }
-    if ($maxThreads -lt 1) { $maxThreads = 1 }
-    if ($tableTotal -lt $maxThreads) { $maxThreads = $tableTotal }
-
-    # Determine if parallel table metadata retrieval is enabled.
-    # New default: ON (previously OFF unless EnableBigQueryParallelTables was explicitly set)
-    # Override precedence:
-    #   1. $script:DisableBigQueryParallelTables = $true  -> force OFF
-    #   2. $script:EnableBigQueryParallelTables  (legacy flag) respected if present
-    $parallelEnabled = $true
-    if (Get-Variable -Name EnableBigQueryParallelTables -Scope Script -ErrorAction SilentlyContinue) {
-        try { $parallelEnabled = [bool]$script:EnableBigQueryParallelTables } catch { $parallelEnabled = $true }
-    }
-    if (Get-Variable -Name DisableBigQueryParallelTables -Scope Script -ErrorAction SilentlyContinue) {
-        try { if ([bool]$script:DisableBigQueryParallelTables) { $parallelEnabled = $false } } catch {}
-    }
-    $useParallel = $parallelEnabled -and ($tableTotal -gt 0) -and ($maxThreads -gt 1) -and (-not $bulkSuccess)
-    if ($useParallel) {
-        Write-Log ("[DB][BigQuery] ({0}) Dataset={1} LightParallel Threads={2} Tables={3}" -f $ProjectId,$datasetId,$maxThreads,$tableTotal) -Level DEBUG
-    } else {
-        Write-Log ("[DB][BigQuery] ({0}) Dataset={1} SequentialTableMetadata" -f $ProjectId,$datasetId) -Level DEBUG
-    }
-        $bulkAttempted = $false; $bulkSuccess = $false
-        # Try bulk INFORMATION_SCHEMA query if large dataset and not disabled
-        $bulkThreshold = if (Get-Variable -Name BigQueryBulkQueryThreshold -Scope Script -ErrorAction SilentlyContinue) { [int]$script:BigQueryBulkQueryThreshold } else { 250 }
-        $bulkDisabled  = $false; try { $bulkDisabled = [bool]$script:DisableBigQueryBulkQuery } catch {}
-        if (-not $bulkDisabled -and $tableTotal -ge $bulkThreshold) {
-            $bulkAttempted = $true
-            Write-Log ("[DB][BigQuery] ({0}) Dataset={1} BulkQueryAttempt Tables={2}" -f $ProjectId,$datasetId,$tableTotal) -Level DEBUG
-            # Use bq query --nouse_legacy_sql to pull logical & physical bytes per table.
-            $qualified = "$ProjectId.$datasetId"
-            # Build single INFORMATION_SCHEMA query (avoid fragile escaping of backticks inside interpolated string)
-            $sql = 'SELECT table_id AS TableId, total_physical_bytes AS PhysicalBytes, total_logical_bytes AS LogicalBytes FROM `' + $qualified + '.INFORMATION_SCHEMA.TABLE_STORAGE`'
-            $bulkJson = & bq --project_id=$ProjectId query --nouse_legacy_sql --format=json --max_rows=100000 "$sql" 2>$null
-            if ($LASTEXITCODE -eq 0 -and $bulkJson) {
-                try {
-                    $parsedBulk = $bulkJson | ConvertFrom-Json
-                    # Rows may be objects with fields table_id, total_physical_bytes, total_logical_bytes
-                    foreach ($row in ($parsedBulk | Where-Object { $_ })) {
-                        $tid = $row.TableId
-                        if (-not $tid -and $row.PSObject.Properties['table_id']) { $tid = $row.table_id }
-                        if ($tid) {
-                            $logical = 0; $physical=0
-                            if ($row.PSObject.Properties['LogicalBytes']) { $logical = [int64]$row.LogicalBytes }
-                            elseif ($row.PSObject.Properties['total_logical_bytes']) { $logical = [int64]$row.total_logical_bytes }
-                            if ($row.PSObject.Properties['PhysicalBytes']) { $physical = [int64]$row.PhysicalBytes }
-                            elseif ($row.PSObject.Properties['total_physical_bytes']) { $physical = [int64]$row.total_physical_bytes }
-                            $tableResults += [PSCustomObject]@{TableId=$tid; LogicalBytes=$logical; PhysicalBytes=$physical; Error=''}
-                        }
-                    }
-                    if ($tableResults.Count -gt 0) {
-                        $bulkSuccess = $true
-                        Write-Log ("[DB][BigQuery] ({0}) Dataset={1} BulkQuerySuccess Rows={2}" -f $ProjectId,$datasetId,$tableResults.Count) -Level DEBUG
-                    } else {
-                        Write-Log ("[DB][BigQuery] ({0}) Dataset={1} BulkQueryEmpty FallingBack" -f $ProjectId,$datasetId) -Level WARN
-                        $tableResults = @()
-                    }
-                } catch {
-                    Write-Log ("[DB][BigQuery] ({0}) Dataset={1} BulkQueryParseFailed FallingBack" -f $ProjectId,$datasetId) -Level WARN
-                    $tableResults = @()
-                }
-            } else {
-                Write-Log ("[DB][BigQuery] ({0}) Dataset={1} BulkQueryFailed ExitCode={2} FallingBack" -f $ProjectId,$datasetId,$LASTEXITCODE) -Level WARN
-            }
-        }
-        if ($bulkSuccess) { $useParallel = $false } # Skip per-table lookups entirely if bulk worked
-
-        # Build tableIds list (handles mixed object shapes) only if per-table needed
-        if (-not $bulkSuccess) {
-            $tableIds = @()
-            foreach ($t in $tables) {
-                if ($t.tableReference -and $t.tableReference.tableId) { $tableIds += $t.tableReference.tableId }
-                elseif ($t.tableId) { $tableIds += $t.tableId }
-            }
-        }
-
-        if (-not $bulkSuccess -and $useParallel) {
-            try {
-                $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
-                $pool = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspacePool(1,$maxThreads,$iss,$Host); $pool.Open()
-                $active = @(); $idx = 0; $completed = 0
-                while ($idx -lt $tableIds.Count -or $active.Count -gt 0) {
-                    # Adaptive free memory check (drop to 2 threads if <1.5GB)
-                    try {
-                        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
-                        $freeGB = [math]::Round(($os.FreePhysicalMemory*1KB)/1GB,2)
-                        if ($freeGB -lt 1.5 -and $maxThreads -gt 2) { $maxThreads = 2 }
-                    } catch {}
-                    while ($active.Count -lt $maxThreads -and $idx -lt $tableIds.Count) {
-                        $tid = $tableIds[$idx]; $idx++
-                        $ps = [PowerShell]::Create(); $ps.RunspacePool = $pool
-                        [void]$ps.AddScript({
-                            param($p,$ds,$t)
-                            $r = [PSCustomObject]@{TableId=$t; LogicalBytes=[int64]0; PhysicalBytes=[int64]0; Error=''}
-                            $j = & bq show --format=json --project_id=$p "$ds.$t" 2>$null
-                            if ($LASTEXITCODE -eq 0 -and $j) {
-                                try {
-                                    $o = $j | ConvertFrom-Json
-                                    if ($o.PSObject.Properties['numTotalLogicalBytes']) { $r.LogicalBytes = [int64]$o.numTotalLogicalBytes }
-                                    elseif ($o.PSObject.Properties['numBytes']) { $r.LogicalBytes = [int64]$o.numBytes }
-                                    if ($o.PSObject.Properties['numTotalPhysicalBytes']) { $r.PhysicalBytes = [int64]$o.numTotalPhysicalBytes }
-                                } catch { $r.Error='parse' }
-                            } else { $r.Error='show' }
-                            return $r
-                        }).AddArgument($ProjectId).AddArgument($datasetId).AddArgument($tid)
-                        $active += [PSCustomObject]@{ PS=$ps; Handle=$ps.BeginInvoke(); Table=$tid }
-                    }
-                    $next=@()
-                    foreach ($a in $active) {
-                        if ($a.Handle.IsCompleted) {
-                            try { $out = $a.PS.EndInvoke($a.Handle) } catch { $out=$null }
-                            try { $a.PS.Dispose() } catch {}
-                            if ($out) { $tableResults += ConvertTo-CVItemArray $out }
-                            $completed++
-                            if ($tableIds.Count -gt 0 -and ($completed -eq 1 -or $completed -eq $tableIds.Count -or ($completed % 25 -eq 0))) {
-                                $pct = [int](($completed/[double]$tableIds.Count)*100)
-                                Update-CVProgress -Id 'bq-tables' -Activity ("Tables $datasetId") -Status ("{0}/{1} ({2}%)" -f $completed,$tableIds.Count,$pct) -PercentComplete $pct -ParentId 'bq-datasets'
-                            }
-                        } else { $next += $a }
-                    }
-                    $active = $next
-                    if ($active.Count -gt 0 -and $idx -lt $tableIds.Count) { Start-Sleep -Milliseconds 50 }
-                }
-                $pool.Close(); $pool.Dispose()
-            } catch {
-                Write-Log ("[DB][BigQuery] ({0}) Dataset={1} LightParallelFailed -> Sequential: {2}" -f $ProjectId,$datasetId,$_.Exception.Message) -Level WARN
-                $useParallel = $false
-            }
-        }
-
-        if (-not $bulkSuccess -and -not $useParallel) {
-            $tblIndex = 0
-            foreach ($tid in $tableIds) {
-                $tblIndex++
-                if ($tableIds.Count -gt 0) {
-                    $pctTbl = [int](($tblIndex/[double]$tableIds.Count)*100)
-                    if ($tblIndex -eq 1 -or $tblIndex -eq $tableIds.Count -or ($tblIndex % 25 -eq 0)) {
-                        Update-CVProgress -Id 'bq-tables' -Activity ("Tables $datasetId") -Status ("{0}/{1} ({2}%)" -f $tblIndex,$tableIds.Count,$pctTbl) -PercentComplete $pctTbl -ParentId 'bq-datasets'
-                    }
-                }
-                $metaJson = & bq show --format=json --project_id=$ProjectId "$datasetId.$tid" 2>$null
-                $obj = [PSCustomObject]@{TableId=$tid; LogicalBytes=[int64]0; PhysicalBytes=[int64]0; Error=''}
-                if ($LASTEXITCODE -eq 0 -and $metaJson) {
-                    try {
-                        $tm = $metaJson | ConvertFrom-Json
-                        if ($tm.PSObject.Properties['numTotalLogicalBytes']) { $obj.LogicalBytes = [int64]$tm.numTotalLogicalBytes }
-                        elseif ($tm.PSObject.Properties['numBytes']) { $obj.LogicalBytes = [int64]$tm.numBytes }
-                        if ($tm.PSObject.Properties['numTotalPhysicalBytes']) { $obj.PhysicalBytes = [int64]$tm.numTotalPhysicalBytes }
-                    } catch { $obj.Error='parse' }
-                } else { $obj.Error='show' }
-                $tableResults += $obj
-            }
-        }
-        # Aggregate results
-        foreach ($r in $tableResults) {
-            if ($r.Error -and $r.Error -ne '') { $Errors.Value.Add(("Failed table meta {0}:{1}.{2} ({3})" -f $ProjectId,$datasetId,$r.TableId,$r.Error)) }
-            $totalLogicalBytes  += $r.LogicalBytes
-            $totalPhysicalBytes += $r.PhysicalBytes
-            if ($r.PhysicalBytes -gt $largestPhysicalBytes) { $largestPhysicalBytes = $r.PhysicalBytes; $largestLogicalBytesForLargestPhysical = $r.LogicalBytes; $largestTableName = $r.TableId }
-            Write-Log ("[DB][BigQuery][Table-Info] ({0}) Dataset={1} Table={2} LogicalBytes={3} PhysicalBytes={4}" -f $ProjectId,$datasetId,$r.TableId,$r.LogicalBytes,$r.PhysicalBytes) -Level DEBUG
-        }
-        $tblIndex = $tableResults.Count
-        if ($tableTotal -gt 0) { Update-CVProgress -Id 'bq-tables' -Activity ("Tables $datasetId") -Status ("{0}/{1} (100%)" -f $tblIndex,$tableTotal) -PercentComplete 100 -ParentId 'bq-datasets' }
-        # --- End parallel table metadata retrieval ---
-        if ($tableTotal -gt 0) { Complete-CVProgress -Id 'bq-tables' }
-        Write-Log ("[DB][BigQuery] ({0}) DatasetEnd {1} Tables={2} LogicalBytes={3} PhysicalBytes={4} LargestTable={5}" -f $ProjectId,$datasetId,$tableTotal,$totalLogicalBytes,$totalPhysicalBytes,$largestTableName) -Level DEBUG
-
-        $physicalGB = [math]::Round($totalPhysicalBytes / 1GB, 2)
-        $logicalGB  = [math]::Round($totalLogicalBytes  / 1GB, 2)
-        $largestPhysicalGB = [math]::Round($largestPhysicalBytes / 1GB,2)
-        $largestLogicalGB  = [math]::Round($largestLogicalBytesForLargestPhysical / 1GB,2)
-
-        $items += [PSCustomObject]@{
+    foreach ($ds in $list.Datasets) {
+        $r = Resolve-CVBqDatasetSize -DatasetId $ds.DatasetId -SizeMap $sizeMap
+        $logicalGB = if ($null -ne $r.LogicalBytes) { [math]::Round($r.LogicalBytes / 1GB, 2) } else { $null }
+        $largestGB = if ($null -ne $r.LargestTableBytes) { [math]::Round($r.LargestTableBytes / 1GB, 2) } else { $null }
+        Write-Log ("[DB][BigQuery] ({0}) Dataset={1} Tables={2} LogicalBytes={3} Status={4}" -f $ProjectId,$ds.DatasetId,$r.TableCount,$r.LogicalBytes,$r.Status) -Level DEBUG
+        $items.Add([PSCustomObject]@{
             Type                     = 'BigQueryDataset'
             Project                  = $ProjectId
-            Name                     = $datasetId
-            Region                   = $region
+            Name                     = $ds.DatasetId
+            Region                   = $ds.Location
             Engine                   = 'BigQuery'
-            StorageGB                = $physicalGB            # Backward compatibility (now physical size)
-            TotalPhysicalSizeGB      = $physicalGB
+            StorageGB                = $logicalGB             # Backward compatibility (now LOGICAL size - see above)
+            TotalPhysicalSizeGB      = $null                  # Not available from Cloud Monitoring
             TotalLogicalSizeGB       = $logicalGB
-            TableCount               = $tableTotal
-            LargestTable             = $largestTableName
-            LargestTablePhysicalGB   = $largestPhysicalGB
-            LargestTableLogicalGB    = $largestLogicalGB
+            TableCount               = $r.TableCount
+            LargestTable             = $r.LargestTable
+            LargestTablePhysicalGB   = $null
+            LargestTableLogicalGB    = $largestGB
+            SizeSource               = 'CloudMonitoring:bigquery/storage/stored_bytes'
+            SizeStatus               = $r.Status
+            SizeNote                 = $r.Note
             Error                    = ''
-        }
+        })
     }
-    if ($datasetTotal -gt 0) { Complete-CVProgress -Id 'bq-datasets' }
 
     Write-Log "[DB] ($ProjectId) End BigQuery" -Level DEBUG
-    return $items
+    return @($items)
 }
 
 function Invoke-GcpDbProjectInventory {
@@ -3271,31 +2953,13 @@ if ($Selected.DB -and $invResults.Databases -and (@($invResults.Databases)).Coun
         $bigQuery | Sort-Object Project,Name | Export-Csv -Path $bqCsv -NoTypeInformation
     } else {
         # No datasets discovered - emit a header-only file (downstream relies on it existing).
-        'Type,Project,Name,Region,Engine,TotalPhysicalSizeGB,TotalLogicalSizeGB,TableCount,LargestTable,LargestTablePhysicalGB,LargestTableLogicalGB,Error' | Out-File -FilePath $bqCsv -Encoding utf8
+        'Type,Project,Name,Region,Engine,StorageGB,TotalPhysicalSizeGB,TotalLogicalSizeGB,TableCount,LargestTable,LargestTablePhysicalGB,LargestTableLogicalGB,SizeSource,SizeStatus,SizeNote,Error' | Out-File -FilePath $bqCsv -Encoding utf8
     }
     Write-Host "gcp_bigquery_datasets_$dateStr.csv file has been written to $outDir" -ForegroundColor Cyan
 
-    # Optional: detailed tables CSV when any BigQuery dataset has tables (aggregate table info already summarized per dataset)
-    $anyTables = $false; if ($bigQuery.Count -gt 0) { $anyTables = ($bigQuery | Where-Object { $_.TableCount -gt 0 }).Count -gt 0 }
-    if ($anyTables) {
-        $bqTablesCsv = Join-Path $outDir ("gcp_bigquery_tables_" + $dateStr + ".csv")
-        'Project,Dataset,TableName,LogicalBytes,PhysicalBytes,LogicalGB,PhysicalGB' | Out-File -FilePath $bqTablesCsv -Encoding utf8
-        # Reconstruct table details from logs (DEBUG lines) if not explicitly captured elsewhere.
-        # The queue is populated at $Global: scope by the worker log helper; reading $script: here matched nothing,
-        # so this block silently produced a header-only CSV.
-        foreach ($line in $Global:ChildLogQueue) {
-            if ($line -match '\[DB\]\[BigQuery\]\[Table-Info\] \(([^)]+)\) Dataset=([^ ]+) Table=([^ ]+) LogicalBytes=([0-9]+) PhysicalBytes=([0-9]+)') {
-                $proj=$Matches[1]; $ds=$Matches[2]; $tbl=$Matches[3]; $lbytes=[int64]$Matches[4]; $pbytes=[int64]$Matches[5]
-                $lgb=[math]::Round($lbytes/1GB,2); $pgb=[math]::Round($pbytes/1GB,2)
-                Add-Content -Path $bqTablesCsv -Value ("{0},{1},{2},{3},{4},{5},{6}" -f $proj,$ds,$tbl,$lbytes,$pbytes,$lgb,$pgb)
-            }
-        }
-        if ((Get-Content $bqTablesCsv | Measure-Object -Line).Lines -le 1) {
-            Write-Host "BigQuery Tables CSV: header only, no table detail rows reconstructed." -ForegroundColor DarkYellow
-        } else {
-            Write-Host "BigQuery Tables CSV written: $(Split-Path $bqTablesCsv -Leaf)" -ForegroundColor Cyan
-        }
-    }
+    # gcp_bigquery_tables_*.csv is no longer produced: per-table sizes came from one `bq show` per table, which is
+    # what made BigQuery sizing take hours. Cloud Monitoring labels only the 100 largest tables per dataset; the
+    # largest one is carried on the dataset row (LargestTable / LargestTableLogicalGB).
 
     # AlloyDB Clusters
     $alloyClusters = $dbSuccess | Where-Object Type -eq 'alloydbcluster'

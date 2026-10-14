@@ -53,7 +53,7 @@ $inventory = @{
     )
     AlloyDbClusters  = @()
     BigQueryDatasets = @(
-        [PSCustomObject]@{ Project='proj-a'; Region='US'; Name='ds1'; TotalPhysicalSizeGB=512 }
+        [PSCustomObject]@{ Project='proj-a'; Region='US'; Name='ds1'; TotalLogicalSizeGB=512 }
     )
     GKEClusters = @(
         [PSCustomObject]@{ Project='proj-a'; Region='us-central1'; ClusterName='c1'; PersistentVolumeCapacityGB=100; PersistentVolumeCount=3 }

@@ -40,7 +40,7 @@
 
     Several other GCP figures are binary despite a "GB" name and get Format-CVSizeGiB: Filestore
     provisionedGib, GKE PersistentVolumeCapacityGB (which comes from Convert-QuantityToGiB), AlloyDB monitored
-    usage, and BigQuery physical bytes already divided by 1GB. Buckets measure real bytes.
+    usage, and BigQuery logical bytes already divided by 1GB. Buckets measure real bytes.
 
     DELIBERATELY NOT A DESCRIPTOR: FilestoreInstances.
 
@@ -115,8 +115,10 @@ $script:CVGcpSummaryTypes = @(
        Fmt = { param($v) Format-CVSizeGiB $v } }
 
     @{ Key = 'DB'; Source = 'BigQueryDatasets'; Group = 'Region'; SeqOverall = 8
-       Label = 'BigQuery Dataset (physical)'
-       Measure = { param($r) Measure-CVLooseSum $r 'TotalPhysicalSizeGB' }
+       # Logical, not physical: sizing now reads Cloud Monitoring's storage/stored_bytes, which has no physical
+       # counterpart. Physical was also the wrong basis for protected data - it includes time-travel and fail-safe.
+       Label = 'BigQuery Dataset (logical)'
+       Measure = { param($r) Measure-CVLooseSum $r 'TotalLogicalSizeGB' }
        Fmt = { param($v) Format-CVSizeGiB $v } }
 
     @{ Key = 'GKE'; Source = 'GKEClusters'; Group = 'Region'; SeqOverall = 9

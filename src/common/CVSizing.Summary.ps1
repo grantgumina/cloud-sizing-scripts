@@ -80,7 +80,7 @@ function Format-CVSizeGBDecimal {
 }
 
 # GiB-denominated input. Several GCP figures are binary gigabytes despite a "GB" name: Filestore
-# provisionedGib, GKE PV CapacityGiB, AlloyDB monitored usage, and BigQuery physical bytes divided by 1GB.
+# provisionedGib, GKE PV CapacityGiB, AlloyDB monitored usage, and BigQuery logical bytes divided by 1GB.
 # All three outputs derive from ONE byte count, so TB and TiB reconcile instead of disagreeing by 7.4%.
 function Format-CVSizeGiB {
     param([double]$Gib)

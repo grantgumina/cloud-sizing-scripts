@@ -25,7 +25,7 @@ Every run needs three things: **PowerShell 7**, the **cloud vendor's CLI/SDK** (
 | | AWS | Azure | Google Cloud |
 |---|---|---|---|
 | PowerShell 7+ | Required | Required | Required |
-| Vendor CLI | **AWS CLI v2** — required (credential profiles, SSO, EKS kubeconfig) | Azure CLI **not** required — Azure runs on the Az PowerShell modules | **gcloud CLI** — required, including the `gsutil` and `bq` components |
+| Vendor CLI | **AWS CLI v2** — required (credential profiles, SSO, EKS kubeconfig) | Azure CLI **not** required — Azure runs on the Az PowerShell modules | **gcloud CLI** — required (`gsutil` and `bq` are no longer needed) |
 | PowerShell modules | `AWS.Tools.*` | `Az.*` | none (beyond the shared console UI) |
 | Interactive console UI | `PwshSpectreConsole` (not needed with `-NonInteractive`) | same | same |
 | `kubectl` | Auto-installed when needed | Auto-installed when needed | Auto-installed when needed |
@@ -75,7 +75,7 @@ Azure is the exception: the script talks to Azure through the `Az` PowerShell mo
 **Google Cloud — gcloud CLI**
 - Install (Windows / macOS / Linux): [Install the gcloud CLI](https://cloud.google.com/sdk/docs/install)
 - Initialize and sign in: [Initializing the gcloud CLI](https://cloud.google.com/sdk/docs/initializing) — `gcloud init`, or `gcloud auth login` if already initialized
-- The script requires `gsutil` (bucket sizing) and `bq` (BigQuery sizing) in addition to `gcloud`. They ship with the SDK; if the preflight reports either missing, add them with [`gcloud components install gsutil bq`](https://cloud.google.com/sdk/docs/components)
+- Bucket and BigQuery sizes come from Cloud Monitoring (one query per project), so `gsutil` and `bq` are not required. The Cloud Monitoring API must be enabled in each project for those sizes to be filled in; see [docs/GoogleCloud.md](docs/GoogleCloud.md#how-buckets-and-bigquery-are-sized)
 - Confirm: `gcloud auth list` and `gcloud projects list`
 
 **Permissions:** read-only access is enough everywhere — AWS: the IAM policy in [docs/AWS.md](docs/AWS.md); Azure: **Reader** on each target subscription (AKS additionally needs Cluster User Role and cluster-scoped node/PV read — see [docs/Azure.md](docs/Azure.md#permissions)); GCP: **Viewer** on each target project.
